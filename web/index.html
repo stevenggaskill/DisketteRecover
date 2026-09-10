@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DisketteRecover</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='2' fill='%23191c24'/%3E%3Crect x='4' y='2' width='8' height='5' fill='%23dfe3ec'/%3E%3Crect x='3' y='9' width='10' height='5' fill='%236aa9ff'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#12141a; --panel:#191c24; --line:#2a2f3c; --fg:#dfe3ec; --dim:#8a93a6;
+  --ok:#49c17a; --bad:#e2584d; --warn:#e8b552; --accent:#6aa9ff;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;
+       padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{font-size:14px;margin:0 14px 0 0;letter-spacing:.5px}
+h1 span{color:var(--accent)}
+.badge{padding:2px 8px;border-radius:3px;font-weight:700;font-size:11px}
+.badge.ok{background:rgba(73,193,122,.15);color:var(--ok);border:1px solid var(--ok)}
+.badge.bad{background:rgba(226,88,77,.15);color:var(--bad);border:1px solid var(--bad)}
+select,input,button{background:#0e1016;color:var(--fg);border:1px solid var(--line);
+  border-radius:3px;padding:4px 7px;font:inherit}
+button{cursor:pointer}
+button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+button:disabled{opacity:.4;cursor:default}
+button.primary{border-color:var(--accent);color:var(--accent)}
+main{padding:12px 14px;display:flex;flex-direction:column;gap:12px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:5px}
+section>h2{margin:0;padding:8px 12px;font-size:11px;letter-spacing:1.2px;
+  text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--line)}
+.body{padding:10px 12px;overflow-x:auto}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.kv{color:var(--dim)} .kv b{color:var(--fg);font-weight:600}
+canvas{display:block;image-rendering:pixelated}
+#hex{display:grid;grid-template-columns:repeat(16,auto);gap:2px;width:max-content;
+  max-height:420px;overflow-y:auto}
+#hex .b{padding:2px 4px;border-radius:2px;cursor:pointer;border:1px solid transparent}
+#hex .b:hover{border-color:var(--accent)}
+#hex .b.sel{outline:1px solid var(--accent)}
+#hex .b.sync{color:#7f8aa3}#hex .b.mark{color:var(--warn)}#hex .b.crc{color:var(--accent)}
+#hex .b.chg{background:rgba(226,88,77,.35);font-weight:700}
+#candwrap{max-height:340px;overflow-y:auto;border:1px solid var(--line);border-radius:3px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+thead th{position:sticky;top:0;background:var(--panel);z-index:1}
+th,td{text-align:left;padding:3px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--dim);font-weight:600}
+tr.sel td{background:rgba(106,169,255,.12)}
+.small{color:var(--dim);font-size:11px}
+.legend span{display:inline-block;margin-right:12px}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;margin-right:4px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Diskette<span>Recover</span></h1>
+  <span class="kv">image <b id="img">-</b></span>
+  <label class="kv">sector
+    <select id="sector"></select>
+  </label>
+  <span id="crcbadge" class="badge bad">-</span>
+  <span class="kv" id="model"></span>
+</header>
+
+<main>
+<section>
+  <h2>Flux stream &amp; cell decode</h2>
+  <div class="body">
+    <div class="row" style="margin-bottom:8px">
+      <label class="kv">zoom <input id="zoom" type="range" min="4" max="34" value="15"></label>
+      <label class="kv">position <input id="pos" type="range" min="0" max="100" value="0" style="width:320px"></label>
+      <button id="jumpworst">jump to least trusted bit</button>
+      <span class="legend small">
+        <span><i class="sw" style="background:#49c17a"></i>confident</span>
+        <span><i class="sw" style="background:#e8b552"></i>marginal</span>
+        <span><i class="sw" style="background:#e2584d"></i>ambiguous</span>
+        <span><i class="sw" style="background:#6aa9ff"></i>reversal</span>
+        <span><i class="sw" style="background:#49c17a;height:3px"></i>below threshold (assumed good)</span>
+      </span>
+    </div>
+    <canvas id="strip" height="240"></canvas>
+    <div class="small" id="striphint"></div>
+  </div>
+</section>
+
+<section>
+  <h2>CRC-covered message</h2>
+  <div class="body">
+    <div class="row" style="margin-bottom:8px">
+      <span class="kv">stored CRC <b id="scrc">-</b></span>
+      <span class="kv">computed <b id="ccrc">-</b></span>
+      <span class="kv">syndrome <b id="syn">-</b></span>
+      <span class="kv">field <b id="field">-</b></span>
+    </div>
+    <div id="hex"></div>
+  </div>
+</section>
+
+<section>
+  <h2>Repair search</h2>
+  <div class="body">
+    <div class="row" style="margin-bottom:10px">
+      <label class="kv">good threshold <input id="thr" type="text" size="7" value="1e-3"></label>
+      <label class="kv">max weight <input id="wmax" type="number" min="1" max="6" value="3" style="width:60px"></label>
+      <label class="kv">pool <input id="pool" type="number" min="8" max="512" value="96" style="width:70px"></label>
+      <button id="search" class="primary">search</button>
+      <button id="next" disabled>next candidate &#8594;</button>
+      <button id="prev" disabled>&#8592; previous</button>
+      <button id="apply" disabled>apply &amp; verify</button>
+      <span class="kv" id="searchinfo"></span>
+    </div>
+    <div id="candwrap"><table id="cands"><thead><tr>
+      <th>#</th><th>weight</th><th>rel. likelihood</th><th>flips</th><th>data head</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+</section>
+
+<section>
+  <h2>Export</h2>
+  <div class="body row">
+    <label class="kv">path <input id="expath" type="text" size="40" value="repaired.hfe"></label>
+    <label class="kv">format <input id="exfmt" type="text" size="10" value="hfe"></label>
+    <button id="export">write image</button>
+    <span class="kv" id="exinfo"></span>
+  </div>
+</section>
+</main>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+let scan = null, view = null, cands = null, sel = -1, selByte = -1;
+
+/* Absolute error probabilities span a huge range and depend on the
+   image, so the palette is stretched over whatever range this sector
+   actually shows - otherwise everything saturates at one colour. */
+let scaleLo = -6, scaleHi = -0.3;
+function computeScale(){
+  let lo = Infinity, hi = -Infinity;
+  for (const p of view.cells.perr){
+    const l = Math.log10(Math.max(p, 1e-12));
+    if (l < lo) lo = l;
+    if (l > hi) hi = l;
+  }
+  if (!isFinite(lo) || !isFinite(hi)) { lo = -6; hi = -0.3; }
+  if (hi - lo < 0.8) lo = hi - 0.8;      /* uniform prior: keep contrast */
+  scaleLo = lo; scaleHi = hi;
+}
+const norm = p => (p === undefined || p < 0) ? 0
+  : Math.min(1, Math.max(0, (Math.log10(Math.max(p,1e-12)) - scaleLo)
+                             / (scaleHi - scaleLo)));
+const goodThreshold = () => parseFloat($("#thr").value) || 1e-3;
+const heat = p => {
+  const t = norm(p);
+  if (t < 0.5) { const u = t/0.5; return rgb(73+(232-73)*u, 193+(181-193)*u, 122+(82-122)*u); }
+  const u = (t-0.5)/0.5; return rgb(232+(226-232)*u, 181+(88-181)*u, 82+(77-82)*u);
+};
+const rgb = (r,g,b) => `rgb(${r|0},${g|0},${b|0})`;
+const hex2 = v => v.toString(16).toUpperCase().padStart(2,"0");
+const hex4 = v => v.toString(16).toUpperCase().padStart(4,"0");
+
+async function getJSON(u, opt){ const r = await fetch(u, opt); return await r.json(); }
+
+/* ---------------- sector list ---------------- */
+async function loadScan(keep){
+  scan = await getJSON("/api/scan");
+  $("#img").textContent = scan.image.replace(/^.*\//,"");
+  const s = $("#sector"); const prev = s.value;
+  s.innerHTML = "";
+  scan.sectors.forEach(x => {
+    const bad = x.header_crc === "bad" || x.data_crc === "bad";
+    const o = document.createElement("option");
+    o.value = x.index;
+    o.textContent = `#${x.index}  t${x.track}/s${x.side} id ${x.id} `
+                  + `(${x.size}B) ${bad ? "CRC BAD" : "ok"}`;
+    s.appendChild(o);
+  });
+  if (keep && prev) s.value = prev;
+  else if (scan.first_bad >= 0) s.value = scan.first_bad;
+}
+
+/* ---------------- sector view ---------------- */
+async function loadView(){
+  const sec = $("#sector").value;
+  view = await getJSON(`/api/view?sector=${sec}&threshold=${encodeURIComponent($("#thr").value)}`);
+  cands = null; sel = -1; selByte = -1;
+  $("#next").disabled = $("#prev").disabled = $("#apply").disabled = true;
+  $("#cands").querySelector("tbody").innerHTML = "";
+  $("#searchinfo").textContent = "";
+  computeScale();
+  paintHeader(); paintHex(); resizeStrip(); paintStrip();
+}
+
+function paintHeader(){
+  const b = $("#crcbadge");
+  b.textContent = view.crc_valid ? "CRC VALID" : "CRC INVALID";
+  b.className = "badge " + (view.crc_valid ? "ok" : "bad");
+  $("#model").textContent = view.model + (view.flux ? "" : "  (no flux stream)");
+  $("#scrc").textContent = hex4(view.stored_crc);
+  $("#ccrc").textContent = hex4(view.computed_crc);
+  $("#syn").textContent  = hex4(view.syndrome);
+  $("#field").textContent = view.field + " field, " + view.msg_len + " bytes";
+  $("#pos").max = Math.max(0, view.cells.n - 40);
+}
+
+function worstBit(){
+  let best = -1, bp = -1;
+  for (let i = view.first_bit; i < view.msg_bits; i++){
+    const p = view.bytes[i>>3].p[i&7];
+    if (p > bp){ bp = p; best = i; }
+  }
+  return best;
+}
+
+function bitCells(byte, bit){
+  if (view.encoding === "iso_fm"){
+    const g = byte*view.stride + (bit>>1)*8;
+    return [g + ((bit&1)?5:1), g + ((bit&1)?7:3)];
+  }
+  return [byte*view.stride + bit*2, byte*view.stride + bit*2 + 1];
+}
+
+/* ---------------- hex panel ---------------- */
+function paintHex(){
+  const h = $("#hex"); h.innerHTML = "";
+  const changed = new Set();
+  if (cands && sel >= 0) cands.candidates[sel].edits.forEach(e => changed.add(e.byte));
+
+  view.bytes.forEach(b => {
+    const d = document.createElement("div");
+    const worst = Math.max(...b.p);
+    d.className = "b " + b.role + (changed.has(b.i) ? " chg" : "")
+                + (selByte === b.i ? " sel" : "");
+    let v = b.v;
+    if (cands && sel >= 0){
+      cands.candidates[sel].edits.forEach(e => {
+        if (e.byte === b.i) v ^= (0x80 >> e.bitpos);
+      });
+    }
+    d.textContent = hex2(v);
+    d.style.background = changed.has(b.i) ? "" : heatBg(worst);
+    d.title = `byte ${b.i} (${b.role})  cell ${b.cell}\nworst bit p_err ${worst.toExponential(2)}`;
+    d.onclick = () => { selByte = b.i; $("#pos").value = b.i * view.stride;
+                        paintHex(); paintStrip(); };
+    h.appendChild(d);
+  });
+}
+function heatBg(p){
+  const t = norm(p);
+  const c = heat(p).slice(4, -1);
+  return `rgba(${c},${(0.10 + t*t*0.65).toFixed(3)})`;
+}
+
+/* ---------------- flux strip ---------------- */
+const cv = $("#strip"), cx = cv.getContext("2d");
+function resizeStrip(){
+  cv.width = Math.max(900, Math.min(2400, window.innerWidth - 60));
+  cv.style.width = cv.width + "px";
+}
+window.addEventListener("resize", () => { if(view){ resizeStrip(); paintStrip(); }});
+
+function paintStrip(){
+  if (!view) return;
+  const px = +$("#zoom").value;
+  const start = +$("#pos").value | 0;
+  const n = Math.min(view.cells.n - start, Math.floor(cv.width / px));
+  const C = view.cells;
+  const topY = 34, waveY = 96, cellY = 130, bitY = 176, byteY = 206;
+
+  cx.fillStyle = "#12141a"; cx.fillRect(0,0,cv.width,cv.height);
+
+  const edits = new Map();
+  if (cands && sel >= 0)
+    cands.candidates[sel].edits.forEach(e => edits.set(e.data_cell - C.first, e));
+
+  /* cell heat + grid */
+  for (let i = 0; i < n; i++){
+    const idx = start + i, x = i*px;
+    cx.fillStyle = heatBg(C.perr[idx]);
+    cx.fillRect(x, cellY, px-1, 26);
+    cx.strokeStyle = "#242938"; cx.lineWidth = 1;
+    cx.strokeRect(x+.5, cellY+.5, px-1, 26);
+    if (C.weak[idx] === "1"){
+      cx.fillStyle = "rgba(232,181,82,.35)";
+      cx.fillRect(x, cellY, px-1, 26);
+    }
+    if (C.perr[idx] < goodThreshold()){
+      cx.strokeStyle = "rgba(73,193,122,.45)"; cx.lineWidth = 1;
+      cx.beginPath(); cx.moveTo(x, cellY+25.5); cx.lineTo(x+px-1, cellY+25.5);
+      cx.stroke();
+    }
+    if (edits.has(idx)){
+      cx.strokeStyle = "#6aa9ff"; cx.lineWidth = 2;
+      cx.strokeRect(x+1, cellY-1, px-3, 28);
+    }
+  }
+
+  /* read waveform: toggles on every reversal */
+  cx.strokeStyle = "#6aa9ff"; cx.lineWidth = 1.6; cx.beginPath();
+  let lvl = 0, y = waveY + 18;
+  cx.moveTo(0, y);
+  for (let i = 0; i < n; i++){
+    const idx = start + i, x = i*px;
+    if (C.state[idx] === "1"){
+      cx.lineTo(x + px/2, y);
+      lvl ^= 1; y = waveY + (lvl ? 0 : 18);
+      cx.lineTo(x + px/2, y);
+    }
+  }
+  cx.lineTo(n*px, y); cx.stroke();
+
+  /* reversal ticks + interval labels */
+  cx.font = "10px ui-monospace,monospace"; cx.textAlign = "center";
+  for (let i = 0; i < n; i++){
+    const idx = start + i, x = i*px + px/2;
+    if (C.state[idx] !== "1") continue;
+    cx.strokeStyle = "rgba(106,169,255,.45)"; cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(x, waveY-10); cx.lineTo(x, cellY+26); cx.stroke();
+    const bin = C.bin[idx], ic = C.icells[idx];
+    if (bin > 0 && px >= 9){
+      cx.fillStyle = "#8a93a6";
+      cx.fillText(bin + "T", x - px*bin/2, topY);
+      if (ic > 0 && px >= 13){
+        cx.fillStyle = heat(C.perr[idx]);
+        cx.fillText(ic.toFixed(2), x - px*bin/2, topY + 12);
+      }
+    }
+  }
+
+  /* decoded bits + byte boundaries */
+  const stride = view.stride, bpb = stride/8;
+  cx.textAlign = "center";
+  for (let b = 0; b < view.msg_len; b++){
+    for (let k = 0; k < 8; k++){
+      const [cc, dc] = bitCells(b, k);
+      if (dc < start || dc >= start + n) continue;
+      let bit;
+      if (view.encoding === "iso_fm") bit = C.state[dc] === "1" ? 1 : 0;
+      else bit = (C.state[cc] === "0" && C.state[dc] === "1") ? 1 : 0;
+      let flipped = false;
+      if (cands && sel >= 0)
+        cands.candidates[sel].edits.forEach(e => {
+          if (e.byte === b && e.bitpos === k){ bit ^= 1; flipped = true; }
+        });
+      const mid = ((cc + dc)/2 - start)*px + px/2;
+      cx.fillStyle = flipped ? "#6aa9ff" : "#dfe3ec";
+      cx.font = (flipped ? "bold " : "") + "11px ui-monospace,monospace";
+      if (px >= 6) cx.fillText(String(bit), mid, bitY);
+    }
+    const bs = b*stride;
+    if (bs >= start - stride && bs < start + n){
+      const x = (bs - start)*px;
+      cx.strokeStyle = "#3a4157"; cx.lineWidth = 1;
+      cx.beginPath(); cx.moveTo(x+.5, topY-14); cx.lineTo(x+.5, byteY-12); cx.stroke();
+      if (px*stride > 34){
+        const bt = view.bytes[b];
+        let v = bt.v;
+        if (cands && sel >= 0)
+          cands.candidates[sel].edits.forEach(e => { if (e.byte === b) v ^= (0x80>>e.bitpos); });
+        cx.textAlign = "left";
+        cx.fillStyle = bt.role === "crc" ? "#6aa9ff"
+                     : bt.role === "mark" ? "#e8b552"
+                     : bt.role === "sync" ? "#7f8aa3" : "#dfe3ec";
+        cx.font = "11px ui-monospace,monospace";
+        cx.fillText(`${bt.role[0]}${b}:${hex2(v)}`, x + 3, byteY);
+        cx.textAlign = "center";
+      }
+    }
+  }
+
+  /* axis labels */
+  cx.textAlign = "left"; cx.fillStyle = "#8a93a6"; cx.font = "10px ui-monospace,monospace";
+  cx.fillText("flux", 4, waveY - 12);
+  cx.fillText("cells", 4, cellY - 4);
+  cx.fillText("bits", 4, bitY - 12);
+
+  $("#striphint").textContent =
+    `cells ${C.first + start} .. ${C.first + start + n - 1}`
+    + `   (${n} of ${C.n} shown, ${view.stride} cells/byte)`;
+}
+
+/* ---------------- repair ---------------- */
+async function doSearch(){
+  $("#searchinfo").textContent = "searching...";
+  const q = new URLSearchParams({
+    sector: $("#sector").value, weight: $("#wmax").value,
+    pool: $("#pool").value, threshold: $("#thr").value, limit: 200
+  });
+  cands = await getJSON("/api/repair?" + q);
+  const has = cands.count > 0;
+  sel = has ? 0 : -1;
+  $("#next").disabled = $("#prev").disabled = !has;
+  $("#apply").disabled = !has;
+  $("#searchinfo").textContent =
+    `${cands.pool} bits in pool, searched to weight ${cands.searched_weight}: `
+    + (has ? `${cands.count} CRC-valid candidate(s) at weight ${cands.candidates[0].weight}`
+           : "no CRC-valid correction found - raise max weight or the threshold");
+  paintCands(); paintHex(); paintStrip();
+}
+
+function paintCands(){
+  const tb = $("#cands").querySelector("tbody");
+  tb.innerHTML = "";
+  if (!cands) return;
+  cands.candidates.forEach((c, i) => {
+    const tr = document.createElement("tr");
+    if (i === sel) tr.className = "sel";
+    const flips = c.edits.map(e =>
+      `byte ${e.byte} bit ${e.bitpos}: ${e.from}&rarr;${e.to} <span class="small">(p=${(+e.perr).toExponential(1)})</span>`
+    ).join("<br>");
+    tr.innerHTML = `<td>${i}</td><td>${c.weight}</td>`
+      + `<td>${(+c.rel).toExponential(3)}</td><td>${flips}</td>`
+      + `<td class="small">${c.data.slice(0,32)}&hellip;</td>`;
+    tr.onclick = () => { sel = i; paintCands(); paintHex(); paintStrip(); focusEdit(); };
+    tb.appendChild(tr);
+    if (i === sel) requestAnimationFrame(() =>
+      tr.scrollIntoView({block:"nearest"}));
+  });
+}
+
+function focusEdit(){
+  if (!cands || sel < 0) return;
+  const c = cands.candidates[sel];
+  const cell = c.edits[0].data_cell - view.cells.first;
+  $("#pos").value = Math.max(0, cell - 24);
+  paintStrip();
+}
+
+function step(d){
+  if (!cands || !cands.count) return;
+  sel = (sel + d + cands.count) % cands.count;
+  paintCands(); paintHex(); focusEdit();
+}
+
+/* ---------------- wiring ---------------- */
+$("#sector").onchange = loadView;
+$("#zoom").oninput = paintStrip;
+$("#pos").oninput = paintStrip;
+$("#search").onclick = doSearch;
+$("#next").onclick = () => step(1);
+$("#prev").onclick = () => step(-1);
+$("#jumpworst").onclick = () => {
+  const b = worstBit();
+  if (b < 0) return;
+  const [, dc] = bitCells(b>>3, b&7);
+  $("#pos").value = Math.max(0, dc - 24);
+  paintStrip();
+};
+$("#apply").onclick = async () => {
+  const r = await getJSON(`/api/apply?sector=${$("#sector").value}&rank=${sel}`,
+                          {method:"POST"});
+  $("#searchinfo").textContent = r.verified
+    ? "applied - libhxcfe re-decode reports the sector is now CLEAN"
+    : "applied, but the sector still does not decode cleanly";
+  await loadScan(true); await loadView();
+};
+$("#export").onclick = async () => {
+  const q = new URLSearchParams({path:$("#expath").value, format:$("#exfmt").value});
+  const r = await getJSON("/api/export?" + q, {method:"POST"});
+  $("#exinfo").textContent = r.ok ? "wrote " + r.path : "error: " + r.error;
+};
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "n" || e.key === "ArrowRight") step(1);
+  if (e.key === "p" || e.key === "ArrowLeft") step(-1);
+});
+
+(async () => { await loadScan(); await loadView(); })();
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+build/
+*.o
+*.a
+*.so
+*.map
+disketterecover
+tests/out/
+src/dr_web.c
+docs/*.tmp
