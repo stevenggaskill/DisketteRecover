@@ -83,8 +83,10 @@ typedef struct {
 	/* ended on this cell.                                            */
 	int32_t  interval_ticks; /* measured flux interval                */
 	float    interval_cells; /* interval expressed in cell periods    */
-	int      bin;            /* nearest legal bin (2T/3T/4T ...)      */
+	int      bin;            /* the bin the decoder used (2T/3T/4T)   */
+	int      best_bin;       /* the bin the timings actually favour    */
 	float    margin;         /* 0..0.5 distance to the bin boundary   */
+	float    p_bin;          /* posterior that `bin` is right          */
 
 	float    p_err;          /* probability this cell is wrong        */
 } dr_cell;
@@ -127,7 +129,12 @@ typedef struct {
 	float    *bit_perr;
 
 	int       flux_available;/* 1 if flux timings were aligned        */
-	char      model[80];     /* short description of the evidence used*/
+	void     *flux;          /* dr_flux_map *, kept for the re-binner */
+	double    period;        /* ticks per cell                        */
+	double    fit_a, fit_b;  /* measured cell length ~ a + b*bin      */
+	double    fit_sigma;
+	int       fit_n;
+	char      model[160];     /* short description of the evidence used*/
 
 	/* Internal bookkeeping used by dr_apply(). */
 	void     *side;          /* HXCFE_SIDE *                          */
@@ -140,7 +147,10 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 /* A repair candidate: a set of message bits to flip.                  */
 /* ------------------------------------------------------------------ */
-#define DR_MAX_WEIGHT 6
+/* A bit-flip search never goes deep, but a re-binning result can move
+ * a whole burst worth of bits at once. */
+#define DR_MAX_WEIGHT 96
+#define DR_MAX_SEARCH_WEIGHT 6
 
 typedef struct {
 	int     weight;
@@ -148,6 +158,10 @@ typedef struct {
 	double  log_likelihood;        /* higher = more plausible         */
 	double  rel_likelihood;        /* normalised against the best     */
 	uint8_t before[DR_MAX_WEIGHT]; /* current bit values              */
+
+	/* Re-binning results only: how the flux was re-read. */
+	int     rebins;                /* intervals given a different bin */
+	double  flux_cost;             /* -log likelihood of the timings  */
 } dr_candidate;
 
 typedef struct {
@@ -156,7 +170,25 @@ typedef struct {
 	int           searched_weight;  /* deepest weight actually tried  */
 	int           npool;            /* candidate bits considered      */
 	int           truncated;        /* search hit the result cap      */
+
+	/* Re-binning search bookkeeping. */
+	int           rebin;            /* results came from re-binning   */
+	int           ambiguous;        /* intervals the timings left open*/
+	int           pinned_moves;     /* intervals the timings re-bin   */
+	long          explored;         /* assignments actually tested    */
+	double        floor_cost;       /* cost of the likeliest reading  */
+	double        current_cost;     /* what the decoder's own reading */
+	                                /* costs under the timing model   */
+	int           floor_valid;      /* ...and whether its CRC passes  */
+	int           uncertain_bits;   /* message bits still in doubt    */
+	char          note[160];
 } dr_repair_result;
+
+typedef enum {
+	DR_MODE_AUTO = 0,       /* re-bin when there is flux, else bits   */
+	DR_MODE_BITS,
+	DR_MODE_REBIN
+} dr_mode;
 
 typedef struct {
 	double good_threshold;  /* p_err below this = "assumed good"      */
@@ -165,6 +197,12 @@ typedef struct {
 	int    max_weight;      /* deepest error weight to try            */
 	int    max_pool;        /* cap on candidate bits                  */
 	int    max_results;     /* cap on returned candidates             */
+
+	dr_mode mode;
+	double  bin_budget;     /* nats of timing cost a re-bin may spend */
+	long    max_explore;    /* cap on re-binning assignments tested   */
+	int     max_ambiguous;  /* refuse to search past this many        */
+	int     rebin_width;    /* re-readings kept per disturbed stretch */
 } dr_options;
 
 void        dr_options_default(dr_options *o);
@@ -173,6 +211,10 @@ void        dr_options_default(dr_options *o);
 /* Context lifecycle                                                   */
 /* ------------------------------------------------------------------ */
 dr_ctx     *dr_open(const char *path, int verbose);
+/* Same, but applying "NAME=VALUE" overrides to libhxcfe's environment
+ * first - the PLL and loader settings only take effect at load time. */
+dr_ctx     *dr_open_ex(const char *path, int verbose,
+                       char *const *sets, int nsets);
 void        dr_close(dr_ctx *c);
 const char *dr_last_error(dr_ctx *c);
 const char *dr_path(dr_ctx *c);
@@ -195,6 +237,10 @@ void        dr_view_free(dr_view *v);
 
 int         dr_repair_search(dr_view *v, const dr_options *o,
                              dr_repair_result *out);
+/* Re-read the sector's flux under a different, equally legal binning of
+ * the transitions, keeping the total cell count intact. */
+int         dr_rebin_search(dr_view *v, const dr_options *o,
+                            dr_repair_result *out);
 void        dr_repair_free(dr_repair_result *r);
 
 /* Materialise a candidate: returns a freshly allocated copy of the

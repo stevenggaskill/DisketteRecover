@@ -73,6 +73,25 @@ if command -v python3 >/dev/null 2>&1; then
 	      --out "$out/f3.img" --format RAW_LOADER >/dev/null 2>&1
 	if cmp -s "$out/ref.img" "$out/f3.img"; then ok "flux defect recovered"
 	else bad "flux defect recovered"; fi
+
+	echo "== the re-binning engine"
+	rb=$("$dr" repair "$out/shift.scp" --mode rebin --json 2>/dev/null |
+	     sed -n 's/.*"rebin":\(true\|false\).*/\1/p')
+	check "re-binning engine ran" "$rb" "true"
+
+	fit=$("$dr" inspect "$out/shift.scp" 2>/dev/null |
+	      sed -n 's/^evidence.*\(cell = \).*/fitted/p')
+	check "a timing model was fitted" "$fit" "fitted"
+
+	# --mode bits must still work on a flux image
+	w=$("$dr" repair "$out/shift.scp" --mode bits --json 2>/dev/null |
+	    sed -n 's/.*"searched_weight":\([0-9]*\).*/\1/p')
+	check "bit-flip engine still finds it at weight 2" "$w" "2"
+
+	# libhxcfe settings can be overridden before the load
+	if "$dr" scan "$out/shift.scp" --set FLUXSTREAM_PLL_MAX_ERROR_NS=900 \
+	        >/dev/null 2>&1; then ok "--set is accepted"
+	else bad "--set is accepted"; fi
 else
 	echo "  skip flux tests (no python3)"
 fi

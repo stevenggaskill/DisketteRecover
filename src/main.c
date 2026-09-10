@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "dr_internal.h"
 
@@ -26,6 +27,15 @@ static const char *usage_text =
 "  --sector N        sector index from `scan` (default: first bad CRC)\n"
 "  --track T --side S --id R     select by physical address instead\n"
 "\n"
+"engine options:\n"
+"  --mode M          auto | bits | rebin   (default auto)\n"
+"                      bits  : search bit flips (works without flux)\n"
+"                      rebin : re-read the flux under another legal\n"
+"                              binning of the transitions (MFM + flux)\n"
+"  --bin-budget N    nats of timing cost a re-bin may spend (12)\n"
+"  --max-ambiguous N refuse to search past this many open intervals (40)\n"
+"  --max-explore N   cap on re-binning assignments tested (2000000)\n"
+"\n"
 "model options:\n"
 "  --threshold P     p_err below this is 'assumed good' (default 1e-3)\n"
 "  --base-perr P     prior error rate with no timing evidence (2e-4)\n"
@@ -45,6 +55,8 @@ static const char *usage_text =
 "  --out FILE        required\n"
 "\n"
 "other:\n"
+"  --set NAME=VALUE  override a libhxcfe setting before loading, e.g.\n"
+"                    --set FLUXSTREAM_PLL_MAX_ERROR_NS=900 (repeatable)\n"
 "  --json            machine readable output\n"
 "  --port N          port for `serve` (default 842)\n"
 "  --bind ADDR       bind address for `serve` (default 127.0.0.1)\n"
@@ -64,14 +76,18 @@ typedef struct {
 	const char *out;
 	const char *format;
 	const char *bits;
+	char *const *sets;
+	int    nsets;
 	dr_options opt;
 } args;
 
 static int parse_args(int argc, char **argv, args *a)
 {
 	int i;
+	static char *setbuf[32];
 
 	memset(a, 0, sizeof(*a));
+	a->sets = setbuf;
 	dr_options_default(&a->opt);
 	a->sector = -1;
 	a->track = a->side = a->id = -1;
@@ -98,6 +114,15 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--max-weight"))a->opt.max_weight = atoi(NEXT());
 		else if (!strcmp(o, "--max-pool")) a->opt.max_pool = atoi(NEXT());
 		else if (!strcmp(o, "--max-results"))a->opt.max_results = atoi(NEXT());
+		else if (!strcmp(o, "--bin-budget")) a->opt.bin_budget = atof(NEXT());
+		else if (!strcmp(o, "--max-explore")) a->opt.max_explore = atol(NEXT());
+		else if (!strcmp(o, "--max-ambiguous")) a->opt.max_ambiguous = atoi(NEXT());
+		else if (!strcmp(o, "--mode")) {
+			const char *m = NEXT();
+			if (!strcmp(m, "bits"))       a->opt.mode = DR_MODE_BITS;
+			else if (!strcmp(m, "rebin")) a->opt.mode = DR_MODE_REBIN;
+			else                          a->opt.mode = DR_MODE_AUTO;
+		}
 		else if (!strcmp(o, "--apply"))    a->apply = atoi(NEXT());
 		else if (!strcmp(o, "--auto"))     a->autoapply = 1;
 		else if (!strcmp(o, "--out"))      a->out = NEXT();
@@ -105,6 +130,12 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--bits"))     a->bits = NEXT();
 		else if (!strcmp(o, "--port"))     a->port = atoi(NEXT());
 		else if (!strcmp(o, "--bind"))     a->bind = NEXT();
+		else if (!strcmp(o, "--set")) {
+			if (a->nsets < 32)
+				setbuf[a->nsets++] = (char *)NEXT();
+			else
+				(void)NEXT();
+		}
 		else if (!strcmp(o, "--json"))     a->json = 1;
 		else if (!strcmp(o, "-v"))         a->verbose = 1;
 		else if (!strcmp(o, "-vv"))        a->verbose = 2;
@@ -295,6 +326,92 @@ static void print_view(dr_view *v, int top)
 }
 
 /* ------------------------------------------------------------------ */
+/* Re-binning results move whole bursts, so list the bytes that changed
+ * rather than every individual bit. */
+static void print_rebin(dr_view *v, dr_repair_result *r, int limit)
+{
+	int i, k;
+
+	printf("\nsearch    : re-binning the flux - %d interval(s) left open by "
+	       "the timings,\n"
+	       "            %d that the timings re-read on their own; "
+	       "%ld assignment(s) tested\n",
+	       r->ambiguous, r->pinned_moves, r->explored);
+	if (r->note[0])
+		printf("            %s\n", r->note);
+
+	if (!r->count) {
+		printf("result    : no legal re-binning satisfies the CRC.\n");
+		if (r->truncated)
+			printf("            the search hit its cap - try a larger "
+			       "--max-explore or --bin-budget.\n");
+		return;
+	}
+
+	printf("result    : %d CRC-valid re-reading(s)%s\n", r->count,
+	       r->truncated ? " (search capped)" : "");
+	printf("            likeliest reading costs %.1f nats and %s the CRC\n",
+	       r->floor_cost, r->floor_valid ? "satisfies" : "does NOT satisfy");
+	if (r->count)
+		printf("            best CRC-valid reading costs %.1f nats "
+		       "(%.1f more than the likeliest)\n",
+		       r->list[0].flux_cost,
+		       r->list[0].flux_cost - r->floor_cost);
+	if (r->count > 1) {
+		double margin = r->list[1].rel_likelihood > 0.0
+		        ? 1.0 / r->list[1].rel_likelihood : 0.0;
+		printf("margin    : the top re-reading is %.3g x more likely than "
+		       "the next; %s\n", margin,
+		       margin >= 100.0 ? "clear winner"
+		                       : "NOT a clear winner - inspect before applying");
+	}
+
+	/* A 16-bit CRC can only settle 16 unknowns. Say plainly when the
+	 * disturbed region carries more than that. */
+	if (r->uncertain_bits > 0) {
+		printf("budget    : %d message bit(s) still in doubt across the "
+		       "disturbed region;\n"
+		       "            a 16-bit CRC pins down 16, so expect ~%.3g "
+		       "reading(s) to pass it\n",
+		       r->uncertain_bits,
+		       r->uncertain_bits > 16
+		           ? pow(2.0, r->uncertain_bits - 16) : 1.0);
+	}
+	if (r->current_cost > 0.0)
+		printf("            re-binning explains the timings far better "
+		       "than the decoder did:\n"
+		       "            %.0f nats -> %.0f nats over the disturbed "
+		       "intervals\n", r->current_cost, r->floor_cost);
+
+	printf("\n rank  bits  re-bins  rel.likelihood  changed bytes\n");
+	printf(" ----  ----  -------  --------------  "
+	       "------------------------------------\n");
+
+	for (i = 0; i < r->count && i < limit; i++) {
+		dr_candidate *cd = &r->list[i];
+		uint8_t *m = dr_candidate_message(v, cd);
+		int shown = 0, lastbyte = -1;
+
+		printf(" %4d  %4d  %7d  %14.6g  ", i, cd->weight, cd->rebins,
+		       cd->rel_likelihood);
+		for (k = 0; k < cd->weight && m; k++) {
+			int b = cd->bits[k] >> 3;
+			if (b == lastbyte)
+				continue;
+			lastbyte = b;
+			if (shown == 6) {
+				printf(", ...");
+				break;
+			}
+			printf("%s%d:%02X->%02X", shown ? ", " : "",
+			       b, v->msg[b], m[b]);
+			shown++;
+		}
+		printf("\n");
+		free(m);
+	}
+}
+
 static void print_candidates(dr_view *v, dr_repair_result *r, int limit)
 {
 	int i, k;
@@ -404,7 +521,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	c = dr_open(a.image, a.verbose);
+	c = dr_open_ex(a.image, a.verbose, a.sets, a.nsets);
 	if (!c)
 		return 1;
 	if (!c->floppy) {
@@ -509,11 +626,38 @@ int main(int argc, char **argv)
 
 		if (!strcmp(a.cmd, "repair")) {
 			dr_repair_result r;
+			int use_rebin;
 
 			if (!a.json)
 				print_view(v, 12);
 
-			if (dr_repair_search(v, &a.opt, &r) < 0) {
+			/* Re-binning only makes sense when there are real
+			 * timings to re-bin; otherwise fall back to bit
+			 * flips, and say so. */
+			use_rebin = (a.opt.mode == DR_MODE_REBIN) ||
+			            (a.opt.mode == DR_MODE_AUTO &&
+			             v->flux_available &&
+			             v->encoding == DR_ENC_ISO_MFM);
+
+			if (use_rebin) {
+				if (dr_rebin_search(v, &a.opt, &r) < 0) {
+					fprintf(stderr, "re-binning search failed\n");
+					dr_view_free(v);
+					dr_close(c);
+					return 1;
+				}
+				if (!r.count && a.opt.mode == DR_MODE_AUTO) {
+					if (!a.json)
+						print_rebin(v, &r, 16);
+					dr_repair_free(&r);
+					if (!a.json)
+						printf("\nfalling back to a bit-flip "
+						       "search.\n");
+					use_rebin = 0;
+				}
+			}
+
+			if (!use_rebin && dr_repair_search(v, &a.opt, &r) < 0) {
 				fprintf(stderr, "search failed\n");
 				dr_view_free(v);
 				dr_close(c);
@@ -523,6 +667,8 @@ int main(int argc, char **argv)
 			if (a.json) {
 				dr_json_candidates(v, &r, 0, 0, stdout);
 				printf("\n");
+			} else if (use_rebin) {
+				print_rebin(v, &r, 16);
 			} else {
 				print_candidates(v, &r, 16);
 			}

@@ -163,10 +163,20 @@ void dr_json_candidates(const dr_view *v, const dr_repair_result *r,
 
 		fprintf(f, "{\"count\":%d,\"offset\":%d,\"pool\":%d,"
 		           "\"searched_weight\":%d,\"truncated\":%s,"
-		           "\"margin\":%.6g,\"flux\":%s,\"candidates\":[",
+		           "\"margin\":%.6g,\"flux\":%s,\"rebin\":%s,"
+		           "\"ambiguous\":%d,\"uncertain_bits\":%d,"
+		           "\"explored\":%ld,\"floor_cost\":%.6g,"
+		           "\"current_cost\":%.6g,\"floor_valid\":%s,"
+		           "\"note\":",
 		        r->count, offset, r->npool, r->searched_weight,
 		        r->truncated ? "true" : "false", margin,
-		        v->flux_available ? "true" : "false");
+		        v->flux_available ? "true" : "false",
+		        r->rebin ? "true" : "false",
+		        r->ambiguous, r->uncertain_bits, r->explored,
+		        r->floor_cost, r->current_cost,
+		        r->floor_valid ? "true" : "false");
+		json_str(f, r->note);
+		fprintf(f, ",\"candidates\":[");
 	}
 
 	for (i = offset; i < offset + limit; i++) {
@@ -174,9 +184,11 @@ void dr_json_candidates(const dr_view *v, const dr_repair_result *r,
 		uint8_t *m = dr_candidate_message(v, cd);
 
 		fprintf(f, "%s{\"rank\":%d,\"weight\":%d,\"loglik\":%.6g,"
-		           "\"rel\":%.6g,\"bits\":[",
+		           "\"rel\":%.6g,\"rebins\":%d,\"flux_cost\":%.6g,"
+		           "\"bits\":[",
 		        i > offset ? "," : "", i, cd->weight,
-		        cd->log_likelihood, cd->rel_likelihood);
+		        cd->log_likelihood, cd->rel_likelihood,
+		        cd->rebins, cd->flux_cost);
 		for (k = 0; k < cd->weight; k++)
 			fprintf(f, "%s%d", k ? "," : "", cd->bits[k]);
 		fprintf(f, "],\"edits\":[");

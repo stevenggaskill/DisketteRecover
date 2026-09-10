@@ -104,6 +104,13 @@ tr.sel td{background:rgba(106,169,255,.12)}
       <label class="kv">good threshold <input id="thr" type="text" size="7" value="1e-3"></label>
       <label class="kv">max weight <input id="wmax" type="number" min="1" max="6" value="3" style="width:60px"></label>
       <label class="kv">pool <input id="pool" type="number" min="8" max="512" value="96" style="width:70px"></label>
+      <label class="kv">engine
+        <select id="mode">
+          <option value="auto">auto</option>
+          <option value="rebin">re-bin flux</option>
+          <option value="bits">bit flips</option>
+        </select>
+      </label>
       <button id="search" class="primary">search</button>
       <button id="next" disabled>next candidate &#8594;</button>
       <button id="prev" disabled>&#8592; previous</button>
@@ -385,17 +392,35 @@ async function doSearch(){
   $("#searchinfo").textContent = "searching...";
   const q = new URLSearchParams({
     sector: $("#sector").value, weight: $("#wmax").value,
-    pool: $("#pool").value, threshold: $("#thr").value, limit: 200
+    pool: $("#pool").value, threshold: $("#thr").value,
+    mode: $("#mode").value, limit: 200
   });
   cands = await getJSON("/api/repair?" + q);
   const has = cands.count > 0;
   sel = has ? 0 : -1;
   $("#next").disabled = $("#prev").disabled = !has;
   $("#apply").disabled = !has;
-  $("#searchinfo").textContent =
-    `${cands.pool} bits in pool, searched to weight ${cands.searched_weight}: `
-    + (has ? `${cands.count} CRC-valid candidate(s) at weight ${cands.candidates[0].weight}`
-           : "no CRC-valid correction found - raise max weight or the threshold");
+
+  const parts = [];
+  if (cands.rebin){
+    parts.push(`re-binning the flux: ${cands.ambiguous} disturbed interval(s), `
+             + `${cands.explored} reading(s) tested`);
+    if (cands.uncertain_bits > 16)
+      parts.push(`${cands.uncertain_bits} bits still in doubt vs 16 bits of CRC `
+               + `- expect ~2^${cands.uncertain_bits - 16} readings to pass it`);
+  } else {
+    parts.push(`${cands.pool} bits in pool, searched to weight `
+             + `${cands.searched_weight}`);
+  }
+  parts.push(has ? `${cands.count} CRC-valid reading(s)`
+                 : "no CRC-valid correction found");
+  if (has && cands.margin)
+    parts.push(`top is ${(+cands.margin).toPrecision(3)}x the next`
+             + (cands.margin >= 100 ? " - clear winner"
+                                    : " - NOT a clear winner"));
+  if (!cands.flux)
+    parts.push("no flux timing: equal-weight candidates cannot be ranked");
+  $("#searchinfo").textContent = parts.join(" | ");
   paintCands(); paintHex(); paintStrip();
 }
 
@@ -406,10 +431,10 @@ function paintCands(){
   cands.candidates.forEach((c, i) => {
     const tr = document.createElement("tr");
     if (i === sel) tr.className = "sel";
-    const flips = c.edits.map(e =>
+    const flips = (c.edits || []).slice(0, 8).map(e =>
       `byte ${e.byte} bit ${e.bitpos}: ${e.from}&rarr;${e.to} <span class="small">(p=${(+e.perr).toExponential(1)})</span>`
     ).join("<br>");
-    tr.innerHTML = `<td>${i}</td><td>${c.weight}</td>`
+    tr.innerHTML = `<td>${i}</td><td>${c.weight}${c.rebins ? " / " + c.rebins + " re-bin" : ""}</td>`
       + `<td>${(+c.rel).toExponential(3)}</td><td>${flips}</td>`
       + `<td class="small">${c.data.slice(0,32)}&hellip;</td>`;
     tr.onclick = () => { sel = i; paintCands(); paintHex(); paintStrip(); focusEdit(); };

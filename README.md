@@ -69,42 +69,150 @@ a guess, and that is where the sector broke.
 ### 3. Bin the transitions and assign probabilities
 
 Each flux interval is divided by the local cell period and compared with
-the cell count the decoder actually assigned it. The distance to the
-nearest decision boundary is the *margin*; assuming Gaussian timing
-jitter with standard deviation `--jitter` (in cell periods), the
-probability that the interval was binned wrongly is
+where a 2T, 3T or 4T interval *actually lands on this track* - which is
+not 2.0, 3.0 and 4.0. Two effects move the bin centres:
+
+* the dump's bitrate estimate is never exact, and
+* **peak shift** - adjacent reversals repel each other, so a 2T following
+  a 4T reads long and the next one reads short.
+
+So the centres are learned rather than assumed, by a robust fit of
 
 ```
-p_err = 0.5 * erfc(margin / (jitter * sqrt(2)))
+measured_cells  ~  a + b*bin + c*previous_bin + d*next_bin
 ```
 
-That probability is spread across every cell the interval covers - any of
-them could have carried the reversal - and each decoded bit inherits the
+On a real KryoFlux dump this comes out at `cell = -0.18 + 1.033*bin` with
+a residual sigma of **0.075 cells**. Scoring against the ideal 2/3/4
+instead would call a sixth of a perfectly good track ambiguous.
+
+Each interval then gets a posterior over the three legal bins,
+
+```
+p(bin = k)  =  softmax( -(measured - centre_k)^2 / 2*sigma^2 )
+```
+
+and `1 - p(the bin the decoder chose)` is its error probability. That
+probability is spread across every cell the interval covers - any of them
+could have carried the reversal - and each decoded bit inherits the
 combined probability of the two cells that produce it. Cells libhxcfe
-already flagged as weak are floored at a high probability, unless the
-flag fires so widely that it carries no information. Anything below
-`--threshold` is **assumed good** and is left out of the search.
+flagged as weak are floored at a high probability, unless the flag fires
+so widely that it carries no information. Anything below `--threshold` is
+**assumed good** and is left out of the search.
 
-### 4. Cycle through the most likely corrections
+The residuals of a real dump are near-Gaussian out to about 4 sigma and
+then break cleanly into a separate population of genuine mis-reads, so
+that is where the defect detector draws its line.
 
-A CRC is affine over GF(2): flipping message bit *p* always XORs a fixed
-mask into the CRC, whatever the data is. So repairing a sector is finding
-a set of bits whose masks XOR to the current syndrome - which turns into
-a hash lookup rather than a re-computation per trial.
+### 4. Two engines: bit flips, and re-reading the flux
+
+There are two ways to make a sector's CRC come out right, and they suit
+different damage.
+
+**Bit flips** (`--mode bits`). A CRC is affine over GF(2): flipping
+message bit *p* always XORs a fixed mask into the CRC, whatever the data
+is. So repairing a sector is finding a set of bits whose masks XOR to the
+current syndrome - a hash lookup rather than a re-computation per trial.
 
 * weight 1 and 2 are searched **exhaustively** over the whole field, so
-  the search works even on images with no timing information at all;
+  this works even on images with no timing information at all;
 * weight 3 and up enumerate the least trustworthy bits and let the hash
   supply the remaining one;
 * the search stops at the first weight that yields a CRC-valid reading;
-* every survivor is re-verified by actually recomputing the CRC;
-* candidates are ranked by the product of their bits' error
-  probabilities, so the most plausible reading comes first.
+* every survivor is re-verified by actually recomputing the CRC.
+
+This is the right tool for an isolated error - a transition displaced by
+most of a cell, a single dropped bit.
+
+**Re-binning the flux** (`--mode rebin`, the default whenever there are
+timings to work with). Real disks rarely lose a bit outright. They fail
+by putting a reversal in the *wrong bin*, and the failure conserves
+something - which is the whole point. See the next section.
+
+`--mode auto` (the default) re-bins when the image carries flux and the
+track is MFM, and falls back to bit flips otherwise, or when re-binning
+comes up empty.
+
+Press `next candidate` (or `n`) in the browser to step through the
+results; the flux strip and the hex dump update to show the reading each
+one implies.
+
+### 4a. What MFM's three interval widths actually buy you
+
+MFM writes exactly **three** interval lengths. Between one magnetic
+reversal and the next there are 2, 3 or 4 cell periods and nothing else -
+4 us, 6 us or 8 us on a 250 kbit/s DD disk. So the flux really is a
+ternary symbol stream, and it is tempting to count redundancy from there:
+a byte is roughly six intervals, 3^6 = 729 possibilities for 256 byte
+values, so surely there is a factor of ~3 of redundancy to exploit.
+
+It is a good instinct, but the arithmetic does not survive contact with
+the encoding, and the redundancy that *does* exist is somewhere else -
+somewhere more useful.
+
+**A byte is not a fixed number of intervals.** Eight data bits occupy 16
+cell periods, and the intervals tiling those 16 cells vary in number:
+between four (4+4+4+4) and eight (2 x 8), averaging 16/3 = 5.33. There is
+no fixed-length symbol to count.
+
+**The tilings are fewer than the bytes, not more.** There are exactly
+**165** ways to tile a 16-cell window with parts of 2, 3 and 4 - fewer
+than the 256 values a byte can take. The shortfall is not a paradox: the
+tiling of one byte is not independent of its neighbours. The last data
+bit of the previous byte decides where this byte's first reversal can
+fall, so the mapping is a state machine, not a per-byte code.
+
+**The real combinatorial redundancy is small.** MFM's cell stream obeys
+the (d=1, k=3) run-length constraint: at least one and at most three zero
+cells between reversals. That constraint has a Shannon capacity of
+**0.5515 bits per cell**, and MFM carries exactly 0.5 - so it is 90.7%
+efficient, and the spare capacity is only **0.82 bits per byte**. Not a
+factor of three. MFM is a *good* code; there is not much slack left in
+the symbol alphabet.
+
+**But there is a conservation law, and it is worth far more.** When a PLL
+mis-bins an interval it does not lose the time - it takes it from the
+next interval. A true (4,2) reads back as (3,3). The pair still spans six
+cells. And downstream of the error the byte grid still framed correctly:
+the sync was found, the sector ended where it should. So *the cell count
+across a disturbed stretch is known*, even when the individual intervals
+inside it are not.
+
+That is the constraint DisketteRecover enforces. A candidate re-reading
+must
+
+* give every interval a legal length (2, 3 or 4 cells), and
+* span exactly the cells the original reading spanned.
+
+Together those two rules cut the search space down enormously - far more
+than the 0.82 bits per byte of alphabet redundancy would. On the real
+disk below, they take a stretch the decoder read at a timing cost of 1711
+nats down to 429, and pin the damage to fifteen specific interval pairs.
+
+The engine also models the two other physical failures, because both
+conserve cell count in the same way:
+
+| failure  | what the flux shows              | what the search does        |
+|----------|----------------------------------|-----------------------------|
+| mis-bin  | adjacent intervals off by +1/-1  | re-bin the pair             |
+| dropout  | one interval covers two real ones| split it, at a fixed penalty|
+| spurious | two intervals cover one real one | merge them, likewise        |
+
+Each disturbed stretch is solved independently by a shortest-path search
+over its legal re-readings, and the stretches are then combined in cost
+order and tested against the CRC.
+
+### 5. Cycle through the most likely corrections
+
+Whichever engine ran, the results come back ranked - by the product of
+the flipped bits' error probabilities for a bit-flip search, or by how
+well the re-reading explains the measured timings for a re-bin. The most
+plausible reading is first; `--apply K` takes the Kth.
 
 Press `next candidate` (or `n`) in the browser to step through them; the
 flux strip and the hex dump update to show the reading each one implies.
 
-### 5. Write the corrected image back
+### 6. Write the corrected image back
 
 `apply` patches the bit cells in the track - re-encoding the affected
 bytes so the MFM clock cells stay legal - then re-runs libhxcfe's decoder
@@ -121,12 +229,18 @@ field offers a few thousand places to flip a bit, so **alternative
 readings that also satisfy the CRC are normal, not exceptional** - a
 three-bit error will quite often have a one-bit alias.
 
-DisketteRecover therefore does two things rather than one: it tells you
-how much the top candidate wins by, and it tells you when the ranking is
-meaningless.
+DisketteRecover therefore does three things rather than one: it tells you
+how much the top candidate wins by, it tells you when the ranking is
+meaningless, and it tells you when the CRC simply does not carry enough
+information to settle the question.
 
 ```
 margin    : the top candidate is 1.75e+03 x more likely than the next; clear winner
+```
+
+```
+budget    : 108 message bit(s) still in doubt across the disturbed region;
+            a 16-bit CRC pins down 16, so expect ~5e+27 reading(s) to pass it
 ```
 
 ```
@@ -140,14 +254,59 @@ The ranking is only as good as the evidence. On a sector-level image
 (IMG, HFE, ADF) there is no timing to bin, every bit gets the same prior,
 and all the tool can offer is "here are the minimum-weight readings".
 On a flux dump (SCP, KryoFlux stream, A2R, DFI, MFI, HxC stream, FDX) the
-margins are real and the top candidate is usually right by a wide margin.
+margins are real and an isolated defect is usually resolved by a wide
+margin.
 
 Currently supported encodings for repair: **ISO/IBM MFM** (System 34, the
-PC/Atari/Amstrad family) and **ISO/IBM FM** (System 3740). Amiga MFM uses
-a checksum rather than a CRC-16 and is not handled yet; nor are the GCR
-formats.
+PC/Atari/Amstrad family) and **ISO/IBM FM** (System 3740). Re-binning is
+MFM-only. Amiga MFM uses a checksum rather than a CRC-16 and is not
+handled yet; nor are the GCR formats.
 
----
+### A worked case: a real KryoFlux dump
+
+An 84-track KryoFlux dump of a real 720K disk, 1440 sectors, two of them
+with a bad data CRC - sector 6 on side 1 of tracks 72 *and* 73. The same
+sector on adjacent tracks is the signature of a physical mark rather than
+a random error.
+
+`inspect` fits the track's timing to a sigma of 0.075 cells and finds the
+damage immediately - a stretch of bytes 381-454 where intervals sit 10 to
+16 sigma from any legal bin centre, in **adjacent pairs of opposite
+sign**:
+
+```
+  cell  6187 (byte 386)  gap 4  meas  2.846  z  -15.82
+  cell  6189 (byte 386)  gap 2  meas  3.238  z  +16.03
+  cell  6266 (byte 391)  gap 3  meas  3.849  z  +11.25
+  cell  6269 (byte 391)  gap 3  meas  2.173  z  -11.63
+```
+
+That is the mis-bin signature exactly: the decoder took a cell from one
+interval and gave it to the next. Fifteen such pairs. Re-binning them
+drops the timing cost of the disturbed region from **1711 nats to 429**,
+and the corrected reading is far more plausible than the decoder's.
+
+And yet the sector is still not recoverable, and the tool says so:
+
+```
+budget    : 108 message bit(s) still in doubt across the disturbed region;
+            a 16-bit CRC pins down 16, so expect ~5e+27 reading(s) to pass it
+margin    : the top re-reading is 2.63 x more likely than the next;
+            NOT a clear winner - inspect before applying
+```
+
+Fifteen independent glitches put roughly a hundred bits in play. Sixteen
+bits of CRC cannot choose between 2^92 readings, and the timings - which
+would otherwise break the tie - are themselves disturbed across that
+whole stretch. The correct output here is a precise diagnosis and a
+refusal to guess, not a confident wrong answer.
+
+What would actually recover it: another dump. A second read of the same
+disk, or a different drive, gives independent timings over the same
+bytes; where this dump is 12 sigma off, another may not be. (libhxcfe
+already tries the other revolutions inside one dump - that is
+`FLUXSTREAM_SECTORS_RECOVERY`, on by default - and it did not help here,
+which says the defect is stable rather than intermittent.)
 
 ## Building
 
@@ -183,6 +342,15 @@ selection:
   --sector N        sector index from `scan` (default: first bad CRC)
   --track T --side S --id R     select by physical address instead
 
+engine options:
+  --mode M          auto | bits | rebin   (default auto)
+                      bits  : search bit flips (works without flux)
+                      rebin : re-read the flux under another legal
+                              binning of the transitions (MFM + flux)
+  --bin-budget N    nats of timing cost a re-bin may spend (12)
+  --max-ambiguous N refuse to search past this many open intervals (48)
+  --max-explore N   cap on re-binning assignments tested (500000)
+
 model options:
   --threshold P     p_err below this is 'assumed good' (default 1e-3)
   --base-perr P     prior error rate with no timing evidence (2e-4)
@@ -193,10 +361,30 @@ model options:
 
 repair options:
   --apply K         apply candidate K (0 = most likely) and verify
-  --auto            apply candidate 0 when the search is unambiguous
+  --auto            apply candidate 0 only when it clearly wins
   --out FILE        write the patched image
   --format NAME     export format for --out (default: HXC_HFE)
+
+other:
+  --set NAME=VALUE  override a libhxcfe setting before loading, e.g.
+                    --set FLUXSTREAM_PLL_MAX_ERROR_NS=900 (repeatable)
+  --json            machine readable output
 ```
+
+### KryoFlux, SuperCard Pro and other flux dumps
+
+Point the tool at any file in the set and libhxcfe pulls in the rest:
+
+```sh
+disketterecover scan   "Disk 1/track00.0.raw"     # KryoFlux stream set
+disketterecover repair "Disk 1/track00.0.raw" --sector 1310
+```
+
+`--set` reaches libhxcfe's own decoder settings, which is occasionally
+what a marginal dump needs - `FLUXSTREAM_PLL_MAX_ERROR_NS`,
+`FLUXSTREAM_PLL_PHASE_CORRECTION_DIVISOR`,
+`FLUXSTREAM_BITRATE_FILTER_WINDOW` and friends. They are documented in
+`third_party/HxCFloppyEmulator/libhxcfe/sources/init.script`.
 
 ### Worked example
 
@@ -253,7 +441,8 @@ python3 tests/tools/scp_jitter.py good.scp broken.scp \
 src/dr_core.c     image load/save, sector scan, cell encode/decode
 src/dr_view.c     the zoomed view: cells, flux bins, confidence model
 src/dr_flux.c     realigning the cell stream with the raw pulse list
-src/dr_repair.c   the GF(2) CRC search and the patcher
+src/dr_repair.c   the GF(2) CRC bit-flip search and the patcher
+src/dr_rebin.c    the flux re-binning list decoder
 src/dr_crc.c      CRC-16/CCITT and its per-bit linear masks
 src/dr_json.c     JSON for the CLI and the viewer
 src/dr_http.c     the built-in HTTP server

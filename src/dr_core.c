@@ -50,10 +50,43 @@ void dr_options_default(dr_options *o)
 	o->max_weight     = 3;
 	o->max_pool       = 96;
 	o->max_results    = 256;
+
+	o->mode           = DR_MODE_AUTO;
+	o->bin_budget     = 12.0;   /* nats; ~e^-12 relative likelihood   */
+	o->max_explore    = 500000;
+	o->max_ambiguous  = 48;
+	o->rebin_width    = 24;
 }
 
 /* ------------------------------------------------------------------ */
+static int dr_set_env(dr_ctx *c, const char *assignment)
+{
+	char name[128];
+	const char *eq;
+	size_t n;
+
+	if (!c || !c->hxcfe || !assignment)
+		return -1;
+
+	eq = strchr(assignment, '=');
+	if (!eq)
+		return -1;
+	n = (size_t)(eq - assignment);
+	if (n == 0 || n >= sizeof(name))
+		return -1;
+	memcpy(name, assignment, n);
+	name[n] = 0;
+
+	return hxcfe_setEnvVar(c->hxcfe, name, (char *)(eq + 1));
+}
+
 dr_ctx *dr_open(const char *path, int verbose)
+{
+	return dr_open_ex(path, verbose, NULL, 0);
+}
+
+dr_ctx *dr_open_ex(const char *path, int verbose,
+                   char *const *sets, int nsets)
 {
 	dr_ctx *c;
 	int32_t err = 0;
@@ -72,6 +105,17 @@ dr_ctx *dr_open(const char *path, int verbose)
 		return c;
 	}
 	hxcfe_setOutputFunc(c->hxcfe, dr_printf);
+
+	/* Loader and PLL settings are read while the image is decoded, so
+	 * they have to be in place before the load. */
+	{
+		int i;
+		for (i = 0; i < nsets; i++) {
+			if (dr_set_env(c, sets[i]) < 0)
+				fprintf(stderr, "warning: could not set '%s'\n",
+				        sets[i]);
+		}
+	}
 
 	c->loader = hxcfe_imgInitLoader(c->hxcfe);
 	if (!c->loader) {

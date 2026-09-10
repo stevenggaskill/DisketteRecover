@@ -226,6 +226,13 @@ static void handle(struct srv *s, int fd, const char *method,
 		struct jcand a;
 
 		s->opt.max_weight     = qs_int(query, "weight", s->opt.max_weight);
+		{
+			char m[16];
+			qs_str(query, "mode", m, sizeof(m));
+			if (!strcmp(m, "bits"))       s->opt.mode = DR_MODE_BITS;
+			else if (!strcmp(m, "rebin")) s->opt.mode = DR_MODE_REBIN;
+			else if (m[0])                s->opt.mode = DR_MODE_AUTO;
+		}
 		s->opt.max_pool       = qs_int(query, "pool", s->opt.max_pool);
 		s->opt.good_threshold = qs_dbl(query, "threshold",
 		                               s->opt.good_threshold);
@@ -240,7 +247,21 @@ static void handle(struct srv *s, int fd, const char *method,
 			return;
 		}
 		if (!s->have_res) {
-			dr_repair_search(v, &s->opt, &s->res);
+			int rebin = (s->opt.mode == DR_MODE_REBIN) ||
+			            (s->opt.mode == DR_MODE_AUTO &&
+			             v->flux_available &&
+			             v->encoding == DR_ENC_ISO_MFM);
+
+			if (rebin) {
+				dr_rebin_search(v, &s->opt, &s->res);
+				if (!s->res.count &&
+				    s->opt.mode == DR_MODE_AUTO) {
+					dr_repair_free(&s->res);
+					rebin = 0;
+				}
+			}
+			if (!rebin)
+				dr_repair_search(v, &s->opt, &s->res);
 			s->have_res = 1;
 		}
 		a.v = v;

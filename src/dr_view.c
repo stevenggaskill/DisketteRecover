@@ -36,23 +36,12 @@ static void set_perr(dr_cell *c, double p, dr_evidence ev)
 	}
 }
 
-/* Find the reversal at or before `cell`, scanning back at most `limit`. */
-static int prev_reversal(const HXCFE_SIDE *s, int cell, int limit)
-{
-	int i;
-
-	for (i = 0; i < limit; i++) {
-		if (dr_getcell(s, cell - i))
-			return cell - i;
-	}
-	return cell - limit;
-}
-
 dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 {
 	dr_view *v;
 	HXCFE_SIDE *side;
 	dr_flux_map *flux = NULL;
+	dr_timing tm;
 	const dr_sector *sd;
 	dr_options defopt;
 	int stride, base, span, i, k;
@@ -134,6 +123,8 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 		cc->state = (uint8_t)dr_getcell(side, base + i);
 		cc->weak = (uint8_t)dr_getweak(side, base + i);
 		cc->bin = -1;
+		cc->best_bin = -1;
+		cc->p_bin = -1.0f;
 		cc->interval_ticks = -1;
 		cc->interval_cells = -1.0f;
 		cc->margin = -1.0f;
@@ -145,87 +136,109 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 			nweak++;
 	}
 
-	flux = dr_flux_build(c, side);
+	v->flux = dr_flux_build(c, side);
+	flux = (dr_flux_map *)v->flux;
 	v->flux_available = flux ? 1 : 0;
 
-	/* ---- walk the flux intervals covering the window ------------ */
+	/* ---- fit the track's own timing, then bin against it -------- */
+	/* What a 2T, 3T or 4T interval actually measures depends on the
+	 * dump's bitrate error and on peak shift from its neighbours, so
+	 * the bin centres are learned from this track rather than assumed
+	 * to be 2.0/3.0/4.0. */
 	{
-		int prev = prev_reversal(side, base - 1, 32);
-		int abs_cell;
+		dr_interval *iv = NULL;
+		double period = 0.0;
+		int niv, j;
 
-		for (i = 0; i < span; i++) {
-			abs_cell = base + i;
-			if (!dr_getcell(side, abs_cell))
-				continue;
+		memset(&tm, 0, sizeof(tm));
+		niv = dr_intervals_collect(v, &iv, &period);
 
-			{
-				int gap = abs_cell - prev;
-				double p = opt->base_perr;
-				dr_evidence ev = DR_EV_NONE;
-				double cells_f = -1.0, margin = -1.0;
-				int32_t ticks = -1;
-				int bin = -1;
-				int lo, j;
+		if (niv > 0) {
+			dr_timing_fit(iv, niv, &tm);
+			for (j = 0; j < niv; j++)
+				iv[j].adj = dr_timing_adjust(&tm, iv[j].meas,
+				        j > 0 ? iv[j - 1].gap : 3,
+				        j + 1 < niv ? iv[j + 1].gap : 3);
+			v->period = period;
+			v->fit_a = tm.a;
+			v->fit_b = tm.b;
+			v->fit_sigma = tm.sigma;
+			v->fit_n = tm.n;
+		}
 
-				if (flux) {
-					uint32_t pi = flux->pulse_of_cell[
-					        dr_wrap(side->tracklen, abs_cell)];
-					if (pi != 0xFFFFFFFFu && pi < flux->nb_pulses) {
-						double bitrate = side->timingbuffer
-						        ? (double)side->timingbuffer[
-						              dr_wrap(side->tracklen, abs_cell) / 8]
-						        : (double)side->bitrate;
-						double period;
+		for (j = 0; j < niv; j++) {
+			double p = opt->base_perr;
+			double margin = -1.0, p_bin = -1.0;
+			dr_evidence ev = DR_EV_NONE;
+			int gap = iv[j].gap;
+			int best_bin = -1, lo, m;
 
-						if (bitrate < 1000.0)
-							bitrate = (double)side->bitrate;
-						period = (double)flux->tick_freq /
-						         (2.0 * bitrate);
+			if (iv[j].meas > 0.0)
+				nflux++;
 
-						ticks = (int32_t)flux->stream[pi];
-						if (period > 0.0) {
-							double d;
-							cells_f = (double)ticks / period;
-							bin = gap;
-							d = fabs(cells_f - (double)gap);
-							margin = 0.5 - d;
-							if (margin < 0.0)
-								margin = 0.0;
-							if (margin > 0.5)
-								margin = 0.5;
-							p = tail_prob(margin, opt->jitter);
-							ev = DR_EV_FLUX;
-							nflux++;
-						}
+			if (iv[j].meas > 0.0 && tm.valid) {
+				/* Posterior over the three legal bins. */
+				double cost[5], best = 1e18, sum = 0.0;
+				int k;
+
+				for (k = 2; k <= 4; k++) {
+					cost[k] = dr_bin_cost(&tm, iv[j].adj, k);
+					if (cost[k] < best) {
+						best = cost[k];
+						best_bin = k;
 					}
 				}
+				for (k = 2; k <= 4; k++)
+					sum += exp(-(cost[k] - best));
 
-				/* Illegal MFM cell spacing: something is wrong
-				 * here whatever the timings say. */
-				if (v->encoding == DR_ENC_ISO_MFM &&
-				    (gap < 2 || gap > 4)) {
-					if (VIOLATION_PERR > p) {
-						p = VIOLATION_PERR;
-						ev = DR_EV_VIOLATION;
-					}
-				}
+				p_bin = (gap >= 2 && gap <= 4)
+				          ? exp(-(cost[gap] - best)) / sum : 0.0;
+				p = 1.0 - p_bin;
 
-				/* The whole interval is jointly uncertain: the
-				 * reversal could have landed on any cell in it. */
-				lo = prev + 1;
-				if (lo < base)
-					lo = base;
-				for (j = lo; j <= abs_cell; j++) {
-					dr_cell *cc = &v->cells[j - base];
-					cc->interval_ticks = ticks;
-					cc->interval_cells = (float)cells_f;
-					cc->bin = bin;
-					cc->margin = (float)margin;
-					set_perr(cc, p, ev);
+				/* How far the measurement sits from the boundary
+				 * with its nearest rival, in cell periods. */
+				margin = 0.5 - fabs(iv[j].adj -
+				        (tm.a + tm.b * (double)best_bin)) /
+				        (tm.b > 0.1 ? tm.b : 1.0);
+				if (margin < 0.0) margin = 0.0;
+				if (margin > 0.5) margin = 0.5;
+				ev = DR_EV_FLUX;
+			} else if (iv[j].meas > 0.0) {
+				double d = fabs(iv[j].meas - (double)gap);
+				margin = 0.5 - d;
+				if (margin < 0.0)
+					margin = 0.0;
+				p = tail_prob(margin, opt->jitter);
+				ev = DR_EV_FLUX;
+			}
+
+			/* Illegal MFM cell spacing: something is wrong here
+			 * whatever the timings say. */
+			if (v->encoding == DR_ENC_ISO_MFM && (gap < 2 || gap > 4)) {
+				if (VIOLATION_PERR > p) {
+					p = VIOLATION_PERR;
+					ev = DR_EV_VIOLATION;
 				}
 			}
-			prev = abs_cell;
+
+			/* The whole interval is jointly uncertain: the reversal
+			 * could have landed on any cell inside it. */
+			lo = iv[j].cell - gap + 1;
+			if (lo < 0)
+				lo = 0;
+			for (m = lo; m <= iv[j].cell && m < span; m++) {
+				dr_cell *cc = &v->cells[m];
+				cc->interval_ticks = (int32_t)iv[j].ticks;
+				cc->interval_cells = (float)iv[j].meas;
+				cc->bin = gap;
+				cc->best_bin = best_bin;
+				cc->margin = (float)margin;
+				cc->p_bin = (float)p_bin;
+				set_perr(cc, p, ev);
+			}
 		}
+
+		free(iv);
 	}
 
 	/* libhxcfe's weak-bit flag is a strong hint when it picks out a few
@@ -281,13 +294,20 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 		}
 	}
 
-	snprintf(v->model, sizeof(v->model),
-	         flux ? "flux timing (%d/%d reversals binned, %d weak%s)"
-	              : "bitstream only (%d/%d reversals, %d weak%s)",
-	         nflux, nrev, nweak,
-	         (nweak && !weak_useful) ? ", ignored - too many" : "");
+	if (flux && tm.valid)
+		snprintf(v->model, sizeof(v->model),
+		         "flux timing, %d/%d reversals binned against cell = "
+		         "%.2f + %.3f*bin %+.3f*prev %+.3f*next, sigma %.3f "
+		         "(%d fitted)",
+		         nflux, nrev, tm.a, tm.b, tm.c, tm.d, tm.sigma, tm.n);
+	else
+		snprintf(v->model, sizeof(v->model),
+		         flux ? "flux timing (%d/%d reversals, no usable model, "
+		                "%d weak%s)"
+		              : "bitstream only (%d/%d reversals, %d weak%s)",
+		         nflux, nrev, nweak,
+		         (nweak && !weak_useful) ? ", ignored - too many" : "");
 
-	dr_flux_free(flux);
 	return v;
 }
 
@@ -295,6 +315,7 @@ void dr_view_free(dr_view *v)
 {
 	if (!v)
 		return;
+	dr_flux_free((dr_flux_map *)v->flux);
 	free(v->msg);
 	free(v->cells);
 	free(v->bytes);
