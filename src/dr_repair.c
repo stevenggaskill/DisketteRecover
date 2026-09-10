@@ -211,8 +211,20 @@ int dr_repair_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 		hput(hash, masks[i], i);
 
 	/* ---- the low-confidence pool, used for weight >= 3 ---------- */
+	/*
+	 * Media drops transitions far more readily than it invents them: a
+	 * weak pulse simply fails to clear the detector's threshold,
+	 * whereas a spurious one has to be manufactured out of noise.
+	 * Every error whose truth we have been able to check - eleven on
+	 * one disk, and the one unambiguous English correction on another -
+	 * has been a 1 read as a 0. --restore-only takes that literally and
+	 * considers nothing else, which also cuts a weight-3 search by
+	 * roughly eightfold.
+	 */
 	thr = opt->good_threshold;
 	for (i = v->first_bit; i < v->msg_bits; i++) {
+		if (opt->restore_only && msg_bit(v->msg, i))
+			continue;
 		if (v->bit_perr[i] < thr)
 			continue;
 		pool[npool].bit = i;
@@ -250,7 +262,7 @@ int dr_repair_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 
 		if (w == 1) {
 			int b = hget(hash, v->syndrome);
-			if (b >= 0) {
+			if (b >= 0 && !(opt->restore_only && msg_bit(v->msg, b))) {
 				bits[0] = b;
 				if (acc_add(&acc, v, bits, 1) < 0) {
 					rc = -1;
@@ -264,9 +276,14 @@ int dr_repair_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 			/* Exhaustive over the whole field: cheap and it does not
 			 * depend on any confidence model being available. */
 			for (i = v->first_bit; i < v->msg_bits; i++) {
-				int b = hget(hash,
-				             (uint16_t)(v->syndrome ^ masks[i]));
-				if (b > i) {
+				int b;
+
+				if (opt->restore_only && msg_bit(v->msg, i))
+					continue;
+				b = hget(hash,
+				         (uint16_t)(v->syndrome ^ masks[i]));
+				if (b > i &&
+				    !(opt->restore_only && msg_bit(v->msg, b))) {
 					bits[0] = i;
 					bits[1] = b;
 					if (acc_add(&acc, v, bits, 2) < 0) {

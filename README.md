@@ -104,10 +104,26 @@ The residuals of a real dump are near-Gaussian out to about 4 sigma and
 then break cleanly into a separate population of genuine mis-reads, so
 that is where the defect detector draws its line.
 
-### 4. Two engines: bit flips, and re-reading the flux
+### 4. Three engines, strongest evidence first
 
-There are two ways to make a sector's CRC come out right, and they suit
-different damage.
+There are several ways to make a sector's CRC come out right, and they
+suit different damage. `--mode auto` (the default) tries them in order of
+how decisive their evidence is when it applies.
+
+**Restoring the data's own regularity** (`--mode pattern`). Sector data
+is very often not random: a freshly formatted MS-DOS disk is 512 bytes of
+`0xF6`, an unused directory block is `0x00` or `0xE5`, a padded tail
+repeats. When 506 of 512 bytes read `0xF6` and the other six are each
+`0xF6` with a single bit missing, Occam has already answered the
+question - and the CRC only has to confirm it. This engine finds the
+repeat the field almost obeys, lists the bytes that break it, and
+enumerates by how few of them it has to leave broken. It needs no flux at
+all, and when it fires it is by far the most decisive thing available.
+
+**Re-binning the flux** (`--mode rebin`, whenever there are timings and
+the track is MFM). Real disks rarely lose a bit outright; they put a
+reversal in the wrong bin, and the failure conserves something. See the
+next section.
 
 **Bit flips** (`--mode bits`). A CRC is affine over GF(2): flipping
 message bit *p* always XORs a fixed mask into the CRC, whatever the data
@@ -121,21 +137,12 @@ current syndrome - a hash lookup rather than a re-computation per trial.
 * the search stops at the first weight that yields a CRC-valid reading;
 * every survivor is re-verified by actually recomputing the CRC.
 
-This is the right tool for an isolated error - a transition displaced by
-most of a cell, a single dropped bit.
+This is the fallback, and the right tool for an isolated error on an
+image that carries no other evidence.
 
-**Re-binning the flux** (`--mode rebin`, the default whenever there are
-timings to work with). Real disks rarely lose a bit outright. They fail
-by putting a reversal in the *wrong bin*, and the failure conserves
-something - which is the whole point. See the next section.
-
-`--mode auto` (the default) re-bins when the image carries flux and the
-track is MFM, and falls back to bit flips otherwise, or when re-binning
-comes up empty.
-
-Press `next candidate` (or `n`) in the browser to step through the
-results; the flux strip and the hex dump update to show the reading each
-one implies.
+Whichever engine runs, its results are re-scored by the same data model
+before ranking, so a reading that turns a run of `0xF6` into noise ends
+up where it belongs even when its CRC checks perfectly.
 
 ### 4a. What MFM's three interval widths actually buy you
 
@@ -262,17 +269,15 @@ PC/Atari/Amstrad family) and **ISO/IBM FM** (System 3740). Re-binning is
 MFM-only. Amiga MFM uses a checksum rather than a CRC-16 and is not
 handled yet; nor are the GCR formats.
 
-### A worked case: a real KryoFlux dump
+### A worked case: two real KryoFlux dumps
 
-An 84-track KryoFlux dump of a real 720K disk, 1440 sectors, two of them
-with a bad data CRC - sector 6 on side 1 of tracks 72 *and* 73. The same
-sector on adjacent tracks is the signature of a physical mark rather than
-a random error.
+**Disk 1** - an 84-track dump of a 720K disk, 1440 sectors, two bad:
+sector 6 on side 1 of tracks 72 *and* 73. The same sector on adjacent
+tracks is the signature of a physical mark rather than a random error.
 
-`inspect` fits the track's timing to a sigma of 0.075 cells and finds the
-damage immediately - a stretch of bytes 381-454 where intervals sit 10 to
-16 sigma from any legal bin centre, in **adjacent pairs of opposite
-sign**:
+The flux said the damage was a mess. `inspect` fits the track timing to
+sigma 0.075 cells and finds a 70-byte stretch where intervals sit 10 to
+16 sigma from any legal bin centre, in adjacent pairs of opposite sign:
 
 ```
   cell  6187 (byte 386)  gap 4  meas  2.846  z  -15.82
@@ -281,32 +286,102 @@ sign**:
   cell  6269 (byte 391)  gap 3  meas  2.173  z  -11.63
 ```
 
-That is the mis-bin signature exactly: the decoder took a cell from one
-interval and gave it to the next. Fifteen such pairs. Re-binning them
-drops the timing cost of the disturbed region from **1711 nats to 429**,
-and the corrected reading is far more plausible than the decoder's.
+Fifteen such pairs. Re-binning them cuts the region's timing cost from
+1711 nats to 429 - a real improvement - but leaves about a hundred bits
+in play, and sixteen bits of CRC cannot choose among 2^92 readings. The
+flux alone does not settle it.
 
-And yet the sector is still not recoverable, and the tool says so:
+The data does, instantly:
 
 ```
-budget    : 108 message bit(s) still in doubt across the disturbed region;
-            a 16-bit CRC pins down 16, so expect ~5e+27 reading(s) to pass it
-margin    : the top re-reading is 2.63 x more likely than the next;
-            NOT a clear winner - inspect before applying
+data      : period 1 explains 98.8% of the field (3 distinct values,
+            commonest 0xF6 x506)
+search    : restoring the repeat - 6 byte(s) break it; 1 reading(s) tested
+result    : 1 CRC-valid reading(s) from the data model
+
+ rank  bytes  bits  restore  remove  data evidence  changed bytes
+    0      6     6        6       0      37.5 nats  382:76->F6, 383:76->F6,
+                                                    391:F2->F6, 398:76->F6, ...
 ```
 
-Fifteen independent glitches put roughly a hundred bits in play. Sixteen
-bits of CRC cannot choose between 2^92 readings, and the timings - which
-would otherwise break the tie - are themselves disturbed across that
-whole stretch. The correct output here is a precise diagnosis and a
-refusal to guess, not a confident wrong answer.
+506 of 512 bytes are `0xF6` - the MS-DOS `FORMAT` filler - and the six
+exceptions are `0x76` and `0xF2`, each `0xF6` with exactly one bit
+missing. The whole sector is `0xF6`; the stored CRC `2BF6` confirms it on
+the first reading tried. Both sectors, byte-exact, applied and verified
+by libhxcfe's own decoder.
 
-What would actually recover it: another dump. A second read of the same
-disk, or a different drive, gives independent timings over the same
-bytes; where this dump is 12 sigma off, another may not be. (libhxcfe
-already tries the other revolutions inside one dump - that is
-`FLUXSTREAM_SECTORS_RECOVERY`, on by default - and it did not help here,
-which says the defect is stable rather than intermittent.)
+**Disk 2** - a 1.44 MB dump, 2882 sectors, nine bad, and this time the
+sectors hold real data rather than filler. Two repair uniquely; the rest
+stay ambiguous and are reported as such rather than guessed. But one of
+them is a word-processor document, and there the data model speaks for
+itself - the top four candidates all agree on:
+
+```
+byte 218: 0x23 -> 0x63    '#' -> 'c'
+  was: "...we are interested in li#ensing the de..."
+  now: "...we are interested in licensing the de..."
+```
+
+One bit, reading 0 where a 1 was written. The rest of that sector's
+damage falls in its binary tail, where nothing constrains the answer.
+
+### The errors that actually happen
+
+Fourteen errors across these two disks have a verifiable truth - eleven
+from the all-`0xF6` sectors, three from English prose. **Every one of
+them is a 1 read as a 0: a magnetic reversal that was written and not
+detected.** None is a spurious reversal, and none is a bit written wrong.
+
+Better still, on Disk 1 all eleven sit at one of two bit positions in the
+byte, and those two are exactly the transitions *preceded by a 4T gap*.
+If dropouts were spread evenly over the six transitions in an `0xF6`
+cell pattern you would expect a third of them there; getting eleven out
+of eleven by chance is about one in 180,000. The physics is unsurprising
+once stated: an isolated pulse after a long gap is the broadest and
+lowest, so it is the first to fall under the detector's threshold on a
+weak patch of media.
+
+That gives a usable ranking of causes, most likely first:
+
+| error | mechanism | flux signature | data signature | seen |
+|---|---|---|---|---|
+| **dropout** | weak pulse misses the threshold, most often after a 4T gap | one interval covers two; the PLL splits it into an implausible pair | a 1 reads as 0 | **14/14** |
+| **mis-bin / phase slip** | PLL steals a cell from the next interval | adjacent intervals off by +1/-1, total conserved | usually one bit | the flux face of the above |
+| **shift** | transition displaced but still detected | one interval long, the next short | one bit or none | synthetic only |
+| **spurious pulse** | noise clears the threshold | two intervals sum to one legal length | a 0 reads as 1 | **0/14** |
+| **speed drift** | motor wow, or a different drive | every interval scales together | none, if the PLL tracks | absorbed by the fitted model |
+| **weak / fuzzy bits** | deliberate protection, or unmagnetised media | differs between revolutions | not repeatable | none here |
+| **burst / erasure** | scratch or contamination | many implausible intervals over a span | many bits | Disk 1's tracks 72-73 |
+
+Two things follow, and both are built in. `--restore-only` searches only
+for reversals to put *back*, which is what the evidence says errors are;
+it also cuts a weight-3 search roughly eightfold. And `--dropout-bias`
+tilts the ranking that way without forbidding the alternative.
+
+### Ranking: Occam's razor, made explicit
+
+Every engine's candidates are scored the same way, and the CRC is the
+weakest term in it:
+
+```
+score = data plausibility  +  flux plausibility  +  error-type prior
+```
+
+* **data plausibility** - the log-likelihood ratio of the candidate's
+  bytes against a model of what this disk's data looks like, learned
+  from every sector that reads cleanly. A whole disk is over a megabyte,
+  which supports a real order-2 model; a single 512-byte sector does not,
+  which is why the model is built disk-wide.
+* **flux plausibility** - how well the reading explains the measured
+  interval timings, under the fitted bin centres.
+* **error-type prior** - restoring a dropped reversal beats inventing a
+  spurious one.
+
+A CRC accepts one reading in 65536 by chance. That is plenty when you are
+choosing between a few hundred candidates and nothing else to go on, and
+useless when a burst puts a hundred bits in doubt. The priors are what
+turn "these all pass the CRC" into "this one is the truth", and when they
+cannot, the tool says so instead of picking.
 
 ## Building
 
@@ -341,12 +416,18 @@ commands:
 selection:
   --sector N        sector index from `scan` (default: first bad CRC)
   --track T --side S --id R     select by physical address instead
+  --all             work through every sector with a CRC error
 
 engine options:
-  --mode M          auto | bits | rebin   (default auto)
-                      bits  : search bit flips (works without flux)
-                      rebin : re-read the flux under another legal
-                              binning of the transitions (MFM + flux)
+  --mode M          auto | pattern | rebin | bits   (default auto)
+                      pattern: restore the repeat the data almost obeys
+                      rebin  : re-read the flux under another legal
+                               binning of the transitions (MFM + flux)
+                      bits   : search bit flips (works without flux)
+                    auto tries pattern, then rebin, then bits
+  --max-outliers N  pattern engine: bytes allowed off-pattern (24)
+  --restore-only    only consider putting dropped reversals back
+  --dropout-bias N  nats favouring a restored 1 over a removed one (1.6)
   --bin-budget N    nats of timing cost a re-bin may spend (12)
   --max-ambiguous N refuse to search past this many open intervals (48)
   --max-explore N   cap on re-binning assignments tested (500000)
@@ -370,6 +451,25 @@ other:
                     --set FLUXSTREAM_PLL_MAX_ERROR_NS=900 (repeatable)
   --json            machine readable output
 ```
+
+### Repairing a whole disk
+
+```sh
+disketterecover repair "Disk 1/track00.0.raw" --all --auto --out fixed.hfe
+```
+
+```
+ trk/s sect  engine    result
+ ----- ----  --------  --------------------------------------------------
+  72/1 s6    pattern   1 reading(s), unique  -> APPLIED, verifies clean
+  73/1 s6    pattern   1 reading(s), unique  -> APPLIED, verifies clean
+
+2 of 2 repaired and verified
+```
+
+`--auto` applies a reading only when it is unique or beats the runner-up
+by a hundredfold; everything else is listed and left alone for you to
+look at with `inspect` or `serve`.
 
 ### KryoFlux, SuperCard Pro and other flux dumps
 
@@ -443,6 +543,7 @@ src/dr_view.c     the zoomed view: cells, flux bins, confidence model
 src/dr_flux.c     realigning the cell stream with the raw pulse list
 src/dr_repair.c   the GF(2) CRC bit-flip search and the patcher
 src/dr_rebin.c    the flux re-binning list decoder
+src/dr_pattern.c  the data model: regularity, and the disk-wide byte model
 src/dr_crc.c      CRC-16/CCITT and its per-bit linear masks
 src/dr_json.c     JSON for the CLI and the viewer
 src/dr_http.c     the built-in HTTP server

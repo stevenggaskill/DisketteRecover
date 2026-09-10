@@ -56,6 +56,8 @@ void dr_options_default(dr_options *o)
 	o->max_explore    = 500000;
 	o->max_ambiguous  = 48;
 	o->rebin_width    = 24;
+	o->max_outliers   = 24;
+	o->dropout_bias   = 1.6;
 }
 
 /* ------------------------------------------------------------------ */
@@ -154,6 +156,7 @@ void dr_close(dr_ctx *c)
 		hxcfe_imgUnload(c->loader, c->floppy);
 	if (c->loader)
 		hxcfe_imgDeInitLoader(c->loader);
+	dr_model_free(c->model);
 	if (c->hxcfe)
 		hxcfe_deinit(c->hxcfe);
 	free(c->sectors);

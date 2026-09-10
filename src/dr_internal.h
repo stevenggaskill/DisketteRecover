@@ -15,6 +15,9 @@
 
 #include "dr.h"
 
+/* A byte model of what this disk's data looks like (see dr_pattern.c). */
+typedef struct dr_model dr_model;
+
 struct dr_ctx {
 	HXCFE              *hxcfe;
 	HXCFE_IMGLDR       *loader;
@@ -27,6 +30,8 @@ struct dr_ctx {
 	int    loader_id;
 	int    verbose;
 	int    dirty;            /* track cells were patched              */
+
+	dr_model  *model;        /* built lazily from the clean sectors   */
 
 	dr_sector *sectors;
 	int        nsectors;
@@ -123,6 +128,19 @@ double dr_timing_adjust(const dr_timing *t, double meas,
 int    dr_intervals_collect(dr_view *v, dr_interval **out, double *period);
 void   dr_timing_fit(const dr_interval *iv, int n, dr_timing *t);
 double dr_bin_cost(const dr_timing *t, double meas, int k);
+
+/* Learned from every sector that reads cleanly. One 512-byte sector is
+ * far too little to estimate anything from; a whole disk is 1.4 MB and
+ * enough for a real order-2 model, which is what tells English prose
+ * from noise. */
+dr_model *dr_model_build(dr_ctx *c);
+void      dr_model_free(dr_model *m);
+double    dr_model_logp(const dr_model *m, int p2, int p1, int cur);
+double    dr_model_score(const dr_model *m, const uint8_t *d, int n);
+
+/* Re-rank an engine's results by how plausible their data is. */
+int dr_rescore_data(dr_ctx *c, dr_view *v, const dr_options *opt,
+                    dr_repair_result *r);
 
 /* ---- encoding helpers --------------------------------------------- */
 void dr_decode(const HXCFE_SIDE *s, dr_encoding enc, int cell,

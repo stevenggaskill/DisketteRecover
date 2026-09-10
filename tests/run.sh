@@ -37,9 +37,9 @@ check "clean scan" "$(badcount "$src")" "0"
 echo "== a single flipped data bit"
 "$dr" damage "$src" --sector 5 --bits 803 --out "$out/b1.hfe" >/dev/null 2>&1
 check "one bad sector" "$(badcount "$out/b1.hfe")" "1"
-w=$("$dr" repair "$out/b1.hfe" --json 2>/dev/null |
+w=$("$dr" repair "$out/b1.hfe" --mode bits --json 2>/dev/null |
     sed -n 's/.*"searched_weight":\([0-9]*\).*/\1/p')
-check "found at weight 1" "$w" "1"
+check "bit-flip engine finds it at weight 1" "$w" "1"
 "$dr" repair "$out/b1.hfe" --apply 0 --out "$out/f1.img" \
       --format RAW_LOADER >/dev/null 2>&1
 if cmp -s "$out/ref.img" "$out/f1.img"; then ok "recovered data matches"
@@ -48,9 +48,34 @@ else bad "recovered data matches"; fi
 echo "== two flipped data bits in one sector"
 "$dr" damage "$src" --sector 7 --bits 512,2743 --out "$out/b2.hfe" >/dev/null 2>&1
 check "one bad sector" "$(badcount "$out/b2.hfe")" "1"
-w=$("$dr" repair "$out/b2.hfe" --json 2>/dev/null |
+w=$("$dr" repair "$out/b2.hfe" --mode bits --json 2>/dev/null |
     sed -n 's/.*"searched_weight":\([0-9]*\).*/\1/p')
-check "found at weight 2" "$w" "2"
+check "bit-flip engine finds it at weight 2" "$w" "2"
+
+echo "== the data model, on a sector of filler with bits dropped"
+# 512 bytes of 0xF6 is what MS-DOS FORMAT leaves behind. Dropping a few
+# transitions turns some of them into 0x76 / 0xF2, and restoring the
+# repeat should put every one back in a single reading.
+"$dr" damage "$src" --sector 5 --bits 803,1701,2743,3001 \
+      --out "$out/p0.hfe" >/dev/null 2>&1
+pj=$("$dr" repair "$out/p0.hfe" --mode pattern --json 2>/dev/null)
+pat=$(printf '%s' "$pj" | sed -n 's/.*"pattern":\(true\|false\).*/\1/p')
+check "the pattern engine ran" "$pat" "true"
+pc=$(printf '%s' "$pj" | sed -n 's/^{"count":\([0-9]*\).*/\1/p')
+check "one reading, from the data alone" "$pc" "1"
+
+"$dr" repair "$out/p0.hfe" --apply 0 --out "$out/fp.img" \
+      --format RAW_LOADER >/dev/null 2>&1
+if cmp -s "$out/ref.img" "$out/fp.img"; then ok "4 dropped bits recovered exactly"
+else bad "4 dropped bits recovered exactly"; fi
+
+echo "== --restore-only narrows the search"
+a=$("$dr" repair "$out/b2.hfe" --json 2>/dev/null |
+    sed -n 's/.*"count":\([0-9]*\).*/\1/p' | head -1)
+b=$("$dr" repair "$out/b2.hfe" --restore-only --json 2>/dev/null |
+    sed -n 's/.*"count":\([0-9]*\).*/\1/p' | head -1)
+if [ "${b:-0}" -le "${a:-0}" ]; then ok "restore-only gives no more candidates"
+else bad "restore-only gives no more candidates ($b > $a)"; fi
 
 echo "== an image with no CRC error has nothing to repair"
 if "$dr" repair "$src" >/dev/null 2>&1; then bad "repair on clean image exits non-zero"

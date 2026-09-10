@@ -164,6 +164,8 @@ void dr_json_candidates(const dr_view *v, const dr_repair_result *r,
 		fprintf(f, "{\"count\":%d,\"offset\":%d,\"pool\":%d,"
 		           "\"searched_weight\":%d,\"truncated\":%s,"
 		           "\"margin\":%.6g,\"flux\":%s,\"rebin\":%s,"
+		           "\"pattern\":%s,\"period\":%d,\"coverage\":%.4f,"
+		           "\"outliers\":%d,"
 		           "\"ambiguous\":%d,\"uncertain_bits\":%d,"
 		           "\"explored\":%ld,\"floor_cost\":%.6g,"
 		           "\"current_cost\":%.6g,\"floor_valid\":%s,"
@@ -172,6 +174,8 @@ void dr_json_candidates(const dr_view *v, const dr_repair_result *r,
 		        r->truncated ? "true" : "false", margin,
 		        v->flux_available ? "true" : "false",
 		        r->rebin ? "true" : "false",
+		        r->pattern ? "true" : "false",
+		        r->period, r->coverage, r->outliers,
 		        r->ambiguous, r->uncertain_bits, r->explored,
 		        r->floor_cost, r->current_cost,
 		        r->floor_valid ? "true" : "false");
@@ -185,10 +189,12 @@ void dr_json_candidates(const dr_view *v, const dr_repair_result *r,
 
 		fprintf(f, "%s{\"rank\":%d,\"weight\":%d,\"loglik\":%.6g,"
 		           "\"rel\":%.6g,\"rebins\":%d,\"flux_cost\":%.6g,"
-		           "\"bits\":[",
+		           "\"data_prior\":%.6g,\"restores\":%d,"
+		           "\"removes\":%d,\"bits\":[",
 		        i > offset ? "," : "", i, cd->weight,
 		        cd->log_likelihood, cd->rel_likelihood,
-		        cd->rebins, cd->flux_cost);
+		        cd->rebins, cd->flux_cost, cd->data_prior,
+		        cd->restores, cd->removes);
 		for (k = 0; k < cd->weight; k++)
 			fprintf(f, "%s%d", k ? "," : "", cd->bits[k]);
 		fprintf(f, "],\"edits\":[");

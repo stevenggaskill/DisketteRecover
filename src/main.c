@@ -28,10 +28,16 @@ static const char *usage_text =
 "  --track T --side S --id R     select by physical address instead\n"
 "\n"
 "engine options:\n"
-"  --mode M          auto | bits | rebin   (default auto)\n"
-"                      bits  : search bit flips (works without flux)\n"
-"                      rebin : re-read the flux under another legal\n"
-"                              binning of the transitions (MFM + flux)\n"
+"  --mode M          auto | pattern | rebin | bits   (default auto)\n"
+"                      pattern: restore the repeat the data almost obeys\n"
+"                      rebin  : re-read the flux under another legal\n"
+"                               binning of the transitions (MFM + flux)\n"
+"                      bits   : search bit flips (works without flux)\n"
+"                    auto tries pattern, then rebin, then bits\n"
+"  --max-outliers N  pattern engine: bytes allowed off-pattern (24)\n"
+"  --dropout-bias N  nats favouring a lost 1 over a gained 1 (1.6)\n"
+"  --restore-only    only consider putting dropped reversals back;\n"
+"                    every verified error so far has been a 1 read as 0\n"
 "  --bin-budget N    nats of timing cost a re-bin may spend (12)\n"
 "  --max-ambiguous N refuse to search past this many open intervals (40)\n"
 "  --max-explore N   cap on re-binning assignments tested (2000000)\n"
@@ -45,6 +51,7 @@ static const char *usage_text =
 "  --max-results N   cap on returned candidates (256)\n"
 "\n"
 "repair options:\n"
+"  --all             work through every sector with a CRC error\n"
 "  --apply K         apply candidate K (0 = most likely) and verify\n"
 "  --auto            apply candidate 0 only when it clearly wins\n"
 "  --out FILE        write the patched image\n"
@@ -71,6 +78,7 @@ typedef struct {
 	int    verbose;
 	int    apply;
 	int    autoapply;
+	int    all;
 	int    port;
 	const char *bind;
 	const char *out;
@@ -117,14 +125,19 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--bin-budget")) a->opt.bin_budget = atof(NEXT());
 		else if (!strcmp(o, "--max-explore")) a->opt.max_explore = atol(NEXT());
 		else if (!strcmp(o, "--max-ambiguous")) a->opt.max_ambiguous = atoi(NEXT());
+		else if (!strcmp(o, "--max-outliers")) a->opt.max_outliers = atoi(NEXT());
+		else if (!strcmp(o, "--dropout-bias")) a->opt.dropout_bias = atof(NEXT());
+		else if (!strcmp(o, "--restore-only")) a->opt.restore_only = 1;
 		else if (!strcmp(o, "--mode")) {
 			const char *m = NEXT();
-			if (!strcmp(m, "bits"))       a->opt.mode = DR_MODE_BITS;
-			else if (!strcmp(m, "rebin")) a->opt.mode = DR_MODE_REBIN;
-			else                          a->opt.mode = DR_MODE_AUTO;
+			if (!strcmp(m, "bits"))         a->opt.mode = DR_MODE_BITS;
+			else if (!strcmp(m, "rebin"))   a->opt.mode = DR_MODE_REBIN;
+			else if (!strcmp(m, "pattern")) a->opt.mode = DR_MODE_PATTERN;
+			else                            a->opt.mode = DR_MODE_AUTO;
 		}
 		else if (!strcmp(o, "--apply"))    a->apply = atoi(NEXT());
 		else if (!strcmp(o, "--auto"))     a->autoapply = 1;
+		else if (!strcmp(o, "--all"))      a->all = 1;
 		else if (!strcmp(o, "--out"))      a->out = NEXT();
 		else if (!strcmp(o, "--format"))   a->format = NEXT();
 		else if (!strcmp(o, "--bits"))     a->bits = NEXT();
@@ -326,6 +339,65 @@ static void print_view(dr_view *v, int top)
 }
 
 /* ------------------------------------------------------------------ */
+static void print_pattern(dr_view *v, dr_repair_result *r, int limit)
+{
+	int i, k;
+
+	printf("\ndata      : %s\n", r->note);
+	printf("search    : restoring the repeat - %d byte(s) break it; "
+	       "%ld reading(s) tested\n", r->outliers, r->explored);
+
+	if (!r->count) {
+		printf("result    : restoring the pattern does not satisfy "
+		       "the CRC.\n");
+		return;
+	}
+
+	printf("result    : %d CRC-valid reading(s) from the data model\n",
+	       r->count);
+	if (r->count > 1) {
+		double margin = r->list[1].rel_likelihood > 0.0
+		        ? 1.0 / r->list[1].rel_likelihood : 0.0;
+		printf("margin    : the top reading is %.3g x more likely than "
+		       "the next; %s\n", margin,
+		       margin >= 100.0 ? "clear winner"
+		                       : "NOT a clear winner - inspect first");
+	}
+
+	printf("\n rank  bytes  bits  restore  remove  data evidence  "
+	       "changed bytes\n");
+	printf(" ----  -----  ----  -------  ------  -------------  "
+	       "----------------------------\n");
+
+	for (i = 0; i < r->count && i < limit; i++) {
+		dr_candidate *cd = &r->list[i];
+		uint8_t *m = dr_candidate_message(v, cd);
+		int shown = 0, lastbyte = -1, nbytes = 0;
+
+		for (k = 0; k < cd->weight; k++)
+			if ((cd->bits[k] >> 3) != lastbyte) {
+				lastbyte = cd->bits[k] >> 3;
+				nbytes++;
+			}
+		lastbyte = -1;
+
+		printf(" %4d  %5d  %4d  %7d  %6d  %8.1f nats  ", i, nbytes,
+		       cd->weight, cd->restores, cd->removes, cd->data_prior);
+		for (k = 0; k < cd->weight && m; k++) {
+			int b = cd->bits[k] >> 3;
+			if (b == lastbyte)
+				continue;
+			lastbyte = b;
+			if (shown == 5) { printf(", ..."); break; }
+			printf("%s%d:%02X->%02X", shown ? ", " : "",
+			       b, v->msg[b], m[b]);
+			shown++;
+		}
+		printf("\n");
+		free(m);
+	}
+}
+
 /* Re-binning results move whole bursts, so list the bytes that changed
  * rather than every individual bit. */
 static void print_rebin(dr_view *v, dr_repair_result *r, int limit)
@@ -466,6 +538,160 @@ static void print_candidates(dr_view *v, dr_repair_result *r, int limit)
 	}
 }
 
+/* Run the engine cascade for one sector and report in one line.
+ * Returns 1 if the sector was repaired and verified. */
+static int repair_one(dr_ctx *c, int idx, args *a, int apply)
+{
+	dr_view *v;
+	dr_repair_result r;
+	dr_mode engine;
+	const dr_sector *sl;
+	int n, rc = 0;
+	double margin = 0.0;
+
+	sl = dr_sectors(c, &n);
+	v = dr_view_open(c, idx, &a->opt);
+	if (!v) {
+		printf(" %3d/%d s%-3d  %-8s  %s\n", sl[idx].track, sl[idx].side,
+		       sl[idx].sector_id, "-", "no view (unsupported encoding)");
+		return 0;
+	}
+
+	engine = a->opt.mode == DR_MODE_AUTO ? DR_MODE_PATTERN : a->opt.mode;
+	for (;;) {
+		memset(&r, 0, sizeof(r));
+		if (engine == DR_MODE_PATTERN)
+			dr_pattern_search(v, &a->opt, &r);
+		else if (engine == DR_MODE_REBIN)
+			dr_rebin_search(v, &a->opt, &r);
+		else
+			dr_repair_search(v, &a->opt, &r);
+		dr_rescore_data(c, v, &a->opt, &r);
+
+		if (r.count || a->opt.mode != DR_MODE_AUTO)
+			break;
+		dr_repair_free(&r);
+		if (engine == DR_MODE_PATTERN) {
+			engine = (v->flux_available &&
+			          v->encoding == DR_ENC_ISO_MFM)
+			        ? DR_MODE_REBIN : DR_MODE_BITS;
+			continue;
+		}
+		if (engine == DR_MODE_REBIN) {
+			engine = DR_MODE_BITS;
+			continue;
+		}
+		break;
+	}
+
+	if (r.count > 1 && r.list[1].rel_likelihood > 0.0)
+		margin = 1.0 / r.list[1].rel_likelihood;
+	else if (r.count == 1)
+		margin = 1.0 / 0.0;          /* unique */
+
+	printf(" %3d/%d s%-3d  %-8s  ",
+	       sl[idx].track, sl[idx].side, sl[idx].sector_id,
+	       engine == DR_MODE_PATTERN ? "pattern" :
+	       engine == DR_MODE_REBIN ? "re-bin" : "bits");
+
+	if (!r.count) {
+		printf("no CRC-valid reading found");
+		if (r.uncertain_bits > 16)
+			printf(" (%d bits in doubt vs 16 of CRC)",
+			       r.uncertain_bits);
+		printf("\n");
+	} else {
+		int unique = (r.count == 1);
+
+		printf("%d reading(s), ", r.count);
+		if (unique)
+			printf("unique");
+		else
+			printf("top %.3g x next", margin);
+
+		if (apply && (unique || margin >= 100.0)) {
+			if (dr_apply(c, v, &r.list[0]) == 0 &&
+			    dr_verify(c, idx) == 1) {
+				printf("  -> APPLIED, verifies clean");
+				rc = 1;
+			} else {
+				printf("  -> apply failed");
+			}
+		} else if (apply) {
+			printf("  -> not applied (ambiguous)");
+		}
+		printf("\n");
+	}
+
+	dr_repair_free(&r);
+	dr_view_free(v);
+	return rc;
+}
+
+static int cmd_repair_all(dr_ctx *c, args *a)
+{
+	struct { int track, side, id; } *todo = NULL;
+	int n, i, ntodo = 0, fixed = 0, apply;
+	const dr_sector *sl = dr_sectors(c, &n);
+
+	apply = (a->apply >= 0 || a->autoapply);
+
+	for (i = 0; i < n; i++)
+		if (sl[i].header_crc == DR_CRC_BAD ||
+		    sl[i].data_crc == DR_CRC_BAD) {
+			todo = realloc(todo, (size_t)(ntodo + 1) * sizeof(*todo));
+			if (!todo)
+				return 1;
+			todo[ntodo].track = sl[i].track;
+			todo[ntodo].side = sl[i].side;
+			todo[ntodo].id = sl[i].sector_id;
+			ntodo++;
+		}
+
+	if (!ntodo) {
+		printf("no CRC errors on this disk.\n");
+		free(todo);
+		return 0;
+	}
+
+	printf("%d sector(s) with a CRC error%s\n\n", ntodo,
+	       apply ? "; applying unambiguous repairs" : "");
+	printf(" trk/s sect  engine    result\n");
+	printf(" ----- ----  --------  "
+	       "---------------------------------------------------\n");
+
+	for (i = 0; i < ntodo; i++) {
+		int idx = -1, j;
+
+		/* Applying re-scans, so locate the sector by address. */
+		sl = dr_sectors(c, &n);
+		for (j = 0; j < n; j++)
+			if (sl[j].track == todo[i].track &&
+			    sl[j].side == todo[i].side &&
+			    sl[j].sector_id == todo[i].id) {
+				idx = j;
+				break;
+			}
+		if (idx < 0)
+			continue;
+
+		fixed += repair_one(c, idx, a, apply);
+		fflush(stdout);
+	}
+
+	printf("\n%d of %d repaired and verified\n", fixed, ntodo);
+	free(todo);
+
+	if (a->out && fixed) {
+		if (dr_export(c, a->out, a->format) < 0) {
+			fprintf(stderr, "%s\n", dr_last_error(c));
+			return 1;
+		}
+		printf("wrote %s (%s)\n", a->out, a->format);
+	}
+	return 0;
+}
+
 /* ------------------------------------------------------------------ */
 static int cmd_formats(void)
 {
@@ -567,6 +793,12 @@ int main(int argc, char **argv)
 		return rc;
 	}
 
+	if (!strcmp(a.cmd, "repair") && a.all) {
+		rc = cmd_repair_all(c, &a);
+		dr_close(c);
+		return rc;
+	}
+
 	idx = pick_sector(c, &a);
 	if (idx < 0) {
 		dr_close(c);
@@ -626,48 +858,83 @@ int main(int argc, char **argv)
 
 		if (!strcmp(a.cmd, "repair")) {
 			dr_repair_result r;
-			int use_rebin;
+			dr_mode engine;
 
 			if (!a.json)
 				print_view(v, 12);
 
-			/* Re-binning only makes sense when there are real
-			 * timings to re-bin; otherwise fall back to bit
-			 * flips, and say so. */
-			use_rebin = (a.opt.mode == DR_MODE_REBIN) ||
-			            (a.opt.mode == DR_MODE_AUTO &&
-			             v->flux_available &&
-			             v->encoding == DR_ENC_ISO_MFM);
+			/*
+			 * Engines in order of how decisive their evidence is
+			 * when it applies. The data's own regularity is the
+			 * strongest and the cheapest, so it goes first; flux
+			 * re-binning next, where there are timings to re-bin;
+			 * a bit-flip search last, since it works from the CRC
+			 * almost alone.
+			 */
+			engine = a.opt.mode;
+			if (engine == DR_MODE_AUTO)
+				engine = DR_MODE_PATTERN;
 
-			if (use_rebin) {
-				if (dr_rebin_search(v, &a.opt, &r) < 0) {
-					fprintf(stderr, "re-binning search failed\n");
+			for (;;) {
+				int rs = 0;
+
+				if (engine == DR_MODE_PATTERN)
+					rs = dr_pattern_search(v, &a.opt, &r);
+				else if (engine == DR_MODE_REBIN)
+					rs = dr_rebin_search(v, &a.opt, &r);
+				else
+					rs = dr_repair_search(v, &a.opt, &r);
+
+				if (rs < 0) {
+					fprintf(stderr, "search failed\n");
 					dr_view_free(v);
 					dr_close(c);
 					return 1;
 				}
-				if (!r.count && a.opt.mode == DR_MODE_AUTO) {
-					if (!a.json)
-						print_rebin(v, &r, 16);
-					dr_repair_free(&r);
-					if (!a.json)
-						printf("\nfalling back to a bit-flip "
-						       "search.\n");
-					use_rebin = 0;
-				}
-			}
 
-			if (!use_rebin && dr_repair_search(v, &a.opt, &r) < 0) {
-				fprintf(stderr, "search failed\n");
-				dr_view_free(v);
-				dr_close(c);
-				return 1;
+				/* Rank every engine's output by the same data
+				 * model, so an implausible reading cannot win
+				 * just because its CRC happens to check. */
+				dr_rescore_data(c, v, &a.opt, &r);
+
+				if (r.count || a.opt.mode != DR_MODE_AUTO)
+					break;
+
+				if (!a.json) {
+					if (engine == DR_MODE_PATTERN)
+						print_pattern(v, &r, 16);
+					else if (engine == DR_MODE_REBIN)
+						print_rebin(v, &r, 16);
+				}
+				dr_repair_free(&r);
+
+				if (engine == DR_MODE_PATTERN) {
+					engine = (v->flux_available &&
+					          v->encoding == DR_ENC_ISO_MFM)
+					        ? DR_MODE_REBIN : DR_MODE_BITS;
+					if (!a.json)
+						printf("\nfalling back to %s.\n",
+						       engine == DR_MODE_REBIN
+						       ? "re-binning the flux"
+						       : "a bit-flip search");
+					continue;
+				}
+				if (engine == DR_MODE_REBIN) {
+					engine = DR_MODE_BITS;
+					if (!a.json)
+						printf("\nfalling back to a "
+						       "bit-flip search.\n");
+					continue;
+				}
+				break;
 			}
 
 			if (a.json) {
 				dr_json_candidates(v, &r, 0, 0, stdout);
 				printf("\n");
-			} else if (use_rebin) {
+			} else if (engine == DR_MODE_PATTERN) {
+				print_pattern(v, &r, 16);
+			} else if (engine == DR_MODE_REBIN) {
 				print_rebin(v, &r, 16);
 			} else {
 				print_candidates(v, &r, 16);

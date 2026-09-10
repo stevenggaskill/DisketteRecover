@@ -262,6 +262,7 @@ static void handle(struct srv *s, int fd, const char *method,
 			}
 			if (!rebin)
 				dr_repair_search(v, &s->opt, &s->res);
+			dr_rescore_data(s->ctx, v, &s->opt, &s->res);
 			s->have_res = 1;
 		}
 		a.v = v;

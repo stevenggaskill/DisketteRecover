@@ -162,6 +162,12 @@ typedef struct {
 	/* Re-binning results only: how the flux was re-read. */
 	int     rebins;                /* intervals given a different bin */
 	double  flux_cost;             /* -log likelihood of the timings  */
+
+	/* How much likelier this reading's data is under the sector's own
+	 * statistics than what was decoded (nats; higher is better). */
+	double  data_prior;
+	int     restores;              /* 0->1: puts back a lost reversal */
+	int     removes;               /* 1->0: deletes a spurious one    */
 } dr_candidate;
 
 typedef struct {
@@ -181,13 +187,20 @@ typedef struct {
 	                                /* costs under the timing model   */
 	int           floor_valid;      /* ...and whether its CRC passes  */
 	int           uncertain_bits;   /* message bits still in doubt    */
+
+	/* Pattern engine bookkeeping. */
+	int           pattern;          /* results came from the data model*/
+	int           period;           /* the repeat it locked onto       */
+	int           outliers;         /* bytes that break the pattern    */
+	double        coverage;         /* fraction of bytes on-pattern    */
 	char          note[160];
 } dr_repair_result;
 
 typedef enum {
-	DR_MODE_AUTO = 0,       /* re-bin when there is flux, else bits   */
+	DR_MODE_AUTO = 0,       /* try each engine, cheapest evidence first*/
 	DR_MODE_BITS,
-	DR_MODE_REBIN
+	DR_MODE_REBIN,
+	DR_MODE_PATTERN         /* trust the data's own regularity        */
 } dr_mode;
 
 typedef struct {
@@ -203,6 +216,9 @@ typedef struct {
 	long    max_explore;    /* cap on re-binning assignments tested   */
 	int     max_ambiguous;  /* refuse to search past this many        */
 	int     rebin_width;    /* re-readings kept per disturbed stretch */
+	int     max_outliers;   /* pattern engine: bytes off-pattern      */
+	double  dropout_bias;   /* nats favouring a lost 1 over a gained 1*/
+	int     restore_only;   /* only consider putting reversals back   */
 } dr_options;
 
 void        dr_options_default(dr_options *o);
@@ -241,6 +257,24 @@ int         dr_repair_search(dr_view *v, const dr_options *o,
  * the transitions, keeping the total cell count intact. */
 int         dr_rebin_search(dr_view *v, const dr_options *o,
                             dr_repair_result *out);
+
+/* Occam's razor: most sector data is not random. Find the pattern the
+ * field almost obeys, and see whether restoring it satisfies the CRC. */
+int         dr_pattern_search(dr_view *v, const dr_options *o,
+                              dr_repair_result *out);
+
+/* Describe the regularity found, for `inspect`. */
+typedef struct {
+	int    period;
+	int    outliers;
+	double coverage;
+	int    modal[256];      /* the repeating pattern, `period` long   */
+	int    distinct;        /* distinct byte values in the field      */
+	int    top_value;
+	int    top_count;
+} dr_pattern_info;
+
+int         dr_pattern_analyse(const dr_view *v, dr_pattern_info *info);
 void        dr_repair_free(dr_repair_result *r);
 
 /* Materialise a candidate: returns a freshly allocated copy of the
