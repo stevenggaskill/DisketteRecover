@@ -616,3 +616,54 @@ int dr_damage(dr_ctx *c, int sector_index, const int *bits, int nbits,
 	dr_view_free(v);
 	return rc;
 }
+
+/*
+ * Write known-good bytes into a sector's data field and re-stamp its
+ * CRC.
+ *
+ * Every other path in this program reasons from the CRC. This one is
+ * for when the truth came from somewhere the CRC cannot reach: the
+ * other copy of a FAT, or the same file archived twice on the same
+ * disk and checked by its own CRC-32. In those cases the sector's own
+ * sixteen bits are not evidence - they were usually destroyed along
+ * with the data, which is why the sector was unreadable - so they are
+ * recomputed rather than matched.
+ */
+int dr_set_data(dr_ctx *c, dr_view *v, const uint8_t *data, int len)
+{
+	HXCFE_SIDE *side;
+	uint8_t *m;
+	uint16_t crc;
+	int b;
+
+	if (!c || !v || !data || len != v->data_len)
+		return -1;
+	side = (HXCFE_SIDE *)v->side;
+	if (!side)
+		return -1;
+
+	m = malloc((size_t)v->msg_len);
+	if (!m)
+		return -1;
+	memcpy(m, v->msg, (size_t)v->msg_len);
+	memcpy(m + v->data_offset, data, (size_t)len);
+
+	crc = dr_crc16(m, v->msg_len - 2);
+	m[v->msg_len - 2] = (uint8_t)(crc >> 8);
+	m[v->msg_len - 1] = (uint8_t)(crc & 0xFF);
+
+	for (b = v->data_offset; b < v->msg_len; b++)
+		if (m[b] != v->msg[b])
+			dr_write_byte(side, v->encoding,
+			              v->base_cell + b * v->stride, m[b]);
+
+	memcpy(v->msg, m, (size_t)v->msg_len);
+	free(m);
+
+	v->syndrome     = dr_crc16(v->msg, v->msg_len);
+	v->computed_crc = dr_crc16(v->msg, v->msg_len - 2);
+	v->stored_crc   = (uint16_t)((v->msg[v->msg_len - 2] << 8) |
+	                              v->msg[v->msg_len - 1]);
+	c->dirty = 1;
+	return 0;
+}

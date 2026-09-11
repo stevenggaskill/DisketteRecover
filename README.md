@@ -306,6 +306,136 @@ Each disturbed stretch is solved independently by a shortest-path search
 over its legal re-readings, and the stretches are then combined in cost
 order and tested against the CRC.
 
+### 4d. The referee above the sector
+
+A sector CRC is sixteen bits of evidence about five hundred and twelve
+bytes, and this project spent a long time treating it as the arbiter of
+truth. It is not, for two reasons that turn out to matter on real disks.
+
+The first is that it is often destroyed along with the data. The two CRC
+bytes are the last two bytes of the sector and nothing protects them; on
+every disk here where a mark ran off the end of a sector it took them
+with it. `crc_expected_errors` measures that, and it is cleanly bimodal:
+0.006 bits in doubt on an intact sector, 0.36 to 4.9 on a damaged one.
+When the CRC is a guess, every "CRC-valid" reading is matching a number
+that was never on the disk.
+
+The second is that sixteen bits are not many. Search far enough and
+hundreds of readings satisfy them. On Sand's `27/1 s10` the search finds
+**245** CRC-valid readings, the best only nine times likelier than the
+next. Sixteen bits cannot separate those, and no amount of cleverer
+ranking will change that - the information is not there.
+
+What *is* there, and what nothing in this program was using, is the
+filesystem. `--fs` reads it, and it changes the question from "which
+reading satisfies the checksum" to "what is this sector, and who can
+check it".
+
+```
+$ disketterecover scan "Disk 2/track00.0.raw" --fs
+filesystem: FAT12, 18 sector(s)/track, 2 head(s), 2 FAT(s) of 9 sector(s), 8 file(s)
+            the two FATs differ in 388 byte(s)
+
+where the bad sectors land
+    0/0 s15   FAT       FAT copy 2, sector 4 of 9 - the other copy of these same bytes reads clean
+    0/0 s16   FAT       FAT copy 2, sector 5 of 9 - the other copy of these same bytes reads clean
+    0/0 s18   FAT       FAT copy 2, sector 7 of 9 - the other copy of these same bytes reads clean
+    0/1 s18   free      cluster 4 - free space: no file's data is here, so nothing was lost
+   41/1 s17   file      cluster 1479 - bytes 34816..35328 of FHP2_97.QBB (118575 bytes)
+   ...
+of 9 bad sector(s): 3 in a FAT (3 with a clean second copy on this disk),
+1 in free space, 0 outside the filesystem, 5 carrying 2560 byte(s)
+of a file.
+```
+
+Four things fall out of that, in rising order of how much they change.
+
+**Some sectors hold nothing.** Disk 1's two failures, GasAcc's one and
+one of Disk 2's are in free space: no file's data is there. Ron's
+twenty-two are not even inside the filesystem - they are noise on track
+80, past the last formatted track, decoded as 16 KB FM sectors. Those
+disks were never damaged in any sense their owner would recognise, and
+saying so is more useful than repairing them.
+
+**A FAT is written twice.** `--from-copy` writes the other copy's bytes
+and re-stamps the CRC. On Disk 2's `0/0 s15` the copy from FAT1 has CRC
+`7D26` - which is exactly the value stored on the damaged sector. That
+is not a ranking, it is a match: eight bytes recovered, confirmed by
+sixteen bits the search never got to choose. The other two FAT sectors
+take the same bytes; there the stored CRC went with the data, so they
+are recovered by redundancy rather than proved by checksum, and the tool
+says which is which.
+
+**A file can check itself.** A ZIP entry carries a CRC-32 of what it
+unpacks to, and a deflate stream that has been touched by one bit almost
+never inflates at all. So `--fs` puts every candidate reading to the
+file's own checksum:
+
+```
+referee   : what the file above this sector makes of each reading
+            245 reading(s) satisfied the sector's 16-bit CRC; none of them
+            survives the file's own 32-bit one. The true reading is not in
+            this pool - the damage is deeper than the search can reach.
+```
+
+That verdict was not previously available at any price. It is the
+difference between applying the top candidate and knowing it is wrong.
+
+And it is not a theoretical worry. The regression suite builds a FAT12
+disk with a ZIP on it, drops two reversals inside the deflate stream,
+and then checks the answer against the original bytes:
+
+```
+  ok   many readings satisfy the 16-bit sector CRC (250)
+  ok   exactly one survives the file's CRC-32
+  ok   the survivor is not the top-ranked reading (#8)
+  ok   and it is the original data, exactly
+```
+
+250 readings satisfy the sector. One satisfies the file. It is candidate
+**#8** - the likelihood ranking put seven wrong answers ahead of it, and
+every one of those seven would have been applied and verified "clean".
+The ranking is not broken; sixteen bits simply do not contain the
+answer, and no amount of better ranking can conjure it. Thirty-two bits
+about the data do.
+
+**And archives get written twice too.** Sand carries `CONTAC~1.ZIP` and
+`CONTACTS.ZIP`: two backups of the same folder, a few weeks apart,
+sharing a hundred and one entries whose packed bytes are byte-identical.
+Three of Sand's four bad sectors sit inside entries that also exist in
+the sister archive. `--from-copy` finds them, splices, inflates, and
+checks the CRC-32:
+
+```
+second copy: 'faxcover.adt' is archived twice on this disk; the copy in
+CONTACTS.ZIP inflates and matches its CRC-32 (3C4E1290) - proven
+```
+
+Ninety-eight to a hundred and three bytes per sector, recovered exactly,
+on damage far too deep for any bit-flip search - and proved by
+thirty-two bits about the data the owner cares about rather than sixteen
+about the sector. All three of those sectors were previously
+unrepairable.
+
+The damaged ranges are worth reading too: bytes 414-511, 408-511,
+403-511. Every one of them runs to the end of the sector. That is the
+radial mark again, and it is why the sector CRC could never have
+arbitrated: the mark eats the CRC on its way past.
+
+### 4e. Five images, and letting a person look
+
+When several readings survive, `--variants 5 --out disk.hfe` writes
+`disk_a1.hfe`, `disk_a2.hfe` ... one image per reading, each with its
+data written in and its CRC re-stamped so every one of them mounts
+clean. Open them in a disk browser and the one whose files still make
+sense is the true reading.
+
+Where the file format carries a checksum, the tool does that looking
+itself and labels the variants; where it does not - QuickBooks backups,
+PowerPoint 97, a Windows VxD - a person with the files in front of them
+is still the better referee, and five files to click through settles in
+seconds what a likelihood ratio only ever estimates.
+
 ### 5. Cycle through the most likely corrections
 
 Whichever engine ran, the results come back ranked - by the product of
@@ -507,9 +637,13 @@ two are.
 They did pay for themselves, though - see the note on the block fit
 below, which they are the reason for.
 
-Totals, now over six disks: **8 of 20** bad sectors repaired and verified.
-The running tally, and what each disk turned out to be suffering from, is
-in [docs/disks.md](docs/disks.md).
+Totals, now over eight disks: 43 bad sectors, of which **29 hold no
+file's data at all** - free space, or, on one whole disk, unformatted
+noise past the last track. Of the 14 that do carry a file, **7 are
+recovered**: four by the search, and three exactly, from a second copy
+of the same bytes elsewhere on the same disk. Three of the eight disks
+lost nothing whatsoever. The running tally, and what each disk turned
+out to be suffering from, is in [docs/disks.md](docs/disks.md).
 
 That number went *down* as the tool got better, and the reason is the
 whole point of the section below. Five of the readings it used to apply
@@ -735,8 +869,10 @@ make
 ```
 
 `make` builds the pinned HxC submodule (`libhxcadaptor` + `libhxcfe`) and
-then the tool. Only a C compiler and make are needed; the browser view is
-compiled into the binary.
+then the tool. A C compiler, make and zlib are needed; the browser view
+is compiled into the binary. zlib is what lets `--fs` inflate a ZIP
+entry and check its CRC-32 - build with `CFLAGS=-DDR_NO_ZLIB` and drop
+`-lz` from `LDLIBS` to do without it, losing only that check.
 
 ```sh
 make test        # regression suite, builds its images from the HxC samples
@@ -924,7 +1060,10 @@ src/dr_view.c     the zoomed view: cells, flux bins, confidence model
 src/dr_flux.c     realigning the cell stream with the raw pulse list
 src/dr_repair.c   the GF(2) CRC bit-flip search and the patcher
 src/dr_rebin.c    the flux re-binning list decoder
+src/dr_revs.c     aligning and combining the dump's own revolutions
 src/dr_pattern.c  the data model: regularity, and the disk-wide byte model
+src/dr_fs.c       the filesystem above the sector: what each one is, the
+                  other copy of a FAT, and the file's own checksum
 src/dr_crc.c      CRC-16/CCITT and its per-bit linear masks
 src/dr_json.c     JSON for the CLI and the viewer
 src/dr_http.c     the built-in HTTP server

@@ -328,6 +328,108 @@ else
 	echo "  skip flux tests (no python3)"
 fi
 
+# ------------------------------------------------------------------ #
+# The filesystem above the sector                                     #
+# ------------------------------------------------------------------ #
+if command -v python3 >/dev/null 2>&1; then
+	echo "== the filesystem says what a bad sector actually is"
+	python3 - "$out" <<'PYEOF'
+import os, random, sys, zipfile
+out = sys.argv[1]
+random.seed(7)
+words = [bytes(random.choice(b'abcdefghijklmnopqrstuvwxyz')
+               for _ in range(random.randint(3, 9))) for _ in range(300)]
+body = b' '.join(random.choice(words) for _ in range(20000))
+with zipfile.ZipFile(os.path.join(out, 'a.zip'), 'w',
+                     zipfile.ZIP_DEFLATED) as z:
+    z.writestr('notes.txt', body)
+PYEOF
+	python3 "$here/tools/mkfat.py" "$out/fs.img" "ARCHIVE.ZIP=$out/a.zip"
+	"$dr" convert "$out/fs.img" --out "$out/fs.hfe" >/dev/null 2>&1
+	"$dr" convert "$out/fs.hfe" --out "$out/fs_ref.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+
+	# LBA 20 is the fourth cluster of the archive - well inside the
+	# deflate stream, where a single wrong bit is fatal.
+	"$dr" damage "$out/fs.hfe" --track 1 --side 0 --id 3 --drop-only \
+	      --bits 803,1701 --out "$out/fs_bad.hfe" >/dev/null 2>&1
+	owner=$("$dr" scan "$out/fs_bad.hfe" --fs 2>/dev/null |
+	        sed -n 's/.*of \(ARCHIVE.ZIP\).*/\1/p')
+	check "a damaged sector is named as part of its file" \
+	      "$owner" "ARCHIVE.ZIP"
+
+	# A sector past every file holds nobody's data.
+	"$dr" damage "$out/fs.hfe" --track 60 --side 0 --id 3 --drop-only \
+	      --bits 803,1701 --out "$out/fs_free.hfe" >/dev/null 2>&1
+	free=$("$dr" scan "$out/fs_free.hfe" --fs 2>/dev/null |
+	       sed -n 's/.*\(no file.s data is here\).*/free/p')
+	check "a sector in free space is reported as losing nothing" \
+	      "$free" "free"
+
+	echo "== 16 bits of sector CRC against 32 bits of the file's own"
+	"$dr" repair "$out/fs_bad.hfe" --fs >"$out/ref.txt" 2>/dev/null
+	tested=$(sed -n 's/.*of \([0-9]*\) CRC-valid reading(s) also satisfy.*/\1/p' \
+	         "$out/ref.txt")
+	kept=$(sed -n 's/.*[^0-9]\([0-9]*\) of [0-9]* CRC-valid reading(s) also satisfy.*/\1/p' \
+	       "$out/ref.txt")
+	if [ "${tested:-0}" -gt 50 ]; then
+		ok "many readings satisfy the 16-bit sector CRC ($tested)"
+	else
+		bad "many readings satisfy the 16-bit sector CRC ($tested)"
+	fi
+	check "exactly one survives the file's CRC-32" "$kept" "1"
+
+	# ...and it is not the one the likelihood ranking put first. This
+	# is the whole point: sixteen bits cannot separate 250 readings,
+	# and the file above the sector can.
+	surv=$(sed -n 's/^ *\([0-9][0-9]*\)  SURVIVES.*/\1/p' "$out/ref.txt")
+	if [ -n "$surv" ] && [ "$surv" != "0" ]; then
+		ok "the survivor is not the top-ranked reading (#$surv)"
+	else
+		bad "the survivor is not the top-ranked reading (#$surv)"
+	fi
+	"$dr" repair "$out/fs_bad.hfe" --apply "$surv" --out "$out/fs_fix.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/fs_ref.img" "$out/fs_fix.img"; then
+		ok "and it is the original data, exactly"
+	else
+		bad "and it is the original data, exactly"
+	fi
+
+	echo "== a FAT is written twice"
+	# LBA 4 is the first sector of the second FAT; the first copy of
+	# those same bytes is at LBA 1 and reads clean.
+	# ...on bytes the FAT actually uses: past the last cluster entry it
+	# is all zeroes, and a dropped reversal there changes nothing.
+	"$dr" damage "$out/fs.hfe" --track 0 --side 0 --id 5 \
+	      --bits 60,140,220 --out "$out/fs_fat.hfe" >/dev/null 2>&1
+	m=$("$dr" repair "$out/fs_fat.hfe" --fs 2>/dev/null |
+	    sed -n 's/.*\(the other copy of these same bytes reads clean\).*/mirror/p')
+	check "the other copy is found" "$m" "mirror"
+	proven=$("$dr" repair "$out/fs_fat.hfe" --from-copy 2>/dev/null |
+	         sed -n 's/.*\(proven, not ranked\).*/proven/p')
+	check "the stored CRC agrees with it, so it is proved not ranked" \
+	      "$proven" "proven"
+	"$dr" repair "$out/fs_fat.hfe" --from-copy --out "$out/fs_fat.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/fs_ref.img" "$out/fs_fat.img"; then
+		ok "the FAT sector is recovered exactly"
+	else
+		bad "the FAT sector is recovered exactly"
+	fi
+
+	echo "== one image per reading, to be looked at"
+	"$dr" repair "$out/fs_bad.hfe" --variants 3 --out "$out/v.hfe" \
+	      >/dev/null 2>&1
+	n=0
+	for f in "$out"/v_a1.hfe "$out"/v_a2.hfe "$out"/v_a3.hfe; do
+		[ -s "$f" ] && n=$((n+1))
+	done
+	check "three variant images were written" "$n" "3"
+	check "each one reads clean" \
+	      "$(badcount "$out/v_a2.hfe")" "0"
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

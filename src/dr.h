@@ -162,6 +162,7 @@ typedef struct {
 typedef enum {
 	DR_MODE_AUTO = 0,       /* try each engine, cheapest evidence first*/
 	DR_MODE_REVS,
+	DR_MODE_MIRROR,        /* the same bytes, stored twice on the disk*/
 	DR_MODE_BITS,
 	DR_MODE_REBIN,
 	DR_MODE_PATTERN         /* trust the data's own regularity        */
@@ -365,6 +366,108 @@ int         dr_damage_slip(dr_ctx *c, int sector_index, int at_byte,
                            int cells);
 int         dr_damage(dr_ctx *c, int sector_index, const int *bits, int nbits,
                       int drop_only);
+
+
+/* ------------------------------------------------------------------ */
+/* The filesystem on top of the sectors                                */
+/* ------------------------------------------------------------------ */
+/* A CRC is sixteen bits of evidence about five hundred and twelve
+ * bytes, and on these disks it is often itself inside the damage. The
+ * filesystem above it carries far stronger evidence, and it is evidence
+ * nobody has been using: a FAT is stored twice, and a ZIP, a PNG or a
+ * gzip member carries a 32-bit checksum of its own contents. Where a
+ * bad sector lands decides which of those referees applies - and
+ * whether anything was lost at all, since a sector in free space holds
+ * no file's data. */
+
+typedef enum {
+	DR_AREA_UNKNOWN = 0,
+	DR_AREA_BOOT,
+	DR_AREA_FAT,
+	DR_AREA_ROOT,
+	DR_AREA_FILE,            /* allocated to a file                  */
+	DR_AREA_FREE,            /* in the data area, owned by nothing   */
+	DR_AREA_OUTSIDE          /* past the end of the filesystem       */
+} dr_fs_area;
+
+typedef struct dr_fs dr_fs;
+
+typedef struct {
+	int   present;
+	char  kind[16];          /* "FAT12" / "FAT16"                    */
+	char  oem[12];
+	int   bps, spc, reserved, nfats, root_entries;
+	long  total_sectors;
+	int   fat_sectors, spt, heads;
+	long  root_lba, data_lba;
+	int   clusters;
+	int   nfiles;
+	long  fat_mismatch;      /* bytes where the FAT copies differ    */
+	int   sectors_read;      /* sectors the assembly actually got    */
+	int   sectors_bad;       /* ...of which had a bad CRC            */
+} dr_fs_info;
+
+typedef struct {
+	dr_fs_area area;
+	long  lba;
+	int   fat_copy;          /* 1-based; FAT area only               */
+	int   fat_rel;           /* sector index within that FAT         */
+	int   mirror_sector;     /* sector index of the other copy, or -1*/
+	int   mirror_clean;      /* ...and whether that one reads clean  */
+	int   cluster;
+	char  file[72];          /* owning file, "" when none            */
+	long  file_offset;       /* byte offset of this sector in it     */
+	long  file_size;
+	char  note[200];
+} dr_fs_loc;
+
+/* What an independent, above-the-sector check made of a payload. */
+typedef struct {
+	int    checked;          /* a real check applied                 */
+	int    proven;           /* an independent checksum matched      */
+	int    refuted;          /* ...or definitely did not            */
+	double score;            /* 0..1, for ranking variants           */
+	char   how[200];
+} dr_fs_verdict;
+
+dr_fs      *dr_fs_open(dr_ctx *c);
+void        dr_fs_free(dr_fs *fs);
+const dr_fs_info *dr_fs_stat(const dr_fs *fs);
+
+/* Where does this sector sit in the filesystem, and what is above it? */
+int         dr_fs_locate(dr_fs *fs, int sector_index, dr_fs_loc *out);
+
+/* The other FAT's copy of a FAT sector - exact redundancy, already on
+ * the disk. Returns NULL unless the sector is in a FAT and the mirror
+ * read cleanly. */
+const uint8_t *dr_fs_mirror(dr_fs *fs, const dr_fs_loc *loc);
+
+/* Judge a candidate payload for this sector by the file that owns it:
+ * a ZIP entry's CRC-32, a gzip member's, a directory's structure, a
+ * FAT's own consistency. Far stronger than the sector CRC when it
+ * applies, and the only referee at all when the sector CRC is damaged. */
+/* The same bytes, stored a second time somewhere else on this disk.
+ * Backup archives are written twice as often as anyone expects: the
+ * same ZIP entry, the same name, the same packed length and the same
+ * CRC-32, sitting in a second archive a few hundred tracks away. When
+ * one copy is under the damaged sector and the other is not, the
+ * sector's contents are not a guess - and the archive's own CRC-32
+ * says so, with thirty-two bits rather than sixteen.
+ *
+ * Fills `out` with this sector's `len` true bytes. Returns 1 when the
+ * archive's CRC-32 confirms them, 0 when a copy was found but does not
+ * check out, -1 when there is no second copy. */
+int         dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc,
+                         uint8_t *out, int len, char *how, int howsz);
+
+int         dr_fs_score(dr_fs *fs, const dr_fs_loc *loc,
+                        const uint8_t *payload, int len,
+                        dr_fs_verdict *out);
+
+/* Overwrite a sector's data field with known-good bytes and re-stamp
+ * its CRC. Used when the truth came from somewhere else entirely - the
+ * other FAT, or the same file archived twice on the same disk. */
+int         dr_set_data(dr_ctx *c, dr_view *v, const uint8_t *data, int len);
 
 /* ------------------------------------------------------------------ */
 /* CRC helpers (CRC-16/CCITT-FALSE, poly 0x1021, init 0xFFFF)          */

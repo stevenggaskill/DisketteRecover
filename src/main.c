@@ -73,6 +73,22 @@ static const char *usage_text =
 "  --out FILE        write the patched image\n"
 "  --format NAME     export format for --out (default: hfe)\n"
 "\n"
+"filesystem options (scan and repair):\n"
+"  --fs              say what each bad sector actually is: free space,\n"
+"                    a FAT with a second copy on the disk, or so many\n"
+"                    bytes of a named file - and, where the file format\n"
+"                    carries a checksum of its own, put every candidate\n"
+"                    reading to it. Thirty-two bits about the data beats\n"
+"                    sixteen about the sector.\n"
+"  --from-copy       write the second copy of these bytes that is\n"
+"                    already on this disk - the other FAT, or the same\n"
+"                    archive entry stored twice - and re-stamp the CRC.\n"
+"                    Not a ranking: the archive's CRC-32 confirms it.\n"
+"                    (--from-mirror is the same switch.)\n"
+"  --variants N      write one image per reading: FILE_a1.hfe,\n"
+"                    FILE_a2.hfe ... Open them in a disk browser and\n"
+"                    see which one's files still make sense.\n"
+"\n"
 "damage options:\n"
 "  --bits a,b,c      message bit indices to flip\n"
 "  --slip B:N        shift the sector's cells by N from byte B on, the\n"
@@ -107,6 +123,9 @@ typedef struct {
 	const char *bits;
 	const char *slip;
 	const char *bytes;
+	int    fs;
+	int    variants;
+	int    frommirror;
 	char *const *sets;
 	int    nsets;
 	dr_options opt;
@@ -165,6 +184,10 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--apply"))    a->apply = atoi(NEXT());
 		else if (!strcmp(o, "--auto"))     a->autoapply = 1;
 		else if (!strcmp(o, "--all"))      a->all = 1;
+		else if (!strcmp(o, "--fs"))       a->fs = 1;
+		else if (!strcmp(o, "--from-mirror") ||
+		         !strcmp(o, "--from-copy")) a->frommirror = 1;
+		else if (!strcmp(o, "--variants")) a->variants = atoi(NEXT());
 		else if (!strcmp(o, "--out"))      a->out = NEXT();
 		else if (!strcmp(o, "--format"))   a->format = NEXT();
 		else if (!strcmp(o, "--bits"))     a->bits = NEXT();
@@ -883,6 +906,271 @@ static void print_candidates(dr_view *v, dr_repair_result *r, int limit)
 	}
 }
 
+
+/* ------------------------------------------------------------------ */
+/* The filesystem above the sector                                     */
+/* ------------------------------------------------------------------ */
+/* Opened once and kept: assembling it re-reads every track. */
+static dr_fs *g_fs;
+static int    g_fs_tried;
+
+static dr_fs *fs_of(dr_ctx *c)
+{
+	if (!g_fs_tried) {
+		g_fs_tried = 1;
+		g_fs = dr_fs_open(c);
+	}
+	return g_fs;
+}
+
+static const char *area_name(dr_fs_area a)
+{
+	switch (a) {
+	case DR_AREA_BOOT:    return "boot";
+	case DR_AREA_FAT:     return "FAT";
+	case DR_AREA_ROOT:    return "root dir";
+	case DR_AREA_FILE:    return "file";
+	case DR_AREA_FREE:    return "free";
+	case DR_AREA_OUTSIDE: return "outside";
+	default:              return "?";
+	}
+}
+
+/* What this sector is, in the terms the disk's owner would use. */
+static void print_fs(dr_ctx *c, int idx)
+{
+	dr_fs *fs = fs_of(c);
+	const dr_fs_info *in;
+	dr_fs_loc loc;
+
+	if (!fs)
+		return;
+	in = dr_fs_stat(fs);
+	if (dr_fs_locate(fs, idx, &loc) != 0)
+		return;
+
+	printf("filesystem: %s, %d sectors/track, %d head(s), %d file(s) in the "
+	       "root - this is LBA %ld\n", in->kind, in->spt, in->heads,
+	       in->nfiles, loc.lba);
+	printf("            %s\n", loc.note);
+}
+
+/* Does the other copy of this FAT sector answer to this sector's own
+ * stored CRC? If it does, the bytes are not a guess: two independent
+ * things agree, and one of them is sixteen bits the search never got
+ * to choose. */
+static const uint8_t *mirror_for(dr_ctx *c, dr_view *v, int idx,
+                                 dr_fs_loc *loc, int *proven, int *ndiff)
+{
+	dr_fs *fs = fs_of(c);
+	const uint8_t *m;
+	uint8_t *msg;
+	uint16_t crc;
+	int i;
+
+	*proven = 0;
+	*ndiff = 0;
+	if (!fs || dr_fs_locate(fs, idx, loc) != 0)
+		return NULL;
+	m = dr_fs_mirror(fs, loc);
+	if (!m || v->data_len != 512)
+		return NULL;
+
+	for (i = 0; i < v->data_len; i++)
+		if (m[i] != v->msg[v->data_offset + i])
+			(*ndiff)++;
+
+	msg = malloc((size_t)v->msg_len);
+	if (!msg)
+		return m;
+	memcpy(msg, v->msg, (size_t)v->msg_len);
+	memcpy(msg + v->data_offset, m, (size_t)v->data_len);
+	crc = dr_crc16(msg, v->msg_len - 2);
+	free(msg);
+	*proven = (crc == v->stored_crc);
+	return m;
+}
+
+static void print_mirror(dr_ctx *c, dr_view *v, int idx)
+{
+	dr_fs_loc loc;
+	const uint8_t *m;
+	int proven = 0, ndiff = 0;
+
+	m = mirror_for(c, v, idx, &loc, &proven, &ndiff);
+	if (!m)
+		return;
+	printf("mirror    : the other FAT holds the same %d bytes and reads "
+	       "clean; it differs\n            from this reading in %d byte(s)"
+	       ".\n", v->data_len, ndiff);
+	if (proven)
+		printf("            Its CRC-16 is %04X - the value stored "
+		       "here. That is not a ranking,\n"
+		       "            it is a match: these are the sector's "
+		       "bytes. Write them with\n"
+		       "            --from-mirror.\n", v->stored_crc);
+	else
+		printf("            Its CRC-16 does not match the value "
+		       "stored here, so either the\n"
+		       "            two copies genuinely differ or the stored "
+		       "CRC went with the data.\n"
+		       "            --from-mirror writes it anyway, re-stamping "
+		       "the CRC.\n");
+}
+
+/* Put every candidate reading to the check that lives above the sector.
+ *
+ * The sector CRC is sixteen bits, and a search that explores far enough
+ * will find hundreds of readings that satisfy it - on one sector here,
+ * 243 of them, the best only nine times likelier than the next. Sixteen
+ * bits cannot separate those. The file they sit inside can: a deflate
+ * stream carries a CRC-32 of what it unpacks to, and a reading that is
+ * wrong by one bit does not unpack at all. So ask it about all of them,
+ * and report what survives - including, usefully, "none of them did". */
+static void print_referee(dr_ctx *c, dr_view *v, dr_repair_result *r,
+                          int idx, int limit)
+{
+	dr_fs *fs = fs_of(c);
+	dr_fs_loc loc;
+	int i, tested = 0, kept = 0, shown = 0;
+	char note[200];
+
+	note[0] = 0;
+	if (!fs || dr_fs_locate(fs, idx, &loc) != 0)
+		return;
+	if (loc.area == DR_AREA_FREE || loc.area == DR_AREA_OUTSIDE) {
+		dr_fs_verdict vd;
+		dr_fs_score(fs, &loc, NULL, 0, &vd);
+		printf("\nreferee   : %s\n", vd.how);
+		return;
+	}
+	if (!r->count)
+		return;
+
+	printf("\nreferee   : what the file above this sector makes of each "
+	       "reading\n");
+	for (i = 0; i < r->count; i++) {
+		uint8_t *msg = dr_candidate_message(v, &r->list[i]);
+		dr_fs_verdict vd;
+
+		if (!msg)
+			continue;
+		if (dr_fs_score(fs, &loc, msg + v->data_offset,
+		                v->data_len, &vd) == 0 && vd.checked) {
+			tested++;
+			if (vd.proven || !vd.refuted) {
+				kept++;
+				if (shown < limit) {
+					printf("  %2d  %-8s %s\n", i,
+					       vd.proven ? "SURVIVES" : "-",
+					       vd.how);
+					shown++;
+				}
+			}
+			if (!note[0])
+				snprintf(note, sizeof(note), "%s", vd.how);
+		} else if (!tested) {
+			printf("            %s\n", vd.how);
+			free(msg);
+			return;
+		}
+		free(msg);
+	}
+	if (!tested)
+		return;
+	if (!kept)
+		printf("            %d reading(s) satisfied the sector's "
+		       "16-bit CRC; none of them\n"
+		       "            survives the file's own 32-bit one. The "
+		       "true reading is not in\n"
+		       "            this pool - the damage is deeper than the "
+		       "search can reach.\n", tested);
+	else
+		printf("            %d of %d CRC-valid reading(s) also satisfy "
+		       "the file's own checksum.\n", kept, tested);
+}
+
+/* Write out one image per plausible reading, so they can be opened and
+ * looked at. A CRC-valid reading is not the same thing as a correct
+ * one; five files a person can browse settle in seconds what a margin
+ * only ever estimates. */
+static int write_variants(args *a, int idx, dr_view *v,
+                          dr_repair_result *r, int n)
+{
+	const char *dot;
+	char stem[1024], ext[64];
+	int i, wrote = 0;
+
+	if (!a->out) {
+		fprintf(stderr, "--variants needs --out\n");
+		return -1;
+	}
+	dot = strrchr(a->out, '.');
+	if (dot && strlen(dot) < sizeof(ext)) {
+		snprintf(stem, sizeof(stem), "%.*s", (int)(dot - a->out), a->out);
+		snprintf(ext, sizeof(ext), "%s", dot);
+	} else {
+		snprintf(stem, sizeof(stem), "%s", a->out);
+		snprintf(ext, sizeof(ext), ".hfe");
+	}
+
+	if (n > r->count)
+		n = r->count;
+	printf("\nvariants  : one image per reading, ranked as the search "
+	       "ranks them\n");
+
+	for (i = 0; i < n; i++) {
+		uint8_t *msg = dr_candidate_message(v, &r->list[i]);
+		char path[1200];
+		dr_ctx *cc;
+		dr_view *vv;
+		dr_fs *vfs;
+		dr_fs_loc loc;
+		dr_fs_verdict vd;
+		int scored = 0;
+
+		if (!msg)
+			continue;
+		snprintf(path, sizeof(path), "%s_a%d%s", stem, i + 1, ext);
+
+		cc = dr_open_ex(a->image, 0, a->sets, a->nsets);
+		if (!cc || dr_scan(cc) < 0) {
+			free(msg);
+			if (cc)
+				dr_close(cc);
+			continue;
+		}
+		vv = dr_view_open(cc, idx, &a->opt);
+		if (vv && dr_set_data(cc, vv, msg + v->data_offset,
+		                      v->data_len) == 0 &&
+		    dr_export(cc, path, a->format) == 0) {
+			wrote++;
+			vfs = dr_fs_open(cc);
+			if (vfs && dr_fs_locate(vfs, idx, &loc) == 0 &&
+			    dr_fs_score(vfs, &loc, msg + v->data_offset,
+			                v->data_len, &vd) == 0 && vd.checked)
+				scored = 1;
+			printf("  %s   %s\n", path,
+			       scored ? (vd.proven ? "PROVEN by the file's own "
+			                             "checksum" : vd.how)
+			              : "written");
+			if (vfs)
+				dr_fs_free(vfs);
+		} else {
+			printf("  %s   could not be written\n", path);
+		}
+		if (vv)
+			dr_view_free(vv);
+		dr_close(cc);
+		free(msg);
+	}
+	if (wrote)
+		printf("            Open them in a disk browser: the one whose "
+		       "files still make sense\n"
+		       "            is the true reading.\n");
+	return wrote;
+}
+
 /* Run the engine cascade for one sector and report in one line.
  * Returns 1 if the sector was repaired and verified. */
 static int repair_one(dr_ctx *c, int idx, args *a, int apply)
@@ -1115,6 +1403,101 @@ int main(int argc, char **argv)
 			dr_json_scan(c, stdout), printf("\n");
 		else
 			print_scan(c);
+		if (a.fs && !a.json) {
+			dr_fs *fs = fs_of(c);
+			const dr_sector *sl;
+			int n, i, shown = 0;
+			int n_out = 0, n_free = 0, n_fat = 0;
+			int n_mirror = 0, n_file = 0, n_other = 0;
+
+			if (!fs) {
+				printf("\nno filesystem recognised on this "
+				       "disk.\n");
+			} else {
+				const dr_fs_info *in = dr_fs_stat(fs);
+				printf("\nfilesystem: %s, %d sector(s)/track, "
+				       "%d head(s), %d FAT(s) of %d sector(s), "
+				       "%d file(s)\n", in->kind, in->spt,
+				       in->heads, in->nfats, in->fat_sectors,
+				       in->nfiles);
+				if (in->nfats > 1)
+					printf("            the two FATs differ "
+					       "in %ld byte(s)%s\n",
+					       in->fat_mismatch,
+					       in->fat_mismatch ? "" :
+					       " - they agree exactly");
+				sl = dr_sectors(c, &n);
+				for (i = 0; i < n; i++) {
+					dr_fs_loc loc;
+
+					if (sl[i].data_crc != DR_CRC_BAD &&
+					    sl[i].header_crc != DR_CRC_BAD)
+						continue;
+					if (!shown++)
+						printf("\nwhere the bad "
+						       "sectors land\n");
+					if (dr_fs_locate(fs, i, &loc) != 0) {
+						/* Not addressable by the
+						 * filesystem at all: a track
+						 * past the formatted area, or
+						 * a sector whose size the
+						 * format does not use. Noise
+						 * read as a sector, not a
+						 * fault in anyone's data. */
+						printf("  %3d/%d s%-3d  %-8s  "
+						       "not part of the "
+						       "filesystem (%d-byte "
+						       "%s sector%s)\n",
+						       sl[i].track, sl[i].side,
+						       sl[i].sector_id,
+						       (n_out++, "outside"),
+						       sl[i].sector_size,
+						       sl[i].encoding == DR_ENC_ISO_FM
+						         ? "FM" : "MFM",
+						       sl[i].track >= in->total_sectors /
+						           (in->spt * in->heads)
+						         ? ", past the last formatted track"
+						         : "");
+						continue;
+					}
+					switch (loc.area) {
+					case DR_AREA_FREE:    n_free++; break;
+					case DR_AREA_OUTSIDE: n_out++; break;
+					case DR_AREA_FILE:    n_file++; break;
+					case DR_AREA_FAT:
+						n_fat++;
+						if (loc.mirror_clean)
+							n_mirror++;
+						break;
+					default:              n_other++; break;
+					}
+					printf("  %3d/%d s%-3d  %-8s  %s\n",
+					       sl[i].track, sl[i].side,
+					       sl[i].sector_id,
+					       area_name(loc.area), loc.note);
+				}
+				if (shown) {
+					/* The number that matters is not how
+					 * many sectors failed but how much of
+					 * anyone's data is actually at stake.
+					 */
+					printf("\nof %d bad sector(s): %d in a "
+					       "FAT (%d with a clean second "
+					       "copy on this disk),\n"
+					       "%d in free space, %d outside "
+					       "the filesystem, %d carrying "
+					       "%d byte(s)\nof a file.\n",
+					       shown, n_fat, n_mirror, n_free,
+					       n_out, n_file, n_file * 512);
+					if (!n_file && !n_fat)
+						printf("Nothing anyone stored "
+						       "on this disk is "
+						       "missing.\n");
+				}
+			}
+		}
+		if (g_fs)
+			dr_fs_free(g_fs);
 		dr_close(c);
 		return 0;
 	}
@@ -1301,8 +1684,71 @@ int main(int argc, char **argv)
 			dr_repair_result r;
 			dr_mode engine;
 
-			if (!a.json)
+			if (!a.json) {
 				print_view(v, 12);
+				if (a.fs || a.frommirror || a.variants) {
+					print_fs(c, idx);
+					print_mirror(c, v, idx);
+				}
+			}
+
+			/* The other FAT's bytes are not a candidate to be
+			 * ranked - they are the same data, read from a
+			 * different place on the disk. */
+			if (a.frommirror) {
+				dr_fs_loc loc;
+				const uint8_t *m;
+				uint8_t sis[512];
+				char how[200];
+				int proven = 0, ndiff = 0;
+
+				m = mirror_for(c, v, idx, &loc, &proven, &ndiff);
+				if (!m && fs_of(c) &&
+				    dr_fs_locate(fs_of(c), idx, &loc) == 0 &&
+				    v->data_len == (int)sizeof(sis)) {
+					int sr = dr_fs_sister(fs_of(c), &loc,
+					                      sis, v->data_len,
+					                      how, (int)sizeof(how));
+					if (sr >= 0) {
+						printf("\nsecond copy: %s\n",
+						       how);
+						if (sr == 1) {
+							m = sis;
+							proven = 1;
+						}
+					}
+				}
+				if (!m) {
+					fprintf(stderr, "--from-copy: nothing "
+					        "on this disk holds a second "
+					        "copy of these bytes\n");
+					rc = 1;
+				} else if (dr_set_data(c, v, m, v->data_len) < 0) {
+					fprintf(stderr, "--from-copy: write "
+					        "failed\n");
+					rc = 1;
+				} else {
+					printf("\nwrote the other copy's %d "
+					       "bytes into this sector%s.\n",
+					       v->data_len,
+					       proven ? " - proven, not ranked"
+					              : ", re-stamping the CRC");
+					if (a.out && dr_export(c, a.out,
+					                       a.format) < 0) {
+						fprintf(stderr, "%s\n",
+						        dr_last_error(c));
+						rc = 1;
+					} else if (a.out) {
+						printf("wrote %s (%s)\n",
+						       a.out, a.format);
+					}
+				}
+				if (g_fs)
+					dr_fs_free(g_fs);
+				dr_view_free(v);
+				dr_close(c);
+				return rc;
+			}
 
 			/*
 			 * Every engine that applies gets a say, and their
@@ -1352,6 +1798,19 @@ int main(int argc, char **argv)
 				print_candidates(v, &r, 16);
 			}
 
+			if (!a.json && (a.fs || a.variants))
+				print_referee(c, v, &r, idx, 5);
+
+			if (a.variants > 0 && !a.json) {
+				write_variants(&a, idx, v, &r, a.variants);
+				if (g_fs)
+					dr_fs_free(g_fs);
+				dr_repair_free(&r);
+				dr_view_free(v);
+				dr_close(c);
+				return 0;
+			}
+
 			/* --auto only fires when the reading is not in doubt:
 			 * a lone candidate, or one that beats the runner-up
 			 * by two orders of magnitude. */
@@ -1396,6 +1855,8 @@ int main(int argc, char **argv)
 				}
 			}
 
+			if (g_fs)
+				dr_fs_free(g_fs);
 			dr_repair_free(&r);
 			dr_view_free(v);
 			dr_close(c);
