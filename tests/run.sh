@@ -173,6 +173,20 @@ if command -v python3 >/dev/null 2>&1; then
 	else bad "recovered exactly despite the damaged CRC"; fi
 fi
 
+echo "== a CRC that is itself inside the damage"
+# The stored CRC is the last two bytes of the sector and nothing protects
+# it. A reading that matches a checksum which is itself a guess proves
+# nothing, so the tool measures how much of that checksum is in doubt.
+if command -v python3 >/dev/null 2>&1; then
+	ce=$("$dr" inspect "$out/fill.hfe" --sector 5 --json 2>/dev/null |
+	     sed -n 's/.*"crc_expected_errors":\([0-9.e-]*\).*/\1/p')
+	if [ -n "$ce" ] && awk "BEGIN{exit !($ce < 0.3)}"; then
+		ok "an intact sector's CRC is trusted ($ce bits in doubt)"
+	else
+		bad "an intact sector's CRC is trusted (got '$ce')"
+	fi
+fi
+
 echo "== --restore-only narrows the search"
 a=$("$dr" repair "$out/b2.hfe" --json 2>/dev/null |
     sed -n 's/.*"count":\([0-9]*\).*/\1/p' | head -1)

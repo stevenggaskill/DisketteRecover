@@ -130,6 +130,7 @@ typedef struct {
 	float    *bit_perr;
 
 	int       crc_suspect;   /* the stored CRC is inside the damage   */
+	double    crc_expected_errors;  /* expected bad bits in those two */
 	int       flux_available;/* 1 if flux timings were aligned        */
 	void     *flux;          /* dr_flux_map *, kept for the re-binner */
 	void     *revs;          /* dr_revmap *, the other passes         */

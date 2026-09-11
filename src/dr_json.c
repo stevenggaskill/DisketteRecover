@@ -93,6 +93,7 @@ void dr_json_view(dr_ctx *c, dr_view *v, FILE *f)
 	           "\"data_offset\":%d,\"data_len\":%d,"
 	           "\"syndrome\":%u,\"stored_crc\":%u,\"computed_crc\":%u,"
 	           "\"crc_valid\":%s,\"crc_suspect\":%s,"
+	           "\"crc_expected_errors\":%.4g,"
 	           "\"flux\":%s,\"stride\":%d,"
 	           "\"base_cell\":%d,\"track_len\":%d,"
 	           "\"revolutions\":%d,\"revolutions_used\":%d,"
@@ -106,6 +107,7 @@ void dr_json_view(dr_ctx *c, dr_view *v, FILE *f)
 	        v->syndrome, v->stored_crc, v->computed_crc,
 	        v->syndrome ? "false" : "true",
 	        v->crc_suspect ? "true" : "false",
+	        v->crc_expected_errors,
 	        v->flux_available ? "true" : "false",
 	        v->stride, v->base_cell,
 	        ((HXCFE_SIDE *)v->side)->tracklen,

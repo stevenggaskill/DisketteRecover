@@ -488,16 +488,34 @@ tool the most: see [the one wrong answer](#the-one-wrong-answer-and-what-it-cost
 below. It repairs exactly, to 512 bytes of `0xF6`.
 
 **Zeus** - 2881 sectors, two bad: sector 9 on tracks 8 *and* 9, the same
-adjacent-track signature as Disk 1. The flux is healthy either side of a
-90-byte burst, the five passes agree on every reversal, and the content
-is structured binary with no repeat to lean on. Both stay ambiguous - 65
-and 56 CRC-valid readings, topping out at 98 and 3 times the runner-up.
-That is the honest end of the road for a 16-bit CRC over a burst this
-size, and the tool says so.
+adjacent-track signature as Disk 1. Both are in the same file - the
+filesystem says `ZEUSNO~1.PPT`, 170 sectors of which exactly these two
+are damaged - and both fail the same way: band collapse over the first
+hundred bytes, gain 0.87 against 1.00 for the rest of the sector, and an
+interval spread of 0.15 cells where the bands are only 0.87 apart.
 
-Totals across the four: **9 of 14** bad sectors repaired and verified.
-The five that are not are reported as ambiguous rather than guessed, and
-`inspect` says which kind of damage each one is.
+Both stay ambiguous, and the arithmetic says they have to. Thirty-four
+intervals are left genuinely open by the timings; the re-binning search
+puts twenty million readings on the table and a 16-bit CRC lets about
+three hundred of them through. There is no more evidence to bring: the
+five passes agree on every reversal to 0.018 of a cell, so the flux has
+already said everything it knows, and adding neighbour and interaction
+terms to the timing model moves its residual from 0.176 to 0.171. A
+sector can be damaged past what its own checksum can arbitrate, and these
+two are.
+
+They did pay for themselves, though - see the note on the block fit
+below, which they are the reason for.
+
+Totals across the four: **6 of 14** bad sectors repaired and verified.
+
+That number went *down* as the tool got better, and the reason is the
+whole point of the section below. Five of the readings it used to apply
+were matching a stored CRC that was itself inside the damage - on Disk
+2's `41/1 s17`, about 4.9 of the checksum's 16 bits are in doubt, so
+matching it exactly is not evidence of anything. The tool now measures
+that and declines. A repair count that only ever goes up is a repair
+count that is not being checked.
 
 ### The errors that actually happen
 
@@ -555,7 +573,20 @@ every marginal call it produced was manufactured.
 
 Blocks overlap by half so the coefficients interpolate rather than step,
 and a block only keeps its own fit if the gain stays inside [0.75, 1.25]
-*and* the local residual beats the global one on those same intervals.
+*and* the local residual beats the global one on those same intervals -
+measured on the same intervals, too, or the trimmed local figure is being
+compared against an untrimmed global one and wins by bookkeeping.
+
+The window the block fit trims against has to come from the block, not
+from the sector. Deriving it from the global sigma looks careful and is
+self-defeating: a block whose bands have collapsed sits half a cell from
+where the global fit expects it, so every interval in it falls outside a
+window scaled to the clean three quarters of the sector, the block is
+left with nothing to fit, and *the one stretch that needed a local model
+is the one stretch that never gets one*. That is how Zeus's bad sectors
+were reported as running at gain 0.99 throughout when their first three
+blocks are 0.90, 0.87 and 0.93. The window now starts at half a cell and
+tightens from the block's own spread.
 Outside that, the global centres stand and the block keeps its own larger
 residual - so a stretch with nothing readable left reads as exactly that,
 rather than having a flattering model fitted to its noise. This is the
@@ -622,13 +653,23 @@ stored CRC `2BF6` - and with the phase put back, the CRC bytes read
 correctly on their own, which is as close to independent confirmation as
 this gets.
 
-Two guards came out of it. `inspect` now says when the timings under the
-CRC bytes were themselves in doubt, because a reading that matches a
-guessed checksum has proved less than it looks. And where a trustworthy
-model determines the data but the stored CRC disagrees by a bit or two,
-the repair may correct *those* bits - and then says so, and prices the
-result honestly: two corrected bits widen the CRC's target from one value
-in 65536 to 137, and the reported budget says so.
+Two guards came out of it, and they are worth more than the sector was.
+
+The first: **a CRC is only evidence if the CRC was read correctly.** The
+tool now adds up the error probability of the sixteen stored CRC bits and
+reports it, and the figure is cleanly bimodal on real disks - 0.006
+expected bad bits where the sector's tail is intact, against 0.36, 3.4,
+4.4 and 4.9 where the damage reaches it. Above 0.3 it will not apply a
+repair on its own authority, however commanding the margin: a margin is a
+ratio against the other readings that matched the stored value, and when
+that value is a guess the ratio only says which fiction the priors
+preferred. `--apply K` still applies one deliberately.
+
+The second: where a trustworthy model determines the data but the stored
+CRC disagrees by a bit or two, the repair may correct *those* bits - and
+then says so, and prices the result honestly: two corrected bits widen
+the CRC's target from one value in 65536 to 137, and the reported budget
+says so.
 
 ### Ranking: Occam's razor, made explicit
 

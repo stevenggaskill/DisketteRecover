@@ -396,14 +396,20 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 	 * checksum that was itself nonsense.
 	 */
 	{
-		int lo = (v->msg_len - 2) * v->stride;
-		int hi = v->msg_len * v->stride;
+		/*
+		 * How many bit errors the CRC bytes are expected to be
+		 * carrying, summed over their sixteen bits. A calibrated
+		 * quantity rather than "is any cell here uneasy": half an
+		 * expected error means the stored value is as likely wrong as
+		 * right, and matching it proves nothing; a twentieth means it
+		 * is almost certainly what was written.
+		 */
+		double expect = 0.0;
 
-		for (i = lo; i < hi && i < v->ncells; i++)
-			if (v->cells[i].p_err > 0.05) {
-				v->crc_suspect = 1;
-				break;
-			}
+		for (i = (v->msg_len - 2) * 8; i < v->msg_bits; i++)
+			expect += v->bit_perr[i];
+		v->crc_expected_errors = expect;
+		v->crc_suspect = (expect > 0.30);
 	}
 
 	if (rm) {

@@ -228,18 +228,34 @@ static int usable(const dr_interval *iv, int i)
 /* Least squares for one block, returning 0 and filling sol/sd on
  * success. `keep` is the residual window; a single robust pass is enough
  * because the global fit has already set the scale. */
+/*
+ * Fit one block, and measure the global fit on the very same intervals so
+ * the two can be compared.
+ *
+ * The rejection window has to start wide and tighten from the block's own
+ * spread, never from the whole sector's. Deriving it from the global
+ * sigma looks careful and is self-defeating: a block whose bands have
+ * collapsed sits half a cell away from where the global fit expects it,
+ * so every interval in it falls outside a window scaled to the clean
+ * three quarters of the sector, the block is left with nothing to fit,
+ * and the one stretch that needed a local model is the one stretch that
+ * never gets one. That is not hypothetical - it is why a sector with
+ * blocks at gain 0.87 was reported as running 0.99 throughout.
+ */
 static int fit_block(const dr_interval *iv, int n, int lo, int hi,
-                     const dr_timing *g, double *sol, double *sd, int *used)
+                     const dr_timing *g, double *sol, double *sd,
+                     double *gsd, int *used)
 {
-	double A[4][5], x[4], ss = 0.0;
+	double A[4][5], x[4], ss, gss;
 	int pass, i, j, k, cnt = 0;
-	double keep = 4.0 * g->sigma;
+	double keep = 0.45;        /* half a cell: excludes nothing legal  */
 
 	sol[0] = g->a; sol[1] = g->b; sol[2] = g->c; sol[3] = g->d;
 
-	for (pass = 0; pass < 2; pass++) {
+	for (pass = 0; pass < 3; pass++) {
 		memset(A, 0, sizeof(A));
 		cnt = 0;
+		ss = 0.0;
 		for (i = lo; i < hi && i < n; i++) {
 			double pred, r;
 
@@ -256,18 +272,26 @@ static int fit_block(const dr_interval *iv, int n, int lo, int hi,
 					A[j][k] += x[j] * x[k];
 				A[j][4] += x[j] * iv[i].meas;
 			}
+			ss += r * r;
 			cnt++;
 		}
 		if (cnt < 64)
 			return -1;
 		if (solve(A, 4, sol) < 0)
 			return -1;
+
+		/* Tighten from what this block actually looks like. */
+		keep = 4.0 * sqrt(ss / cnt);
+		if (keep < 4.0 * g->sigma)
+			keep = 4.0 * g->sigma;
+		if (keep < 0.06)
+			keep = 0.06;
 	}
 
-	ss = 0.0;
+	ss = gss = 0.0;
 	cnt = 0;
 	for (i = lo; i < hi && i < n; i++) {
-		double pred, r;
+		double pred, r, gr;
 
 		if (i < 1 || i + 1 >= n || !usable(iv, i))
 			continue;
@@ -276,36 +300,18 @@ static int fit_block(const dr_interval *iv, int n, int lo, int hi,
 		r = iv[i].meas - pred;
 		if (fabs(r) > keep)
 			continue;
+		gr = iv[i].meas - (g->a + g->b * x[1] + g->c * x[2] +
+		                   g->d * x[3]);
 		ss += r * r;
+		gss += gr * gr;
 		cnt++;
 	}
 	if (cnt < 64)
 		return -1;
 	*sd = sqrt(ss / cnt);
+	*gsd = sqrt(gss / cnt);      /* same intervals, so a fair contest */
 	*used = cnt;
 	return 0;
-}
-
-/* The spread of the block residuals around the *global* fit, which is
- * what a local fit has to beat to be worth having. */
-static double global_sd(const dr_interval *iv, int n, int lo, int hi,
-                        const dr_timing *g)
-{
-	double x[4], ss = 0.0;
-	int i, cnt = 0;
-
-	for (i = lo; i < hi && i < n; i++) {
-		double r;
-
-		if (i < 1 || i + 1 >= n || !usable(iv, i))
-			continue;
-		design(iv, n, i, x);
-		r = iv[i].meas - (g->a + g->b * x[1] + g->c * x[2] +
-		                  g->d * x[3]);
-		ss += r * r;
-		cnt++;
-	}
-	return cnt ? sqrt(ss / cnt) : g->sigma;
 }
 
 static void fit_blocks(const dr_interval *iv, int n, dr_timing *t)
@@ -340,14 +346,9 @@ static void fit_blocks(const dr_interval *iv, int n, dr_timing *t)
 
 		if (hi > n)
 			hi = n;
-		gsd = global_sd(iv, n, lo, hi, t);
 
-		if (fit_block(iv, n, lo, hi, t, sol, &sd, &used) < 0) {
-			/* Too little to say anything local about. */
-			if (gsd > t->sigma)
-				t->lsigma[b] = gsd;
-			continue;
-		}
+		if (fit_block(iv, n, lo, hi, t, sol, &sd, &gsd, &used) < 0)
+			continue;      /* too little to say anything local */
 
 		/*
 		 * A local gain outside this range is not a channel that

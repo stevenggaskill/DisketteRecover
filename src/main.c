@@ -341,10 +341,11 @@ static void print_view(dr_view *v, int top)
 	       v->stored_crc, v->computed_crc, v->syndrome,
 	       v->syndrome ? "INVALID" : "valid");
 	if (v->crc_suspect && v->syndrome)
-		printf("            the damage reaches the CRC bytes, so the "
-		       "stored value is a guess too -\n"
-		       "            a reading that matches it has proved "
-		       "less than it looks\n");
+		printf("            ~%.1f of these 16 bits are themselves in "
+		       "doubt, so the stored value is a\n"
+		       "            guess too - a reading that matches it has "
+		       "proved less than it looks\n",
+		       v->crc_expected_errors);
 	printf("evidence  : %s%s\n", v->model,
 	       v->flux_available ? "" : "  (no flux stream in this image)");
 	if (v->regions[0])
@@ -688,10 +689,27 @@ static void print_rebin(dr_view *v, dr_repair_result *r, int limit)
 
 	print_budget(r);
 	if (r->current_cost > 0.0)
-		printf("            re-binning explains the timings far better "
-		       "than the decoder did:\n"
-		       "            %.0f nats -> %.0f nats over the disturbed "
-		       "intervals\n", r->current_cost, r->floor_cost);
+	{
+		/*
+		 * Say which way round it went. The best re-reading can cost
+		 * *more* than the decoder's - that happens when a stretch has
+		 * no legal binning that fits the timings at all - and
+		 * announcing an improvement in that case contradicts the two
+		 * numbers printed next to it.
+		 */
+		if (r->floor_cost < r->current_cost)
+			printf("            re-binning explains the timings "
+			       "better than the decoder did:\n"
+			       "            %.0f nats -> %.0f nats over the "
+			       "disturbed intervals\n",
+			       r->current_cost, r->floor_cost);
+		else
+			printf("            no legal re-binning explains these "
+			       "timings even as well as the\n"
+			       "            decoder's own (%.0f nats -> %.0f); "
+			       "the flux here fits no reading\n",
+			       r->current_cost, r->floor_cost);
+	}
 
 	printf("\n rank  bits  re-bins  rel.likelihood  changed bytes\n");
 	printf(" ----  ----  -------  --------------  "
@@ -837,7 +855,20 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 		else
 			printf("top %.3g x next", margin);
 
-		if (apply && (unique || margin >= 100.0)) {
+		/*
+		 * A margin is a ratio against the other readings that matched
+		 * the stored CRC. When the damage reaches the CRC bytes
+		 * themselves, the number every one of them matched is a guess
+		 * too, and the ratio says nothing about the truth - it only
+		 * says which fiction the priors preferred. So this refuses to
+		 * apply on its own, however commanding the margin looks, and
+		 * leaves it to be applied deliberately.
+		 */
+		if (apply && v->crc_suspect && !(r.slip || r.crc_fixed)) {
+			printf("  -> not applied (~%.1f of the stored CRC's "
+			       "16 bits are themselves in doubt)",
+			       v->crc_expected_errors);
+		} else if (apply && (unique || margin >= 100.0)) {
 			if (dr_apply(c, v, &r.list[0]) == 0 &&
 			    dr_verify(c, idx) == 1) {
 				printf("  -> APPLIED, verifies clean");
