@@ -173,6 +173,20 @@ if command -v python3 >/dev/null 2>&1; then
 	else bad "recovered exactly despite the damaged CRC"; fi
 fi
 
+echo "== one mark across several tracks"
+# A sector id is an angular position and consecutive tracks are radially
+# adjacent, so the same id failing on a run of tracks is one physical
+# mark, not several faults. Five of six real disks fail exactly that way.
+if command -v python3 >/dev/null 2>&1; then
+	"$dr" damage "$out/fill.hfe" --sector 5 --bits 803 \
+	      --out "$out/r1.hfe" >/dev/null 2>&1
+	"$dr" damage "$out/r1.hfe" --sector 23 --bits 811 \
+	      --out "$out/r2.hfe" >/dev/null 2>&1
+	rad=$("$dr" scan "$out/r2.hfe" 2>/dev/null |
+	      sed -n 's/.*fails across tracks \([0-9]*-[0-9]*\).*/\1/p')
+	check "a mark crossing two tracks is reported as one" "$rad" "0-1"
+fi
+
 echo "== a CRC that is itself inside the damage"
 # The stored CRC is the last two bytes of the sector and nothing protects
 # it. A reading that matches a checksum which is itself a guess proves

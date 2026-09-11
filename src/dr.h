@@ -202,6 +202,14 @@ typedef struct {
 	double  data_prior;
 	int     restores;              /* 0->1: puts back a lost reversal */
 	int     removes;               /* 1->0: deletes a spurious one    */
+
+	/* How many of the flipped bits land where the flux said something
+	 * was wrong. Errors do not fall in places the timings call clean:
+	 * across every repair on these disks that has a verifiable truth,
+	 * every bit of it was inside the span the flux had already
+	 * flagged. A candidate that mends a byte the timings are certain
+	 * about is mending the CRC, not the disk. */
+	int     in_damage;
 } dr_candidate;
 
 typedef struct {
@@ -231,6 +239,7 @@ typedef struct {
 	int           slip;             /* cells of phase the repair undoes */
 	int           slip_byte;        /* ...from this message byte on     */
 	int           crc_fixed;        /* stored-CRC bits it had to correct*/
+	int           damage_bytes;     /* bytes the flux flags as uncertain*/
 	int           period;           /* the repeat it locked onto       */
 	int           outliers;         /* bytes that break the pattern    */
 	double        coverage;         /* fraction of bytes on-pattern    */

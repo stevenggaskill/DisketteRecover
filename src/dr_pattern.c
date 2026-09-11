@@ -33,6 +33,12 @@
 
 #define MAX_PERIOD  256
 #define ALPHA       0.08     /* add-alpha smoothing for the byte model */
+/* A byte is "damaged" when the timings give one of its bits at least
+ * this chance of being wrong, and the doubt spreads this many bytes
+ * either side. */
+#define DAMAGE_PERR    0.20
+#define DAMAGE_SPREAD  4
+
 #define BYTE_NATS   5.545    /* ln(256): the surprise of one wrong byte */
 
 struct dr_model {
@@ -631,11 +637,51 @@ static void order_bits(const dr_candidate *cd, int *ord)
 	}
 }
 
+/*
+ * Which bytes the flux itself says something is wrong with, and how far
+ * a repair's bits fall from them.
+ *
+ * This is the one cross-check that caught every confident wrong answer
+ * these disks produced. A CRC has 65536 values and a damaged sector
+ * offers far more readings than that, so a search will always find
+ * something that matches - and when the stored CRC is itself damaged,
+ * what it finds is a bit flipped somewhere the timings were certain,
+ * miles from the actual defect. Real errors are where the flux says they
+ * are.
+ */
+static int mark_damage(const dr_view *v, uint8_t *suspect)
+{
+	int i, k, n = 0;
+
+	for (i = 0; i < v->nbytes; i++) {
+		suspect[i] = 0;
+		for (k = 0; k < 8; k++)
+			if (v->bytes[i].p_err[k] > DAMAGE_PERR) {
+				suspect[i] = 1;
+				n++;
+				break;
+			}
+	}
+	/* Dilate: a defect that moves one reversal usually disturbs the
+	 * bytes either side of it too, and the repair may legitimately
+	 * land there. */
+	for (i = 0; i < v->nbytes; i++)
+		if (suspect[i] == 1)
+			for (k = 1; k <= DAMAGE_SPREAD; k++) {
+				if (i - k >= 0 && !suspect[i - k])
+					suspect[i - k] = 2;
+				if (i + k < v->nbytes && !suspect[i + k])
+					suspect[i + k] = 2;
+			}
+	return n;
+}
+
 int dr_rescore_data(dr_ctx *c, dr_view *v, const dr_options *opt,
                     dr_repair_result *r)
 {
 	struct dmodel local;
 	const uint8_t *cur;
+	uint8_t *suspect = NULL;
 	double base_score = 0.0;
 	void *fit;
 	int ord[DR_MAX_WEIGHT];
@@ -645,6 +691,13 @@ int dr_rescore_data(dr_ctx *c, dr_view *v, const dr_options *opt,
 		return 0;
 
 	cur = v->msg + v->data_offset;
+
+	if (v->flux_available && v->nbytes > 0) {
+		suspect = malloc((size_t)v->nbytes);
+		if (suspect)
+			r->damage_bytes = mark_damage(v, suspect);
+	}
+
 	fit = dr_fit_get(v);
 	if (fit)
 		before = dr_fit_outliers(fit, cur, v->data_len);
@@ -694,6 +747,7 @@ int dr_rescore_data(dr_ctx *c, dr_view *v, const dr_options *opt,
 		}
 
 		cd->restores = cd->removes = 0;
+		cd->in_damage = 0;
 		order_bits(cd, ord);
 		for (k = 0; k < cd->weight; k++) {
 			double q;
@@ -707,6 +761,8 @@ int dr_rescore_data(dr_ctx *c, dr_view *v, const dr_options *opt,
 			/* What the timings think of moving this particular
 			 * bit. A confident cell is expensive to overrule. */
 			q = (b >= 0 && b < v->msg_bits) ? v->bit_perr[b] : 1e-4;
+			if (suspect && (b >> 3) < v->nbytes && suspect[b >> 3])
+				cd->in_damage++;
 
 			/*
 			 * ...and what the bit before it says. Errors on this
@@ -747,6 +803,7 @@ int dr_rescore_data(dr_ctx *c, dr_view *v, const dr_options *opt,
 		free(msg);
 	}
 
+	free(suspect);
 	if (!fit && !use_disk)
 		dmodel_free(&local);
 

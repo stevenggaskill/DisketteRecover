@@ -507,7 +507,9 @@ two are.
 They did pay for themselves, though - see the note on the block fit
 below, which they are the reason for.
 
-Totals across the four: **6 of 14** bad sectors repaired and verified.
+Totals, now over six disks: **8 of 20** bad sectors repaired and verified.
+The running tally, and what each disk turned out to be suffering from, is
+in [docs/disks.md](docs/disks.md).
 
 That number went *down* as the tool got better, and the reason is the
 whole point of the section below. Five of the readings it used to apply

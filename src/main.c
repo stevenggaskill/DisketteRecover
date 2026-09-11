@@ -196,6 +196,63 @@ static int parse_args(int argc, char **argv, args *a)
 }
 
 /* Resolve --sector / --track/--side/--id / first bad. */
+/*
+ * One mark, several tracks.
+ *
+ * A sector id is an angular position and consecutive tracks are radially
+ * adjacent, so the same id failing on a run of tracks is not several
+ * faults - it is one scratch, one speck, one contact transfer, crossing
+ * them. Five of the six disks this was built against fail exactly that
+ * way, and on the ones where it can be measured the damage lands in the
+ * same byte range of each sector, which is the same angular span. Worth
+ * saying out loud: it tells the reader the defect is physical and where
+ * on the disk it is, and it warns that a neighbouring track is likely to
+ * be marginal even where its CRC still passes.
+ */
+static void print_radial(dr_ctx *c)
+{
+	const dr_sector *s;
+	int n, i, j, side, id;
+
+	s = dr_sectors(c, &n);
+	if (!s)
+		return;
+
+	for (side = 0; side <= 1; side++)
+		for (id = 1; id <= 64; id++) {
+			int lo = -1, hi = -1, cnt = 0;
+
+			for (i = 0; i < n; i++) {
+				if (s[i].side != side || s[i].sector_id != id)
+					continue;
+				if (s[i].data_crc != DR_CRC_BAD &&
+				    s[i].header_crc != DR_CRC_BAD)
+					continue;
+				if (lo < 0 || s[i].track < lo) lo = s[i].track;
+				if (s[i].track > hi) hi = s[i].track;
+				cnt++;
+			}
+			if (cnt < 2)
+				continue;
+
+			/* Only interesting if the tracks are close: the same
+			 * id failing at opposite ends of the disk is two
+			 * faults, not one mark. */
+			if (hi - lo > cnt + 4)
+				continue;
+
+			printf("            sector %d on side %d fails across "
+			       "tracks %d-%d (%d of them)", id, side, lo, hi,
+			       cnt);
+			for (j = 0, i = 0; i < n; i++)
+				if (s[i].side == side && s[i].sector_id == id &&
+				    (s[i].data_crc == DR_CRC_BAD ||
+				     s[i].header_crc == DR_CRC_BAD))
+					j++;
+			printf(" - one physical mark, not %d faults\n", j);
+		}
+}
+
 static int pick_sector(dr_ctx *c, const args *a)
 {
 	int i, n;
@@ -265,6 +322,7 @@ static void print_scan(dr_ctx *c)
 		printf("; first is index %d (track %d side %d sector %d)",
 		       i, s[i].track, s[i].side, s[i].sector_id);
 	printf("\n");
+	print_radial(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -444,10 +502,41 @@ static double top_margin(const dr_repair_result *r)
 	return 1.0 / r->list[1].rel_likelihood;
 }
 
+/*
+ * Does the repair mend the disk, or the checksum?
+ *
+ * A CRC has 65536 values and a damaged sector offers far more readings
+ * than that, so a search will always find something that matches. Where
+ * it puts its bits is the tell: Disk 2's 41/1 s17 has its damage at
+ * bytes 394-410 and 513-517 and was "repaired" by one bit at byte 85,
+ * which the timings give a 1-in-2500 chance of being wrong.
+ *
+ * Reported, not enforced, and the distinction matters. A lost reversal
+ * that runs two 2T intervals into one 4T is perfectly legal MFM: the
+ * timings cannot see it at all, so the commonest failure on these disks
+ * is invisible here by construction. Refusing repairs outside the
+ * flagged span would reject exactly those. The per-bit cost already
+ * prices this properly - a bit the timings call certain is expensive to
+ * overrule - and this line is here so the reader can see what the score
+ * is made of.
+ */
+static void print_locality(const dr_repair_result *r)
+{
+	if (r->damage_bytes <= 0 || !r->count || !r->list[0].weight)
+		return;
+	printf("locality  : the flux flags %d byte(s) as damaged, and the top "
+	       "reading puts %d of\n"
+	       "            its %d bit(s) there%s\n",
+	       r->damage_bytes, r->list[0].in_damage, r->list[0].weight,
+	       r->list[0].in_damage ? "" :
+	       " - so it is mending the checksum, not the disk");
+}
+
 static void print_margin(const dr_repair_result *r, const char *what)
 {
 	double m = top_margin(r);
 
+	print_locality(r);
 	if (r->count <= 1)
 		return;
 	if (m == HUGE_VAL)
