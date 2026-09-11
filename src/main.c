@@ -347,6 +347,8 @@ static void print_view(dr_view *v, int top)
 		       "less than it looks\n");
 	printf("evidence  : %s%s\n", v->model,
 	       v->flux_available ? "" : "  (no flux stream in this image)");
+	if (v->regions[0])
+		printf("timing    : %s\n", v->regions);
 	if (v->passes[0])
 		printf("passes    : %s\n", v->passes);
 	print_majority(v);

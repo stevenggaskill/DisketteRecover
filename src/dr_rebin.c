@@ -225,6 +225,155 @@ static int usable(const dr_interval *iv, int i)
  * buries that 0.3-cell swing in the residual, which then makes a sixth
  * of a perfectly good track look ambiguous.
  */
+/* Least squares for one block, returning 0 and filling sol/sd on
+ * success. `keep` is the residual window; a single robust pass is enough
+ * because the global fit has already set the scale. */
+static int fit_block(const dr_interval *iv, int n, int lo, int hi,
+                     const dr_timing *g, double *sol, double *sd, int *used)
+{
+	double A[4][5], x[4], ss = 0.0;
+	int pass, i, j, k, cnt = 0;
+	double keep = 4.0 * g->sigma;
+
+	sol[0] = g->a; sol[1] = g->b; sol[2] = g->c; sol[3] = g->d;
+
+	for (pass = 0; pass < 2; pass++) {
+		memset(A, 0, sizeof(A));
+		cnt = 0;
+		for (i = lo; i < hi && i < n; i++) {
+			double pred, r;
+
+			if (i < 1 || i + 1 >= n || !usable(iv, i))
+				continue;
+			design(iv, n, i, x);
+			pred = sol[0] + sol[1] * x[1] + sol[2] * x[2]
+			     + sol[3] * x[3];
+			r = iv[i].meas - pred;
+			if (fabs(r) > keep)
+				continue;
+			for (j = 0; j < 4; j++) {
+				for (k = 0; k < 4; k++)
+					A[j][k] += x[j] * x[k];
+				A[j][4] += x[j] * iv[i].meas;
+			}
+			cnt++;
+		}
+		if (cnt < 64)
+			return -1;
+		if (solve(A, 4, sol) < 0)
+			return -1;
+	}
+
+	ss = 0.0;
+	cnt = 0;
+	for (i = lo; i < hi && i < n; i++) {
+		double pred, r;
+
+		if (i < 1 || i + 1 >= n || !usable(iv, i))
+			continue;
+		design(iv, n, i, x);
+		pred = sol[0] + sol[1] * x[1] + sol[2] * x[2] + sol[3] * x[3];
+		r = iv[i].meas - pred;
+		if (fabs(r) > keep)
+			continue;
+		ss += r * r;
+		cnt++;
+	}
+	if (cnt < 64)
+		return -1;
+	*sd = sqrt(ss / cnt);
+	*used = cnt;
+	return 0;
+}
+
+/* The spread of the block residuals around the *global* fit, which is
+ * what a local fit has to beat to be worth having. */
+static double global_sd(const dr_interval *iv, int n, int lo, int hi,
+                        const dr_timing *g)
+{
+	double x[4], ss = 0.0;
+	int i, cnt = 0;
+
+	for (i = lo; i < hi && i < n; i++) {
+		double r;
+
+		if (i < 1 || i + 1 >= n || !usable(iv, i))
+			continue;
+		design(iv, n, i, x);
+		r = iv[i].meas - (g->a + g->b * x[1] + g->c * x[2] +
+		                  g->d * x[3]);
+		ss += r * r;
+		cnt++;
+	}
+	return cnt ? sqrt(ss / cnt) : g->sigma;
+}
+
+static void fit_blocks(const dr_interval *iv, int n, dr_timing *t)
+{
+	int width, i;
+
+	t->nint = n;
+	t->nblk = 0;
+	t->nlocal = 0;
+	t->bmin = t->bmax = t->b;
+
+	width = n / 8;
+	if (width < 192)
+		width = 192;
+	if (width > n)
+		return;
+	if (n / (width / 2) >= DR_TIMING_BLOCKS)
+		width = 2 * n / (DR_TIMING_BLOCKS - 1);
+	t->width = width;
+
+	for (i = 0; i * (width / 2) < n && t->nblk < DR_TIMING_BLOCKS; i++) {
+		int lo = i * (width / 2);
+		int hi = lo + width;
+		int b = t->nblk++;
+		double sol[4], sd = 0.0, gsd;
+		int used = 0;
+
+		t->la[b] = t->a; t->lb[b] = t->b;
+		t->lc[b] = t->c; t->ld[b] = t->d;
+		t->lsigma[b] = t->sigma;
+		t->lok[b] = 0;
+
+		if (hi > n)
+			hi = n;
+		gsd = global_sd(iv, n, lo, hi, t);
+
+		if (fit_block(iv, n, lo, hi, t, sol, &sd, &used) < 0) {
+			/* Too little to say anything local about. */
+			if (gsd > t->sigma)
+				t->lsigma[b] = gsd;
+			continue;
+		}
+
+		/*
+		 * A local gain outside this range is not a channel that
+		 * drifted, it is a stretch with no readable structure left -
+		 * the fit has latched onto noise. Keep the global centres so
+		 * the bins stay where the rest of the track says they are,
+		 * and keep the large residual, so the region reads as
+		 * exactly what it is: not to be trusted.
+		 */
+		if (sol[1] < 0.75 || sol[1] > 1.25 || sd >= gsd) {
+			t->lsigma[b] = (sd > gsd ? sd : gsd);
+			if (t->lsigma[b] < t->sigma)
+				t->lsigma[b] = t->sigma;
+			continue;
+		}
+
+		t->la[b] = sol[0]; t->lb[b] = sol[1];
+		t->lc[b] = sol[2]; t->ld[b] = sol[3];
+		t->lsigma[b] = sd < 0.015 ? 0.015 : sd;
+		t->lok[b] = 1;
+		t->nlocal++;
+		if (sol[1] < t->bmin) t->bmin = sol[1];
+		if (sol[1] > t->bmax) t->bmax = sol[1];
+	}
+}
+
 void dr_timing_fit(const dr_interval *iv, int n, dr_timing *t)
 {
 	int pass, i, j, k, used = 0;
@@ -362,25 +511,76 @@ void dr_timing_fit(const dr_interval *iv, int n, dr_timing *t)
 
 	if (t->b > 0.6 && t->b < 1.6 && t->n >= 32)
 		t->valid = 1;
+
+	if (t->valid)
+		fit_blocks(iv, n, t);
 }
 
-double dr_timing_adjust(const dr_timing *t, double meas,
+/*
+ * The model at interval j, interpolated between the two block fits whose
+ * centres straddle it. Blending rather than stepping matters: a step in
+ * the bin centres halfway through a sector would put a seam of spurious
+ * ambiguity at every block boundary.
+ */
+void dr_timing_at(const dr_timing *t, int j, double *a, double *b,
+                  double *c, double *d, double *sigma)
+{
+	double u;
+	int half, i0, i1;
+
+	*a = t->a; *b = t->b; *c = t->c; *d = t->d; *sigma = t->sigma;
+	if (j < 0 || t->nblk <= 0 || t->width <= 0)
+		return;
+
+	half = t->width / 2;
+	if (half <= 0)
+		return;
+
+	/* Block i covers [i*half, i*half + width), centre i*half + half. */
+	i0 = (j - half) / half;
+	if (i0 < 0)
+		i0 = 0;
+	if (i0 > t->nblk - 1)
+		i0 = t->nblk - 1;
+	i1 = i0 + 1 < t->nblk ? i0 + 1 : i0;
+
+	u = (double)(j - (i0 * half + half)) / (double)half;
+	if (u < 0.0) u = 0.0;
+	if (u > 1.0) u = 1.0;
+
+	*a = t->la[i0] * (1.0 - u) + t->la[i1] * u;
+	*b = t->lb[i0] * (1.0 - u) + t->lb[i1] * u;
+	*c = t->lc[i0] * (1.0 - u) + t->lc[i1] * u;
+	*d = t->ld[i0] * (1.0 - u) + t->ld[i1] * u;
+	/* Uncertainty takes the worse of the two: a boundary next to a
+	 * ruined block is not half safe. */
+	*sigma = t->lsigma[i0] > t->lsigma[i1] ? t->lsigma[i0]
+	                                       : t->lsigma[i1];
+}
+
+double dr_timing_adjust(const dr_timing *t, int j, double meas,
                         int prev_gap, int next_gap)
 {
+	double a, b, c, d, sg;
+
 	if (meas <= 0.0)
 		return meas;
 	if (prev_gap < MIN_BIN || prev_gap > MAX_BIN) prev_gap = 3;
 	if (next_gap < MIN_BIN || next_gap > MAX_BIN) next_gap = 3;
-	return meas - t->c * (double)prev_gap - t->d * (double)next_gap;
+	dr_timing_at(t, j, &a, &b, &c, &d, &sg);
+	return meas - c * (double)prev_gap - d * (double)next_gap;
 }
 
-double dr_bin_cost(const dr_timing *t, double meas, int k)
+double dr_bin_cost(const dr_timing *t, int j, double meas, int k)
 {
-	double r;
+	double a, b, c, d, sg, r;
 
 	if (meas <= 0.0)
 		return 0.0;
-	r = (meas - (t->a + t->b * (double)k)) / t->sigma;
+	dr_timing_at(t, j, &a, &b, &c, &d, &sg);
+	if (sg < 1e-6)
+		sg = 1e-6;
+	r = (meas - (a + b * (double)k)) / sg;
 	return 0.5 * r * r;
 }
 
@@ -876,7 +1076,7 @@ int dr_rebin_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 
 	dr_timing_fit(X.iv, X.niv, &X.t);
 	for (i = 0; i < X.niv; i++)
-		X.iv[i].adj = dr_timing_adjust(&X.t, X.iv[i].meas,
+		X.iv[i].adj = dr_timing_adjust(&X.t, i, X.iv[i].meas,
 		        i > 0 ? X.iv[i - 1].gap : 3,
 		        i + 1 < X.niv ? X.iv[i + 1].gap : 3);
 	if (!X.t.valid) {
@@ -910,10 +1110,10 @@ int dr_rebin_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 		if (X.iv[i].meas <= 0.0)
 			continue;
 		if (X.iv[i].gap < MIN_BIN || X.iv[i].gap > MAX_BIN ||
-		    dr_bin_cost(&X.t, X.iv[i].adj, X.iv[i].gap) > DIRTY_COST)
+		    dr_bin_cost(&X.t, i, X.iv[i].adj, X.iv[i].gap) > DIRTY_COST)
 			dirty[i] = 1;
 	}
-	{
+	if (X.niv > 0) {
 		uint8_t *d2 = malloc((size_t)X.niv);
 		if (!d2) { rc = -1; goto done; }
 		memcpy(d2, dirty, (size_t)X.niv);
@@ -972,7 +1172,7 @@ int dr_rebin_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 
 	for (i = 0; i < X.niv; i++)
 		if (dirty[i])
-			out->current_cost += dr_bin_cost(&X.t, X.iv[i].adj,
+			out->current_cost += dr_bin_cost(&X.t, i, X.iv[i].adj,
 			                                 X.iv[i].gap);
 
 	/* ---- enumerate re-readings of each stretch ------------------- */
@@ -996,7 +1196,7 @@ int dr_rebin_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 		    runs[i].n ? runs[i].cands[0].nbits : -1,
 		    ({ double cc = 0; int q; for (q = runs[i].first;
 		       q <= runs[i].last; q++)
-		         cc += dr_bin_cost(&X.t, X.iv[q].adj, X.iv[q].gap);
+		         cc += dr_bin_cost(&X.t, q, X.iv[q].adj, X.iv[q].gap);
 		       cc; }));
 		out->pinned_moves += runs[i].n ? runs[i].cands[0].rebins : 0;
 	}

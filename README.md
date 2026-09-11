@@ -496,6 +496,8 @@ That is the honest end of the road for a 16-bit CRC over a burst this
 size, and the tool says so.
 
 Totals across the four: **9 of 14** bad sectors repaired and verified.
+The five that are not are reported as ambiguous rather than guessed, and
+`inspect` says which kind of damage each one is.
 
 ### The errors that actually happen
 
@@ -533,15 +535,38 @@ are reversals that went missing.
 The last two are worth separating out, because between them they produced
 the one confidently wrong answer this tool has given.
 
-**Band collapse.** The timing model is fitted per track, so a track whose
-bin centres have moved is handled - but on GasAcc's track 74 the centres
-move *within* a sector. Over bytes 331-515 a 2T next to a 4T reads 2.46
-cells and a 4T between 2Ts reads 3.59, against 2.10 and 3.90 in the clean
-part of the same sector; the gain falls from 1.00 to 0.83 and the
-neighbour terms triple. Both bands are pulled towards the middle, which
-is peak shift - adjacent transitions repelling each other - getting three
-times worse over a stretch. Head-to-media separation does this: the read
-pulse broadens, and a broader pulse leans on its neighbours harder.
+**Band collapse.** On GasAcc's track 74 the bin centres move *within* a
+sector. Over bytes 331-515 a 2T next to a 4T reads 2.46 cells and a 4T
+between 2Ts reads 3.59, against 2.10 and 3.90 in the clean part of the
+same sector; the gain falls from 1.00 to 0.83 and the neighbour terms
+triple. Both bands are pulled towards the middle, which is peak shift -
+adjacent transitions repelling each other - getting three times worse
+over a stretch. Head-to-media separation does this: the read pulse
+broadens, and a broader pulse leans on its neighbours harder.
+
+The model is therefore fitted **per region**, over overlapping blocks of
+a few hundred intervals, and that turns out to matter for every sector
+and not just the collapsed one. Fitting one set of coefficients across a
+sector with a bad patch makes the single answer wrong at both ends: on
+GasAcc's sector the global fit reports sigma 0.165 cells, where the
+intact three quarters of that same sector measures 0.055. Every interval
+in the good part was being judged against noise three times its own, and
+every marginal call it produced was manufactured.
+
+Blocks overlap by half so the coefficients interpolate rather than step,
+and a block only keeps its own fit if the gain stays inside [0.75, 1.25]
+*and* the local residual beats the global one on those same intervals.
+Outside that, the global centres stand and the block keeps its own larger
+residual - so a stretch with nothing readable left reads as exactly that,
+rather than having a flattering model fitted to its noise. This is the
+opposite failure from the one above and just as easy to walk into: a
+local model that can explain anything explains away the damage too.
+
+The gain spread across blocks is reported, and it separates the failures
+cleanly - GasAcc's bad sector runs 0.754 to 0.986 while Zeus's run 0.988
+to 1.016. The sharper evidence is worth real candidates: on Disk 2 it cut
+sector 42/1 s17 from two CRC-valid readings to one, and lifted 9/0 s9 on
+Zeus from 3 times the runner-up to 51.
 
 **Phase slip.** Give a run of intervals one cell too many and the byte
 boundary moves. Nothing is corrupted; everything after is *re-framed*. On

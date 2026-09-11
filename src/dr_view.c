@@ -180,7 +180,7 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 		if (niv > 0) {
 			dr_timing_fit(iv, niv, &tm);
 			for (j = 0; j < niv; j++)
-				iv[j].adj = dr_timing_adjust(&tm, iv[j].meas,
+				iv[j].adj = dr_timing_adjust(&tm, j, iv[j].meas,
 				        j > 0 ? iv[j - 1].gap : 3,
 				        j + 1 < niv ? iv[j + 1].gap : 3);
 			v->period = period;
@@ -206,7 +206,7 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 				int k;
 
 				for (k = 2; k <= 4; k++) {
-					cost[k] = dr_bin_cost(&tm, iv[j].adj, k);
+					cost[k] = dr_bin_cost(&tm, j, iv[j].adj, k);
 					if (cost[k] < best) {
 						best = cost[k];
 						best_bin = k;
@@ -221,9 +221,15 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 
 				/* How far the measurement sits from the boundary
 				 * with its nearest rival, in cell periods. */
-				margin = 0.5 - fabs(iv[j].adj -
-				        (tm.a + tm.b * (double)best_bin)) /
-				        (tm.b > 0.1 ? tm.b : 1.0);
+				{
+					double la, lb, lc, ld, lsg;
+
+					dr_timing_at(&tm, j, &la, &lb, &lc,
+					             &ld, &lsg);
+					margin = 0.5 - fabs(iv[j].adj -
+					        (la + lb * (double)best_bin)) /
+					        (lb > 0.1 ? lb : 1.0);
+				}
 				if (margin < 0.0) margin = 0.0;
 				if (margin > 0.5) margin = 0.5;
 				ev = DR_EV_FLUX;
@@ -354,6 +360,20 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 		         "%.2f + %.3f*bin %+.3f*prev %+.3f*next, sigma %.3f "
 		         "(%d fitted)",
 		         nflux, nrev, tm.a, tm.b, tm.c, tm.d, tm.sigma, tm.n);
+
+	if (tm.valid && tm.nblk > 1) {
+		v->nblocks = tm.nblk;
+		v->nblocks_local = tm.nlocal;
+		v->gain_min = tm.bmin;
+		v->gain_max = tm.bmax;
+		if (tm.nlocal)
+			snprintf(v->regions, sizeof(v->regions),
+			         "re-fitted over %d overlapping block(s) of "
+			         "%d intervals; %d hold their own model, "
+			         "gain %.3f..%.3f",
+			         tm.nblk, tm.width, tm.nlocal,
+			         tm.bmin, tm.bmax);
+	}
 	else
 		snprintf(v->model, sizeof(v->model),
 		         flux ? "flux timing (%d/%d reversals, no usable model, "

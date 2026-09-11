@@ -139,6 +139,9 @@ typedef struct {
 	double    fit_sigma;
 	int       fit_n;
 	char      model[160];     /* short description of the evidence used*/
+	char      regions[160];   /* how the timing varies along the sector */
+	int       nblocks, nblocks_local;
+	double    gain_min, gain_max;
 
 	/* What the dump's other passes over this track had to say. */
 	int       nrev;          /* complete revolutions in the dump      */

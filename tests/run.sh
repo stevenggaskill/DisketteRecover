@@ -203,6 +203,37 @@ if command -v python3 >/dev/null 2>&1; then
 	if cmp -s "$out/ref.img" "$out/f3.img"; then ok "flux defect recovered"
 	else bad "flux defect recovered"; fi
 
+	echo "== the timing model, fitted per region"
+	# One set of coefficients across a sector with a bad patch is wrong
+	# at both ends. The blocks have to cover the sector, hold their own
+	# fits on clean flux, and agree with each other when there is
+	# nothing for them to disagree about.
+	tb=$("$dr" inspect "$out/shift.scp" 2>/dev/null |
+	     sed -n 's/^timing    : re-fitted over \([0-9]*\) .*/\1/p')
+	if [ -n "$tb" ] && [ "$tb" -ge 4 ]; then
+		ok "the sector was split into blocks ($tb)"
+	else
+		bad "the sector was split into blocks (got '$tb')"
+	fi
+	tl=$("$dr" inspect "$out/shift.scp" 2>/dev/null |
+	     sed -n 's/.*; \([0-9]*\) hold their own model.*/\1/p')
+	if [ -n "$tl" ] && [ "$tl" -ge 2 ]; then
+		ok "blocks on clean flux keep their own fit ($tl)"
+	else
+		bad "blocks on clean flux keep their own fit (got '$tl')"
+	fi
+	# A clean track has no regional variation to find, so the gains
+	# must stay together; a spread here would mean the blocks are
+	# fitting noise.
+	gs=$("$dr" inspect "$out/shift.scp" 2>/dev/null |
+	     sed -n 's/.*gain \([0-9.]*\)\.\.\([0-9.]*\).*/\1 \2/p')
+	if [ -n "$gs" ] && awk "BEGIN{split(\"$gs\",g,\" \");
+	                         exit !(g[2]-g[1] < 0.08)}"; then
+		ok "a clean track's blocks agree on the gain ($gs)"
+	else
+		bad "a clean track's blocks agree on the gain (got '$gs')"
+	fi
+
 	echo "== a dump with five passes over the track"
 	# The same track and the same per-pass read noise, dumped once and
 	# then five times, so the only difference between them is how many

@@ -141,6 +141,8 @@ typedef struct {
  * biases short intervals long and long intervals short - on real media
  * a 4T can sit at 3.83T while a 2T sits at 2.04T. Scoring against the
  * ideal 2/3/4 would call half a good track ambiguous. */
+#define DR_TIMING_BLOCKS 40
+
 typedef struct {
 	double a, b;        /* offset and gain                            */
 	double c, d;        /* pull from the previous / next interval     */
@@ -150,12 +152,40 @@ typedef struct {
 	                    /* error, in cells                            */
 	int    n;           /* intervals the fit was built from           */
 	int    valid;
+
+	/*
+	 * The same model again, fitted over overlapping blocks.
+	 *
+	 * One set of coefficients for a whole sector assumes the read
+	 * channel behaved the same way from one end of it to the other,
+	 * and on damaged media it does not: the bin centres drift, and a
+	 * span where the head lifted has them collapsing towards each
+	 * other. Worse, fitting one model across both makes the single
+	 * answer wrong everywhere - on one real sector the global sigma
+	 * came out 0.177 cells where the intact three quarters of that
+	 * same sector measures 0.055, so every interval in the good part
+	 * was being judged against noise three times its own.
+	 *
+	 * Blocks overlap by half so each interval can interpolate between
+	 * the two nearest fits instead of stepping between them.
+	 */
+	int    nblk, width, nint;
+	double la[DR_TIMING_BLOCKS], lb[DR_TIMING_BLOCKS];
+	double lc[DR_TIMING_BLOCKS], ld[DR_TIMING_BLOCKS];
+	double lsigma[DR_TIMING_BLOCKS];
+	uint8_t lok[DR_TIMING_BLOCKS];   /* local coefficients accepted   */
+	double  bmin, bmax;              /* gain spread across the blocks */
+	int     nlocal;                  /* blocks whose fit was accepted */
 } dr_timing;
+
+/* The model as it stands at interval j (j < 0 for the global fit). */
+void dr_timing_at(const dr_timing *t, int j, double *a, double *b,
+                  double *c, double *d, double *sigma);
 
 /* Peak shift makes an interval's measured length depend on its
  * neighbours, so measurements are corrected to a neighbour-free frame
  * before being compared with the bin centres. */
-double dr_timing_adjust(const dr_timing *t, double meas,
+double dr_timing_adjust(const dr_timing *t, int j, double meas,
                         int prev_gap, int next_gap);
 
 /* Collect the intervals covering the view's cell window. Returns the
@@ -166,7 +196,7 @@ double dr_cell_period(const dr_view *v);
 void   dr_decode_slipped(const dr_view *v, int at, int slip, uint8_t *out);
 int    dr_intervals_collect(dr_view *v, dr_interval **out, double *period);
 void   dr_timing_fit(const dr_interval *iv, int n, dr_timing *t);
-double dr_bin_cost(const dr_timing *t, double meas, int k);
+double dr_bin_cost(const dr_timing *t, int j, double meas, int k);
 
 /* Learned from every sector that reads cleanly. One 512-byte sector is
  * far too little to estimate anything from; a whole disk is 1.4 MB and
