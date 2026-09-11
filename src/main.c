@@ -953,6 +953,12 @@ static void print_fs(dr_ctx *c, int idx)
 	       "root - this is LBA %ld\n", in->kind, in->spt, in->heads,
 	       in->nfiles, loc.lba);
 	printf("            %s\n", loc.note);
+	{
+		char detail[256];
+
+		if (dr_fs_detail(fs, &loc, detail, (int)sizeof(detail)) == 0)
+			printf("            %s\n", detail);
+	}
 }
 
 /* Does the other copy of this FAT sector answer to this sector's own
@@ -1033,7 +1039,7 @@ static void print_referee(dr_ctx *c, dr_view *v, dr_repair_result *r,
 	dr_fs *fs = fs_of(c);
 	dr_fs_loc loc;
 	int i, tested = 0, kept = 0, shown = 0;
-	char note[200];
+	char note[256];
 
 	note[0] = 0;
 	if (!fs || dr_fs_locate(fs, c, idx, &loc) != 0)
@@ -1080,11 +1086,14 @@ static void print_referee(dr_ctx *c, dr_view *v, dr_repair_result *r,
 		return;
 	if (!kept)
 		printf("            %d reading(s) satisfied the sector's "
-		       "16-bit CRC; none of them\n"
-		       "            survives the file's own 32-bit one. The "
-		       "true reading is not in\n"
-		       "            this pool - the damage is deeper than the "
-		       "search can reach.\n", tested);
+		       "16-bit CRC; not one of them\n"
+		       "            survives the check the file itself "
+		       "carries. The true reading is\n"
+		       "            not in this pool - the damage is deeper "
+		       "than the search can reach.\n", tested);
+	else if (kept == tested)
+		printf("            all %d of them do; this check cannot "
+		       "separate them.\n", tested);
 	else
 		printf("            %d of %d CRC-valid reading(s) also satisfy "
 		       "the file's own checksum.\n", kept, tested);
@@ -1218,7 +1227,7 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 		dr_fs_loc loc;
 		const uint8_t *m = NULL;
 		uint8_t sis[512];
-		char how[200];
+		char how[256];
 		int proven = 0, ndiff = 0;
 
 		how[0] = 0;
@@ -1233,12 +1242,15 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 			proven = 2;
 		}
 		if (m && dr_set_data(c, v, m, v->data_len) == 0) {
+			char *semi = strchr(how, ';');
+
+			if (semi)
+				*semi = 0;
 			printf(" %3d/%d s%-3d  %-8s  ",
 			       sl[idx].track, sl[idx].side, sl[idx].sector_id,
 			       "2nd copy");
 			printf("%s  -> APPLIED, proven not ranked\n",
-			       proven == 2 ? "the same archive entry, twice "
-			                     "on this disk"
+			       proven == 2 ? how
 			                   : "the other copy of this FAT");
 			dr_repair_free(&r);
 			dr_view_free(v);
@@ -1741,7 +1753,7 @@ int main(int argc, char **argv)
 				dr_fs_loc loc;
 				const uint8_t *m;
 				uint8_t sis[512];
-				char how[200];
+				char how[256];
 				int proven = 0, ndiff = 0;
 
 				m = mirror_for(c, v, idx, &loc, &proven, &ndiff);

@@ -15,12 +15,12 @@ failure was misleading.
 | Disk 1   | 1440 | 2 | **0** | - | sector 6 on tracks 72-73: `0xF6` filler in **free space**. The data model repairs it outright; nothing was lost either way |
 | Disk 2   | 2882 | 9 | 5 | **2** | 3 in FAT copy 2 - all recovered from FAT copy 1, one of them *proved* by the sector's own stored CRC; 1 in free space; 5 in QuickBooks backups, of which 2 repaired and 3 still ambiguous |
 | GasAcc   | 2916 | 1 | **0** | - | band collapse plus a 4-cell phase slip, on filler, in **free space**; see [the one wrong answer](../README.md#the-one-wrong-answer-and-what-it-cost-to-find-it) |
-| Zeus     | 2881 | 2 | 2 | 0 | band collapse over the first 100 bytes of `ZEUSNO~1.PPT`; 34 intervals open, ~20M readings, ~300 pass the CRC |
+| Zeus     | 2881 | 2 | 2 | **1** | both inside `ZEUSNO~1.PPT`. One is in the preview thumbnail, which a PowerPoint 97 file stores **twice** - recovered exactly from the other copy. The other is in the PowerPoint 95 compatibility copy of the deck, over a stretch where the flux bands have collapsed |
 | LGTC0    | 2880 | 2 | 2 | **1** | sector 12 on tracks 9-10, inside `IFSMGR.VXD` |
 | Sand     | 2916 | 4 | 4 | **3** | sector 10 on tracks 24-27, inside two ZIP archives - and the same entries are archived *twice on the same disk*, so three of them are recovered exactly and proved by the archive's CRC-32 |
 | Ron      | 2944 | 22 | **0** | - | every one is on track 80, past the last formatted track: unformatted noise decoded as 16 KB FM sectors. **Not a damaged disk at all** |
 | Scott    | 2881 | 1 | 1 | **1** | a menu string table inside a Word temp file; the repair turns `Move( fro?t )` into `Move( front )` and `Gut Info` into `Get Info` |
-| **total** | **20740** | **43** | **14** | **7** | |
+| **total** | **20740** | **43** | **14** | **8** | |
 
 Three of the eight disks - Disk 1, GasAcc and Ron - lost nothing at all.
 That is not visible from the CRC; it is visible from the filesystem.
@@ -34,6 +34,7 @@ That is not visible from the CRC; it is visible from the filesystem.
 | Sand | `24/1 s10` | `slsdtai5.rep`, archived twice on this disk | inflates, CRC-32 `6C6F80FC` |
 | Sand | `25/1 s10` | `faxcover.adt`, archived twice | inflates, CRC-32 `3C4E1290` |
 | Sand | `26/1 s10` | `faxcover.tpl`, archived twice | inflates, CRC-32 `C486A5AA` |
+| Zeus | `9/0 s9` | the same stream, stored twice inside the same `.ppt` | the twin matches for 8581 bytes either side of the damage, and with its 512 in place the preview metafile's 727 records tile exactly |
 | Disk 2, LGTC0, Scott | 4 sectors | the search, applied on a clear margin | libhxcfe re-decode reads them clean |
 
 After those three, `CONTAC~1.ZIP` verifies **101 of 101** entries -
@@ -127,3 +128,29 @@ Ranked by how often they turned up, not by how interesting they are:
    end, which is most of the time.
 6. **Nothing at all** - 29 of the 43 bad sectors here hold no file's
    data. Three disks of the eight were whole the whole time.
+
+## The CRC can be wrong without the flux noticing
+
+Zeus's `9/0 s9` is the clearest case on any of these disks, because for
+once there is an answer to check against. The recovered bytes are not in
+doubt: the same thumbnail is stored twice in the file, the two copies
+agree on all 8581 bytes outside the damaged sector, and with the twin's
+512 bytes in place the metafile's 727 records tile it exactly to the
+last byte.
+
+Those bytes give a sector CRC-16 of `239E`. The disk has `473C` stored.
+Six of those sixteen bits are wrong - and the flux model put the
+expected number of bad CRC bits at **0.006**.
+
+That is a real blind spot, and it is specific to band collapse. The
+model scores a reversal by how far it sits from the boundary between
+bins; when a whole stretch of the track has its bands pulled together,
+every interval lands comfortably near a bin centre and scores as
+certain, while being wrong. Margin measures *ambiguity*, not *bias*, and
+a collapsed band is pure bias.
+
+So `crc_suspect` catches the common case - a mark that runs off the end
+of the sector and visibly chews the last bytes - and misses this one.
+Where the damage is a collapse rather than a dropout, nothing in the
+timings will tell you the checksum is a fiction; only something above
+the sector can.

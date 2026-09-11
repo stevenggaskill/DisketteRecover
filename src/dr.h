@@ -427,7 +427,7 @@ typedef struct {
 	int    proven;           /* an independent checksum matched      */
 	int    refuted;          /* ...or definitely did not            */
 	double score;            /* 0..1, for ranking variants           */
-	char   how[200];
+	char   how[256];
 } dr_fs_verdict;
 
 dr_fs      *dr_fs_open(dr_ctx *c);
@@ -458,6 +458,15 @@ const uint8_t *dr_fs_mirror(dr_fs *fs, const dr_fs_loc *loc);
  * Fills `out` with this sector's `len` true bytes. Returns 1 when the
  * archive's CRC-32 confirms them, 0 when a copy was found but does not
  * check out, -1 when there is no second copy. */
+/* One line on where inside its file the sector actually sits - the zip
+ * entry, or the stream of a compound document and the storage above it.
+ * A PowerPoint file holds the same stream names twice, once live and
+ * once in the copy kept for PowerPoint 95, and which of the two is
+ * damaged is the difference between a lost presentation and a lost
+ * compatibility copy. Returns 0 when it has something to say. */
+int         dr_fs_detail(dr_fs *fs, const dr_fs_loc *loc,
+                         char *buf, int n);
+
 int         dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc,
                          uint8_t *out, int len, char *how, int howsz);
 

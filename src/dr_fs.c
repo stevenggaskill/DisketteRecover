@@ -486,6 +486,528 @@ const uint8_t *dr_fs_mirror(dr_fs *fs, const dr_fs_loc *loc)
 	return fs->img + other * SECSZ;
 }
 
+
+/* ---------------------------------------------------------------- */
+/* OLE compound documents - PowerPoint, Word, Excel                  */
+/* ---------------------------------------------------------------- */
+/*
+ * A .ppt or .doc is a little filesystem in its own right: a sector
+ * table, a directory, and named streams laid out in 512-byte sectors.
+ * Two things in it are worth having.
+ *
+ * The first is that a PowerPoint 97 file saved for backwards
+ * compatibility contains the *same presentation twice*, and with it the
+ * same preview thumbnail twice - two streams with the same name and the
+ * same length, byte for byte identical. When a bad sector lands in one
+ * of them the other is sitting a few kilobytes away. Zeus's 9/0 s9 is
+ * exactly that.
+ *
+ * The second is that what these streams contain is a chain of records,
+ * each declaring its own length, which must tile the stream exactly:
+ * 727 metafile records landing precisely on the last byte. One wrong
+ * byte in a length field and the chain walks off the end. That is a
+ * referee with hundreds of constraints where the sector CRC has
+ * sixteen - and on Zeus the sector CRC turns out to be wrong anyway.
+ */
+
+typedef struct {
+	char  name[64];
+	char  path[256];         /* including the storages above it      */
+	int   type;              /* 1 = storage, 2 = stream, 5 = root    */
+	int   start;
+	long  size;
+	int   left, right, child;
+	int   live;              /* a real entry, not a free slot        */
+} cfb_dirent;
+
+typedef struct {
+	const uint8_t *d;
+	long      len;
+	int       ssz;
+	long      cutoff;
+	int32_t  *fat;
+	long      nfatent;
+	cfb_dirent *ents;
+	int       nents;
+} cfb;
+
+static long i32(const uint8_t *p)
+{
+	return (long)(int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	                       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+}
+
+static long cfb_off(const cfb *c, long sec) { return 512 + sec * c->ssz; }
+
+static int cfb_chain(const cfb *c, long start, long *out, int max)
+{
+	int n = 0;
+	long s = start;
+
+	while (n < max && s >= 0 && s < c->nfatent) {
+		int k, seen = 0;
+		for (k = 0; k < n; k++)
+			if (out[k] == s) { seen = 1; break; }
+		if (seen)
+			break;
+		out[n++] = s;
+		s = c->fat[s];
+	}
+	return n;
+}
+
+static void cfb_free(cfb *c)
+{
+	if (!c)
+		return;
+	free(c->fat);
+	free(c->ents);
+	free(c);
+}
+
+/* Give every entry the path of the storages it sits under. */
+static void cfb_paths(cfb *c, int id, const char *prefix)
+{
+	cfb_dirent *e;
+
+	if (id < 0 || id >= c->nents)
+		return;
+	e = &c->ents[id];
+	if (!e->live || e->path[0])
+		return;
+	snprintf(e->path, sizeof(e->path), "%s%s",
+	         prefix, e->type == 5 ? "" : e->name);
+	cfb_paths(c, e->left, prefix);
+	cfb_paths(c, e->right, prefix);
+	if (e->child >= 0) {
+		char sub[288];
+		snprintf(sub, sizeof(sub), "%s%s", e->path,
+		         e->type == 5 ? "" : "/");
+		cfb_paths(c, e->child, sub);
+	}
+}
+
+static cfb *cfb_open(const uint8_t *d, long len)
+{
+	static const uint8_t sig[8] =
+	        { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 };
+	cfb *c;
+	long nfat, dirs, i, difat0, ndifat;
+	long *difat, ndf = 0, cap;
+
+	if (!d || len < 4096 || memcmp(d, sig, 8))
+		return NULL;
+	c = calloc(1, sizeof(*c));
+	if (!c)
+		return NULL;
+	c->d = d;
+	c->len = len;
+	c->ssz = 1 << u16le(d + 0x1E);
+	c->cutoff = i32(d + 0x38);
+	if (c->ssz != 512 && c->ssz != 4096) {
+		free(c);
+		return NULL;
+	}
+	nfat   = i32(d + 0x2C);
+	dirs   = i32(d + 0x30);
+	difat0 = i32(d + 0x44);
+	ndifat = i32(d + 0x48);
+	if (nfat < 1 || nfat > 4096) {
+		free(c);
+		return NULL;
+	}
+
+	cap = nfat + 128;
+	difat = malloc(sizeof(long) * (size_t)cap);
+	if (!difat) {
+		free(c);
+		return NULL;
+	}
+	for (i = 0; i < 109 && ndf < cap; i++)
+		difat[ndf++] = i32(d + 0x4C + i * 4);
+	{
+		long s = difat0, guard = 0;
+		while (s >= 0 && ndifat && guard++ < 1024 &&
+		       cfb_off(c, s) + c->ssz <= len) {
+			const uint8_t *p = d + cfb_off(c, s);
+			for (i = 0; i < c->ssz / 4 - 1 && ndf < cap; i++)
+				difat[ndf++] = i32(p + i * 4);
+			s = i32(p + c->ssz - 4);
+		}
+	}
+
+	c->nfatent = nfat * (c->ssz / 4);
+	c->fat = malloc(sizeof(int32_t) * (size_t)c->nfatent);
+	if (!c->fat) {
+		free(difat);
+		free(c);
+		return NULL;
+	}
+	for (i = 0; i < c->nfatent; i++)
+		c->fat[i] = -1;
+	for (i = 0; i < nfat && i < ndf; i++) {
+		long s = difat[i], k;
+		if (s < 0 || cfb_off(c, s) + c->ssz > len)
+			continue;
+		for (k = 0; k < c->ssz / 4; k++)
+			c->fat[i * (c->ssz / 4) + k] =
+			        (int32_t)i32(d + cfb_off(c, s) + k * 4);
+	}
+	free(difat);
+
+	/* Directory. Entries are kept at their own directory ids - the
+	 * tree's left/right/child links are ids, and the path a stream
+	 * sits at is the useful part: a PowerPoint file holds the same
+	 * stream names twice, once live and once inside the storage that
+	 * keeps the PowerPoint 95 copy. */
+	{
+		long *ch = malloc(sizeof(long) * (size_t)c->nfatent);
+		int n, k;
+
+		if (!ch) {
+			cfb_free(c);
+			return NULL;
+		}
+		n = cfb_chain(c, dirs, ch, (int)c->nfatent);
+		c->nents = n * (c->ssz / 128);
+		c->ents = calloc((size_t)c->nents + 1, sizeof(*c->ents));
+		if (!c->ents) {
+			free(ch);
+			cfb_free(c);
+			return NULL;
+		}
+		for (k = 0; k < n; k++) {
+			long base = cfb_off(c, ch[k]);
+			int j;
+
+			if (base + c->ssz > len)
+				break;
+			for (j = 0; j < c->ssz / 128; j++) {
+				const uint8_t *e = d + base + j * 128;
+				int nl = u16le(e + 64), m, q;
+				cfb_dirent *o = &c->ents[k * (c->ssz / 128) + j];
+
+				o->type = e[66];
+				o->left  = (int)i32(e + 68);
+				o->right = (int)i32(e + 72);
+				o->child = (int)i32(e + 76);
+				o->start = (int)i32(e + 116);
+				o->size  = i32(e + 120);
+				if (nl < 2 || nl > 64 ||
+				    (o->type != 1 && o->type != 2 && o->type != 5))
+					continue;
+				m = nl / 2 - 1;
+				if (m > 63)
+					m = 63;
+				for (q = 0; q < m; q++)
+					o->name[q] = (char)e[q * 2];
+				o->name[m] = 0;
+				o->live = 1;
+			}
+		}
+		free(ch);
+		cfb_paths(c, 0, "");
+	}
+	return c;
+}
+
+/* Pull a stream out whole. Only streams held in full sectors - a
+ * damaged sector cannot be inside the mini-stream anyway, since the
+ * mini-stream is packed 64 bytes at a time. */
+static uint8_t *cfb_stream(const cfb *c, const cfb_dirent *e, long *out_len)
+{
+	long *ch, i;
+	uint8_t *b;
+	int n;
+
+	if (e->size < c->cutoff)
+		return NULL;
+	ch = malloc(sizeof(long) * (size_t)c->nfatent);
+	if (!ch)
+		return NULL;
+	n = cfb_chain(c, e->start, ch, (int)c->nfatent);
+	b = calloc((size_t)n * c->ssz + 1, 1);
+	if (!b) {
+		free(ch);
+		return NULL;
+	}
+	for (i = 0; i < n; i++) {
+		long o = cfb_off(c, ch[i]);
+		if (o + c->ssz <= c->len)
+			memcpy(b + i * c->ssz, c->d + o, (size_t)c->ssz);
+	}
+	*out_len = e->size < (long)n * c->ssz ? e->size : (long)n * c->ssz;
+	free(ch);
+	return b;
+}
+
+/* Which stream holds this byte of the file, and where in it? */
+static int cfb_owner(const cfb *c, long fileoff, long *stream_off)
+{
+	long sec = (fileoff - 512) / c->ssz, *ch;
+	int i, best = -1;
+
+	if (fileoff < 512)
+		return -1;
+	ch = malloc(sizeof(long) * (size_t)c->nfatent);
+	if (!ch)
+		return -1;
+	for (i = 0; i < c->nents && best < 0; i++) {
+		int n, k;
+
+		if (!c->ents[i].live || c->ents[i].type != 2 ||
+		    c->ents[i].size < c->cutoff)
+			continue;
+		n = cfb_chain(c, c->ents[i].start, ch, (int)c->nfatent);
+		for (k = 0; k < n; k++)
+			if (ch[k] == sec) {
+				best = i;
+				*stream_off = (long)k * c->ssz +
+				              (fileoff - 512 - sec * c->ssz);
+				break;
+			}
+	}
+	free(ch);
+	return best;
+}
+
+/* ---- the record chains -------------------------------------------- */
+
+/* A PowerPoint / OfficeArt record: 2 bytes of version+instance, 2 of
+ * type, 4 of length. A container's children live inside its length, so
+ * the walk descends into it rather than stepping over it. Every record
+ * must fit, and the last one must end exactly on the stream's end. */
+static int ppt_records_tile(const uint8_t *b, long len, int *nrec)
+{
+	long o = 0;
+	int n = 0;
+
+	while (o + 8 <= len) {
+		long ln = (long)((uint32_t)b[o+4] | ((uint32_t)b[o+5] << 8) |
+		                 ((uint32_t)b[o+6] << 16) |
+		                 ((uint32_t)b[o+7] << 24));
+		int container = (b[o] & 0x0F) == 0x0F;
+
+		if (ln < 0 || o + 8 + ln > len)
+			break;
+		n++;
+		o += container ? 8 : 8 + ln;
+	}
+	if (nrec)
+		*nrec = n;
+	return o == len && n > 0;
+}
+
+/* A Windows metafile: DWORD size in words, WORD function, then
+ * parameters; the chain ends on function 0 and must land exactly on the
+ * length the header declared. */
+static int wmf_records_tile(const uint8_t *b, long len, long base, int *nrec)
+{
+	long sz, end, o;
+	int n = 0;
+
+	if (base + 18 > len)
+		return 0;
+	sz = (long)((uint32_t)b[base+6] | ((uint32_t)b[base+7] << 8) |
+	            ((uint32_t)b[base+8] << 16) | ((uint32_t)b[base+9] << 24));
+	end = base + sz * 2;
+	if (sz < 9 || end > len)
+		return 0;
+	o = base + 18;
+	while (o + 6 <= end) {
+		long rsz = (long)((uint32_t)b[o] | ((uint32_t)b[o+1] << 8) |
+		                  ((uint32_t)b[o+2] << 16) |
+		                  ((uint32_t)b[o+3] << 24));
+		int fn = u16le(b + o + 4);
+
+		if (rsz < 3 || o + rsz * 2 > end)
+			return 0;
+		n++;
+		if (nrec)
+			*nrec = n;
+		if (!fn)
+			return o + rsz * 2 == end;
+		o += rsz * 2;
+	}
+	return 0;
+}
+
+/* Find the metafile a property set carries as its thumbnail. */
+static long wmf_base(const uint8_t *b, long len)
+{
+	long i;
+
+	if (len < 64 || u16le(b) != 0xFFFE)
+		return -1;
+	for (i = 0; i + 18 < len; i++)
+		if (u16le(b + i) == 1 && u16le(b + i + 2) == 9 &&
+		    (u16le(b + i + 4) == 0x0300 || u16le(b + i + 4) == 0x0100))
+			return i;
+	return -1;
+}
+
+/* Does this stream hold together? Returns 1 yes, 0 no, -1 no opinion. */
+static int cfb_stream_ok(const cfb_dirent *e, const uint8_t *b, long len,
+                         char *how, size_t howsz)
+{
+	int n = 0;
+
+	if (strstr(e->name, "SummaryInformation")) {
+		long base = wmf_base(b, len);
+		int ok;
+
+		if (base < 0)
+			return -1;
+		ok = wmf_records_tile(b, len, base, &n);
+		snprintf(how, howsz,
+		         "its preview metafile: %s after %d record(s)",
+		         ok ? "every record tiles exactly"
+		            : "the record chain breaks", n);
+		return ok;
+	}
+	if (!strcmp(e->name, "PowerPoint Document")) {
+		int ok = ppt_records_tile(b, len, &n);
+
+		/* A handful of records is not evidence that the stream is
+		 * broken - it is evidence that this is not the record
+		 * layout we think it is. Only a walk that got properly
+		 * under way and then failed says anything. */
+		if (n < 8 && !ok)
+			return -1;
+		snprintf(how, howsz,
+		         "its record chain %s after %d record(s)",
+		         ok ? "tiles exactly to the end" : "breaks", n);
+		return ok;
+	}
+	return -1;
+}
+
+
+/* The same stream, stored twice inside one compound document. Match by
+ * name and length, then demand that the two agree everywhere *except*
+ * inside the damaged sector: that agreement, over thousands of bytes,
+ * is what makes the twin's version of the missing 512 evidence rather
+ * than a guess. Returns 1 with `out` filled, 0 if a twin exists but
+ * does not check out, -1 if there is none. */
+static int cfb_twin(const uint8_t *file, long flen, long fileoff, int len,
+                    uint8_t *out, char *how, size_t howsz)
+{
+	cfb *c = cfb_open(file, flen);
+	uint8_t *mine = NULL, *theirs = NULL;
+	long mlen = 0, tlen = 0, soff = -1;
+	int owner, i, rc = -1;
+
+	if (!c)
+		return -1;
+	owner = cfb_owner(c, fileoff, &soff);
+	if (owner < 0)
+		goto out;
+	mine = cfb_stream(c, &c->ents[owner], &mlen);
+	if (!mine || soff < 0 || soff + len > mlen)
+		goto out;
+
+	for (i = 0; i < c->nents; i++) {
+		long agree = 0, j;
+		char msg[220];
+		int ok;
+
+		if (i == owner || !c->ents[i].live || c->ents[i].type != 2 ||
+		    c->ents[i].size != c->ents[owner].size ||
+		    strcmp(c->ents[i].name, c->ents[owner].name))
+			continue;
+		free(theirs);
+		theirs = cfb_stream(c, &c->ents[i], &tlen);
+		if (!theirs || tlen != mlen)
+			continue;
+
+		/*
+		 * Not "identical everywhere" - the two copies are written
+		 * by different halves of the application and a few header
+		 * fields genuinely differ. What matters is the run of
+		 * agreement either side of the damage: if the twin matches
+		 * for thousands of bytes right up to the sector and
+		 * thousands of bytes straight after it, the 512 in between
+		 * are not a guess. A handful of differences in a header
+		 * five kilobytes away says nothing about them.
+		 */
+		{
+			long left = 0, right = 0, other = 0;
+
+			for (j = soff - 1; j >= 0 && mine[j] == theirs[j]; j--)
+				left++;
+			for (j = soff + len; j < mlen && mine[j] == theirs[j]; j++)
+				right++;
+			for (j = 0; j < mlen; j++)
+				if ((j < soff || j >= soff + len) &&
+				    mine[j] != theirs[j])
+					other++;
+			agree = left + right;
+			if ((left < 256 && soff > 256) ||
+			    (right < 256 && mlen - (soff + len) > 256)) {
+				snprintf(how, howsz,
+				         "'%s' is stored twice in this file, "
+				         "but the two copies part company %ld "
+				         "byte(s) before and %ld after the "
+				         "damage - not a copy of these bytes",
+				         c->ents[owner].name, left, right);
+				rc = 0;
+				goto out;
+			}
+			(void)other;
+		}
+
+		memcpy(mine + soff, theirs + soff, (size_t)len);
+		ok = cfb_stream_ok(&c->ents[owner], mine, mlen, msg, sizeof(msg));
+		memcpy(out, mine + soff, (size_t)len);
+		if (ok == 1) {
+			snprintf(how, howsz,
+			         "'%s' is stored twice in this file; the twin "
+			         "matches for %ld byte(s) either side of the "
+			         "damage, and with its %d bytes in place, %s",
+			         c->ents[owner].name, agree, len, msg);
+			rc = 1;
+		} else {
+			snprintf(how, howsz,
+			         "'%s' is stored twice in this file; the twin "
+			         "matches for %ld byte(s) either side of the "
+			         "damage, but %s", c->ents[owner].name, agree,
+			         ok == 0 ? msg : "nothing here can check it");
+			rc = (ok == 0) ? 0 : 1;
+		}
+		goto out;
+	}
+out:
+	free(theirs);
+	free(mine);
+	cfb_free(c);
+	return rc;
+}
+
+/* Put a payload to whatever structure the compound document has.
+ * Returns 1 holds, 0 broken, -1 no opinion. */
+static int cfb_check(const uint8_t *file, long flen, long fileoff,
+                     char *how, size_t howsz)
+{
+	cfb *c = cfb_open(file, flen);
+	uint8_t *b = NULL;
+	long blen = 0, soff = -1;
+	int owner, rc = -1;
+
+	if (!c)
+		return -1;
+	owner = cfb_owner(c, fileoff, &soff);
+	if (owner < 0)
+		goto out;
+	b = cfb_stream(c, &c->ents[owner], &blen);
+	if (!b)
+		goto out;
+	rc = cfb_stream_ok(&c->ents[owner], b, blen, how, howsz);
+out:
+	free(b);
+	cfb_free(c);
+	return rc;
+}
+
 /* ---------------------------------------------------------------- */
 /* The referees: checks that live above the sector CRC               */
 /* ---------------------------------------------------------------- */
@@ -805,6 +1327,9 @@ int dr_fs_score(dr_fs *fs, const dr_fs_loc *loc, const uint8_t *payload,
 			if (v < 0)
 				v = gzip_check(buf, flen, out->how,
 				               sizeof(out->how));
+			if (v < 0)
+				v = cfb_check(buf, flen, loc->file_offset,
+				              out->how, sizeof(out->how));
 			free(buf);
 		}
 		if (v >= 0) {
@@ -958,8 +1483,13 @@ int dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc, uint8_t *out, int len,
 	if (!a || !b)
 		goto out;
 	na = zip_entries(mine, mlen, a, MAXENT);
-	if (!na)
+	if (!na) {
+		/* Not an archive - but a compound document keeps its own
+		 * second copy, and it is the same idea. */
+		rc = cfb_twin(mine, mlen, loc->file_offset, len, out,
+		              how, (size_t)howsz);
 		goto out;
+	}
 
 	/*
 	 * Every entry the sector overlaps, not just the one it starts in.
@@ -1018,7 +1548,7 @@ int dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc, uint8_t *out, int len,
 	/* Let the archive's own checksums referee the result - every entry
 	 * the sector touches, spliced or not. */
 	{
-		char msg[200];
+		char msg[220];
 		int v = zip_check(mine, mlen, loc->file_offset, len,
 		                  msg, sizeof(msg));
 
@@ -1054,3 +1584,62 @@ int dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc, uint8_t *out, int len,
 	return -1;
 }
 #endif
+
+int dr_fs_detail(dr_fs *fs, const dr_fs_loc *loc, char *buf, int n)
+{
+	uint8_t *file;
+	long flen = 0;
+	int rc = -1;
+
+	if (!fs || !loc || !buf || n < 32 || loc->area != DR_AREA_FILE)
+		return -1;
+	buf[0] = 0;
+	file = assemble(fs, loc, NULL, 0, &flen);
+	if (!file)
+		return -1;
+#ifndef DR_NO_ZLIB
+	{
+		zip_entry *e = calloc(MAXENT, sizeof(*e));
+		cfb *c;
+		int ne, i;
+
+		if (e) {
+			ne = zip_entries(file, flen, e, MAXENT);
+			for (i = 0; i < ne; i++)
+				if (loc->file_offset < e[i].body + e[i].csz &&
+				    e[i].body < loc->file_offset + 512) {
+					snprintf(buf, (size_t)n,
+					         "zip entry '%s', %ld byte(s) "
+					         "packed", e[i].name, e[i].csz);
+					rc = 0;
+					break;
+				}
+			free(e);
+		}
+		if (rc == 0)
+			goto done;
+
+		c = cfb_open(file, flen);
+		if (c) {
+			long soff = -1;
+			int owner = cfb_owner(c, loc->file_offset, &soff);
+
+			if (owner >= 0) {
+				snprintf(buf, (size_t)n,
+				         "compound document: stream '%s', "
+				         "bytes %ld..%ld of %ld",
+				         c->ents[owner].path[0]
+				           ? c->ents[owner].path
+				           : c->ents[owner].name,
+				         soff, soff + 512,
+				         c->ents[owner].size);
+				rc = 0;
+			}
+			cfb_free(c);
+		}
+	}
+done:
+#endif
+	free(file);
+	return rc;
+}

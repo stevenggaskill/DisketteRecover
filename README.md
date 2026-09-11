@@ -422,6 +422,44 @@ The damaged ranges are worth reading too: bytes 414-511, 408-511,
 radial mark again, and it is why the sector CRC could never have
 arbitrated: the mark eats the CRC on its way past.
 
+**And a document keeps its own second copy.** A PowerPoint 97 file
+saved for backwards compatibility is a little filesystem in its own
+right, and it holds the whole presentation twice - once live, once
+inside a storage called `PP97_DUALSTORAGE` for PowerPoint 95 to read.
+The preview thumbnail goes in twice with it. Zeus's `9/0 s9` landed in
+one of those two copies:
+
+```
+filesystem: FAT12, 18 sectors/track, 2 head(s), 8 file(s) - this is LBA 332
+            cluster 301 - bytes 82432..82944 of ZEUSNO~1.PPT (87040 bytes)
+            compound document: stream 'SummaryInformation', bytes 5632..6144 of 9448
+
+second copy: 'SummaryInformation' is stored twice in this file; the twin matches
+for 8581 byte(s) either side of the damage, and with its 512 bytes in place, its
+preview metafile: every record tiles exactly after 727 record(s)
+```
+
+Two independent things agree there. The twin matches for 8581 bytes
+either side of the gap, and the thumbnail is a Windows metafile - a
+chain of records each declaring its own length, which has to tile the
+stream exactly. As read, that chain breaks at record 416, seventy-four
+bytes into the damaged sector. With the twin's bytes in, all 727
+records land precisely on the last byte.
+
+That is also where the sector CRC is caught out. The recovered bytes
+give a CRC-16 of `239E`; the disk has `473C` stored - six of the sixteen
+bits are wrong, and the flux model put the expected number of bad CRC
+bits at 0.006. Band collapse is *bias*, not ambiguity: every interval
+sits comfortably near a bin centre and scores as certain while being
+wrong. Which is exactly why every one of the 337 re-binnings that
+satisfied that CRC is refuted by the file, and why the other Zeus
+sector - in the PowerPoint 95 copy, where there is no twin - stays
+unrepaired rather than getting the likeliest of 563 wrong answers.
+
+The tool names which of the two copies was hit, because that is the
+difference between a lost presentation and a lost compatibility copy.
+On Zeus it is the compatibility copy: the deck itself opens fine.
+
 ### 4e. Five images, and letting a person look
 
 When several readings survive, `--variants 5 --out disk.hfe` writes
@@ -639,9 +677,10 @@ below, which they are the reason for.
 
 Totals, now over eight disks: 43 bad sectors, of which **29 hold no
 file's data at all** - free space, or, on one whole disk, unformatted
-noise past the last track. Of the 14 that do carry a file, **7 are
-recovered**: four by the search, and three exactly, from a second copy
-of the same bytes elsewhere on the same disk. Three of the eight disks
+noise past the last track. Of the 14 that do carry a file, **8 are
+recovered**: four by the search, and four exactly, from a second copy of
+the same bytes - three from the same archive stored twice on the disk,
+one from the same stream stored twice inside one document. Three of the eight disks
 lost nothing whatsoever. The running tally, and what each disk turned
 out to be suffering from, is in [docs/disks.md](docs/disks.md).
 

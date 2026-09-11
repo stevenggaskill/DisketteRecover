@@ -470,6 +470,41 @@ PYEOF
 		bad "the sector is recovered exactly from the other archive"
 	fi
 
+	echo "== a compound document keeps its own second copy"
+	# A PowerPoint 97 file saved for backwards compatibility holds the
+	# same preview thumbnail twice: once live, once under the storage
+	# carrying the PowerPoint 95 copy. Zeus's 9/0 s9 is that case.
+	python3 "$here/tools/mkcfb.py" "$out/deck.ppt" 700
+	python3 "$here/tools/mkfat.py" "$out/cfb.img" "DECK.PPT=$out/deck.ppt"
+	"$dr" convert "$out/cfb.img" --out "$out/cfb.hfe" >/dev/null 2>&1
+	"$dr" convert "$out/cfb.hfe" --out "$out/cfb_ref.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	"$dr" damage "$out/cfb.hfe" --track 1 --side 0 --id 5 --drop-only \
+	      --bits 803,1701,2743 --out "$out/cfb_bad.hfe" >/dev/null 2>&1
+	check "one bad sector" "$(badcount "$out/cfb_bad.hfe")" "1"
+	st=$("$dr" repair "$out/cfb_bad.hfe" --fs 2>/dev/null |
+	     sed -n "s/.*stream '\([^']*\)'.*/\1/p" | head -1 | tr -d '\001-\037')
+	check "the stream it landed in is named" "$st" "SummaryInformation"
+	pr=$("$dr" repair "$out/cfb_bad.hfe" --from-copy 2>/dev/null |
+	     sed -n 's/.*\(proven, not ranked\).*/proven/p')
+	check "the twin is found and the metafile confirms it" "$pr" "proven"
+	"$dr" repair "$out/cfb_bad.hfe" --from-copy --out "$out/cfb_fix.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/cfb_ref.img" "$out/cfb_fix.img"; then
+		ok "recovered exactly from the other copy in the same file"
+	else
+		bad "recovered exactly from the other copy in the same file"
+	fi
+	# damage the copy under the storage instead: the report has to say
+	# which of the two it was, since that is the whole difference
+	# between a lost document and a lost compatibility copy.
+	"$dr" damage "$out/cfb.hfe" --track 1 --side 1 --id 8 --drop-only \
+	      --bits 803,1701,2743 --out "$out/cfb_bad2.hfe" >/dev/null 2>&1
+	st=$("$dr" repair "$out/cfb_bad2.hfe" --fs 2>/dev/null |
+	     sed -n "s/.*stream '\([^']*\)'.*/\1/p" | head -1 | tr -d '\001-\037')
+	check "the storage above it is named too" \
+	      "$st" "DUALSTORAGE/SummaryInformation"
+
 	echo "== one image per reading, to be looked at"
 	"$dr" repair "$out/fs_bad.hfe" --variants 3 --out "$out/v.hfe" \
 	      >/dev/null 2>&1
