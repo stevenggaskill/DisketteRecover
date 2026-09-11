@@ -91,12 +91,44 @@ typedef struct {
 dr_flux_map *dr_flux_build(dr_ctx *c, HXCFE_SIDE *side);
 void         dr_flux_free(dr_flux_map *m);
 
+/* ---- the other revolutions ----------------------------------------- */
+
+/* What every pass of the head over this sector agreed on (dr_revs.c).
+ * All arrays are indexed by reference interval, 0..n-1. */
+typedef struct {
+	int       nrev;      /* complete revolutions in the dump          */
+	int       nused;     /* of those, aligned to this sector          */
+	int       n;         /* reference intervals                       */
+	uint32_t  p_first;   /* dump pulse index that ticks[0] came from   */
+	uint32_t *ticks;     /* mean duration over the passes that agree  */
+	uint8_t  *votes;     /* passes with a reversal at its far end      */
+	uint8_t  *same;      /* passes that read it as exactly one interval*/
+	uint8_t  *extra;     /* passes that saw a reversal inside it      */
+	uint32_t *extra_at;  /* where the first of them put it, in ticks  */
+	int       splits;    /* extra reversals seen, summed over passes  */
+	int       merges;    /* reversals a pass did not see              */
+	double    resid;     /* mean |pass - pass| on matched intervals   */
+	int outvoted_extra;  /* reversals most passes did not see         */
+	int outvoted_missing;/* reversals most passes saw and this missed */
+} dr_revmap;
+
+dr_revmap *dr_revs_build(dr_view *v);
+void       dr_revs_free(dr_revmap *r);
+int        dr_revs_search(dr_view *v, const dr_options *opt,
+                          dr_repair_result *out);
+/* The reading the passes vote for, into a v->msg_len buffer. Returns the
+ * number of reversals they did not all agree on, or -1 if the dump holds
+ * only one pass. */
+int        dr_revs_reading(dr_view *v, uint8_t *msg, int *contested,
+                           int *majority);
+
 /* ---- flux timing model --------------------------------------------- */
 
 /* One flux interval inside the sector window. */
 typedef struct {
 	int      cell;      /* window-relative cell of the ending reversal */
 	int      gap;       /* cell count the decoder assigned it          */
+	uint32_t pulse;     /* the dump pulse it was measured from         */
 	uint32_t ticks;     /* measured duration                          */
 	double   meas;      /* ticks / cell period, in cells              */
 	double   adj;       /* meas with the neighbour pull taken out     */
@@ -128,6 +160,7 @@ double dr_timing_adjust(const dr_timing *t, double meas,
 
 /* Collect the intervals covering the view's cell window. Returns the
  * count, or -1 when there is no usable flux. */
+double dr_cell_period(const dr_view *v);
 int    dr_intervals_collect(dr_view *v, dr_interval **out, double *period);
 void   dr_timing_fit(const dr_interval *iv, int n, dr_timing *t);
 double dr_bin_cost(const dr_timing *t, double meas, int k);

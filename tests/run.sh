@@ -152,6 +152,50 @@ if command -v python3 >/dev/null 2>&1; then
 	if cmp -s "$out/ref.img" "$out/f3.img"; then ok "flux defect recovered"
 	else bad "flux defect recovered"; fi
 
+	echo "== a dump with five passes over the track"
+	# The same track and the same per-pass read noise, dumped once and
+	# then five times, so the only difference between them is how many
+	# passes there are to combine.
+	python3 "$here/tools/scp_revs.py" "$out/clean.scp" "$out/rev1.scp" \
+	        --revs 1 --sigma 40 --seed 7 --tracks 2 >/dev/null
+	python3 "$here/tools/scp_revs.py" "$out/clean.scp" "$out/rev5.scp" \
+	        --revs 5 --sigma 40 --seed 7 --tracks 2 >/dev/null
+
+	np=$("$dr" inspect "$out/rev5.scp" --sector 0 2>/dev/null |
+	     sed -n 's/^passes    : \([0-9]*\) of \([0-9]*\).*/\1 of \2/p')
+	check "all five passes were aligned" "$np" "5 of 5"
+
+	# Averaging independent read noise over five passes should cut it by
+	# something approaching the root of five; anything near the
+	# single-pass figure means the passes were not really combined.
+	s1=$("$dr" inspect "$out/rev1.scp" --sector 0 2>/dev/null |
+	     sed -n 's/.*sigma \([0-9.]*\).*/\1/p')
+	s5=$("$dr" inspect "$out/rev5.scp" --sector 0 2>/dev/null |
+	     sed -n 's/.*sigma \([0-9.]*\).*/\1/p')
+	if [ -n "$s1" ] && [ -n "$s5" ] &&
+	   awk "BEGIN{exit !($s5 < 0.75 * $s1)}"; then
+		ok "combining the passes cut the timing noise ($s1 -> $s5)"
+	else
+		bad "combining the passes cut the timing noise ($s1 -> $s5)"
+	fi
+
+	d0=$("$dr" inspect "$out/rev5.scp" --sector 0 2>/dev/null |
+	     sed -n 's/.*about \([0-9]*\) reversal.*/\1/p')
+	check "a clean dump has nothing to argue about" "$d0" "0"
+
+	echo "== a reversal only some of the passes can see"
+	python3 "$here/tools/scp_revs.py" "$out/clean.scp" "$out/fuzzy.scp" \
+	        --revs 5 --sigma 40 --seed 7 --tracks 2 \
+	        --fuzzy 0:1500:2 --fuzzy 0:1610:3 >/dev/null
+
+	d2=$("$dr" inspect "$out/fuzzy.scp" --sector 0 2>/dev/null |
+	     sed -n 's/.*about \([0-9]*\) reversal.*/\1/p')
+	check "both weak reversals were spotted" "$d2" "2"
+
+	rv=$("$dr" repair "$out/fuzzy.scp" --sector 0 --mode revs --json \
+	     2>/dev/null | sed -n 's/.*"revs":\(true\|false\).*/\1/p')
+	check "the revolutions engine ran" "$rv" "true"
+
 	echo "== the re-binning engine"
 	rb=$("$dr" repair "$out/shift.scp" --mode rebin --json 2>/dev/null |
 	     sed -n 's/.*"rebin":\(true\|false\).*/\1/p')

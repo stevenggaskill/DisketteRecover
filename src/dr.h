@@ -69,7 +69,8 @@ typedef enum {
 	DR_EV_NONE = 0,          /* no timing information at all          */
 	DR_EV_WEAKBIT,           /* libhxcfe flagged the cell weak        */
 	DR_EV_FLUX,              /* derived from measured flux intervals  */
-	DR_EV_VIOLATION          /* illegal MFM cell spacing              */
+	DR_EV_VIOLATION,         /* illegal MFM cell spacing              */
+	DR_EV_DISSENT            /* the dump's passes disagree here       */
 } dr_evidence;
 
 typedef struct {
@@ -130,12 +131,20 @@ typedef struct {
 
 	int       flux_available;/* 1 if flux timings were aligned        */
 	void     *flux;          /* dr_flux_map *, kept for the re-binner */
+	void     *revs;          /* dr_revmap *, the other passes         */
 	void     *fit;           /* cached structural model of the data   */
 	double    period;        /* ticks per cell                        */
 	double    fit_a, fit_b;  /* measured cell length ~ a + b*bin      */
 	double    fit_sigma;
 	int       fit_n;
 	char      model[160];     /* short description of the evidence used*/
+
+	/* What the dump's other passes over this track had to say. */
+	int       nrev;          /* complete revolutions in the dump      */
+	int       nrev_used;     /* of those, aligned to this sector      */
+	double    rev_resid;     /* mean pass-to-pass disagreement, cells */
+	int       rev_dissent;   /* reversals not every pass agreed on    */
+	char      passes[160];
 
 	/* Internal bookkeeping used by dr_apply(). */
 	void     *side;          /* HXCFE_SIDE *                          */
@@ -147,6 +156,7 @@ typedef struct {
 
 typedef enum {
 	DR_MODE_AUTO = 0,       /* try each engine, cheapest evidence first*/
+	DR_MODE_REVS,
 	DR_MODE_BITS,
 	DR_MODE_REBIN,
 	DR_MODE_PATTERN         /* trust the data's own regularity        */
@@ -200,6 +210,10 @@ typedef struct {
 
 	/* Pattern engine bookkeeping. */
 	int           pattern;          /* results came from the data model*/
+	int           revs;             /* ...or from the dump's own passes*/
+	int           contested;        /* reversals the passes disputed   */
+	int           majority;         /* of those, overruled by the many */
+	int           crc_contested;    /* ...that land in the CRC bytes    */
 	int           period;           /* the repeat it locked onto       */
 	int           outliers;         /* bytes that break the pattern    */
 	double        coverage;         /* fraction of bytes on-pattern    */

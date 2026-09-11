@@ -772,8 +772,9 @@ int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
                    dr_repair_result *out)
 {
 	dr_options defopt;
-	dr_repair_result part[3];
-	dr_mode modes[3] = { DR_MODE_PATTERN, DR_MODE_REBIN, DR_MODE_BITS };
+	dr_repair_result part[4];
+	dr_mode modes[4] = { DR_MODE_PATTERN, DR_MODE_REVS, DR_MODE_REBIN,
+	                     DR_MODE_BITS };
 	dr_candidate *all = NULL;
 	int nall = 0, i, j, m;
 
@@ -784,9 +785,11 @@ int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
 	memset(out, 0, sizeof(*out));
 	memset(part, 0, sizeof(part));
 
-	for (m = 0; m < 3; m++) {
+	for (m = 0; m < 4; m++) {
 		if (modes[m] == DR_MODE_PATTERN)
 			dr_pattern_search(v, opt, &part[m]);
+		else if (modes[m] == DR_MODE_REVS)
+			dr_revs_search(v, opt, &part[m]);
 		else if (modes[m] == DR_MODE_REBIN)
 			dr_rebin_search(v, opt, &part[m]);
 		else
@@ -817,6 +820,11 @@ int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
 		}
 		if (modes[m] == DR_MODE_BITS)
 			out->npool = part[m].npool;
+		if (modes[m] == DR_MODE_REVS) {
+			out->contested = part[m].contested;
+			out->majority = part[m].majority;
+			out->crc_contested = part[m].crc_contested;
+		}
 		out->searched_weight += part[m].searched_weight;
 		nall += part[m].count;
 	}
@@ -824,12 +832,12 @@ int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
 	if (nall) {
 		all = malloc((size_t)nall * sizeof(*all));
 		if (!all) {
-			for (m = 0; m < 3; m++)
+			for (m = 0; m < 4; m++)
 				dr_repair_free(&part[m]);
 			return -1;
 		}
 		nall = 0;
-		for (m = 0; m < 3; m++)
+		for (m = 0; m < 4; m++)
 			for (i = 0; i < part[m].count; i++) {
 				int dup = 0;
 				for (j = 0; j < nall && !dup; j++)
@@ -839,7 +847,7 @@ int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
 					all[nall++] = part[m].list[i];
 			}
 	}
-	for (m = 0; m < 3; m++)
+	for (m = 0; m < 4; m++)
 		dr_repair_free(&part[m]);
 
 	out->list = all;

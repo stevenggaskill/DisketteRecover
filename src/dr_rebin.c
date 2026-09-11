@@ -59,11 +59,47 @@
 /* ------------------------------------------------------------------ */
 /* Interval extraction                                                 */
 /* ------------------------------------------------------------------ */
+/*
+ * The cell period, sampled once where the sector starts and held for the
+ * whole of it.
+ *
+ * That is not always true - a stretch rewritten in a different drive runs
+ * at that drive's speed, and a few percent is enough to push a 4T past
+ * the top of its bin, which is how a region ends up decoded with 5- and
+ * 6-cell gaps that MFM cannot produce at all. libhxcfe's per-byte rate
+ * does not rescue that: it is smoothed over a 24-byte window and two
+ * filter passes, so following it interval by interval destroys the fit
+ * rather than sharpening it (measured - the model stops fitting at all).
+ * Recovering a local rate well enough to help means fitting it from the
+ * flux directly, and until that exists a sector with a speed splice is
+ * reported rather than repaired.
+ */
+double dr_cell_period(const dr_view *v)
+{
+	dr_flux_map *fx = (dr_flux_map *)v->flux;
+	HXCFE_SIDE *side = (HXCFE_SIDE *)v->side;
+	double bitrate;
+
+	if (!fx || !fx->valid || !side)
+		return 0.0;
+
+	bitrate = side->timingbuffer
+	        ? (double)side->timingbuffer[dr_wrap(side->tracklen,
+	                                             v->base_cell) / 8]
+	        : (double)side->bitrate;
+	if (bitrate < 1000.0)
+		bitrate = (double)side->bitrate;
+	if (bitrate < 1000.0)
+		return 0.0;
+	return (double)fx->tick_freq / (2.0 * bitrate);
+}
+
 int dr_intervals_collect(dr_view *v, dr_interval **out, double *period_out)
 {
 	dr_flux_map *fx = (dr_flux_map *)v->flux;
 	HXCFE_SIDE *side = (HXCFE_SIDE *)v->side;
 	dr_interval *iv;
+	dr_revmap *rm;
 	double period0 = 0.0;
 	int i, n = 0, prev = -1;
 
@@ -71,39 +107,27 @@ int dr_intervals_collect(dr_view *v, dr_interval **out, double *period_out)
 	if (!fx || !fx->valid)
 		return -1;
 
-	/*
-	 * The cell period, sampled once where the sector starts and held
-	 * for the whole of it.
-	 *
-	 * That is not always true - a stretch rewritten in a different
-	 * drive runs at that drive's speed, and a few percent is enough to
-	 * push a 4T past the top of its bin, which is how a region ends up
-	 * decoded with 5- and 6-cell gaps that MFM cannot produce at all.
-	 * libhxcfe's per-byte rate does not rescue that: it is smoothed
-	 * over a 24-byte window and two filter passes, so following it
-	 * interval by interval destroys the fit rather than sharpening it
-	 * (measured - the model stops fitting at all). Recovering a local
-	 * rate well enough to help means fitting it from the flux
-	 * directly, and until that exists a sector with a speed splice is
-	 * reported rather than repaired.
-	 */
-	{
-		double bitrate = side->timingbuffer
-		        ? (double)side->timingbuffer[dr_wrap(side->tracklen,
-		                                             v->base_cell) / 8]
-		        : (double)side->bitrate;
-		if (bitrate < 1000.0)
-			bitrate = (double)side->bitrate;
-		if (bitrate < 1000.0)
-			return -1;
-		period0 = (double)fx->tick_freq / (2.0 * bitrate);
-	}
+	period0 = dr_cell_period(v);
 	if (period0 <= 0.0)
 		return -1;
 
 	iv = malloc((size_t)v->ncells * sizeof(*iv));
 	if (!iv)
 		return -1;
+
+	/*
+	 * Where the dump holds more than one pass over the track, an
+	 * interval's duration is the mean of the passes that read it the
+	 * same way. Reversals are magnetised into the oxide, so the passes
+	 * normally agree to a fraction of a tick and averaging simply
+	 * divides the read noise by the root of their number; where they
+	 * disagree, that disagreement is itself the measurement worth
+	 * having, and dr_revs.c has counted it.
+	 *
+	 * The consensus is indexed by the dump's own pulse number, so a
+	 * decode that gained or lost a cell mid-sector still lines up.
+	 */
+	rm = (dr_revmap *)v->revs;
 
 	for (i = 0; i < v->ncells; i++) {
 		uint32_t p;
@@ -118,8 +142,12 @@ int dr_intervals_collect(dr_view *v, dr_interval **out, double *period_out)
 		p = fx->pulse_of_cell[dr_wrap(side->tracklen, v->base_cell + i)];
 		iv[n].cell  = i;
 		iv[n].gap   = i - prev;
+		iv[n].pulse = p;
 		iv[n].ticks = (p != 0xFFFFFFFFu && p < fx->nb_pulses)
 		                      ? fx->stream[p] : 0;
+		if (rm && iv[n].ticks && p >= rm->p_first &&
+		    (int)(p - rm->p_first) < rm->n)
+			iv[n].ticks = rm->ticks[p - rm->p_first];
 		iv[n].meas  = iv[n].ticks ? (double)iv[n].ticks / period0 : -1.0;
 		iv[n].adj   = iv[n].meas;
 		n++;

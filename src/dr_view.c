@@ -36,6 +36,22 @@ static void set_perr(dr_cell *c, double p, dr_evidence ev)
 	}
 }
 
+/* How many of the dump's passes read this interval exactly as the
+ * reference did - neither running it into its neighbour for want of the
+ * reversal at its end, nor splitting it on one the reference missed.
+ * -1 when the consensus does not cover it. */
+static int interval_votes(const dr_revmap *rm, const dr_interval *iv, int j)
+{
+	uint32_t k;
+
+	if (!rm || iv[j].pulse < rm->p_first)
+		return -1;
+	k = iv[j].pulse - rm->p_first;
+	if ((int)k >= rm->n)
+		return -1;
+	return rm->same[k];
+}
+
 dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 {
 	dr_view *v;
@@ -47,6 +63,8 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 	int stride, base, span, i, k;
 	int sync_bytes, data_bytes;
 	int nrev = 0, nflux = 0, nweak = 0, weak_useful;
+	int ndissent = 0;
+	dr_revmap *rm;
 
 	if (!opt) {
 		dr_options_default(&defopt);
@@ -140,6 +158,11 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 	flux = (dr_flux_map *)v->flux;
 	v->flux_available = flux ? 1 : 0;
 
+	/* A dump usually holds several passes over the track. Fold them
+	 * together before anything is measured off the flux. */
+	if (flux)
+		v->revs = dr_revs_build(v);
+
 	/* ---- fit the track's own timing, then bin against it -------- */
 	/* What a 2T, 3T or 4T interval actually measures depends on the
 	 * dump's bitrate error and on peak shift from its neighbours, so
@@ -151,6 +174,7 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 		int niv, j;
 
 		memset(&tm, 0, sizeof(tm));
+		rm = (dr_revmap *)v->revs;
 		niv = dr_intervals_collect(v, &iv, &period);
 
 		if (niv > 0) {
@@ -218,6 +242,36 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 				if (VIOLATION_PERR > p) {
 					p = VIOLATION_PERR;
 					ev = DR_EV_VIOLATION;
+				}
+			}
+
+			/*
+			 * ...and what the dump's other passes made of it.
+			 *
+			 * A reversal that every pass saw is in the oxide. One
+			 * that only some passes saw is the read amplifier
+			 * firing on noise, which is what an unmagnetised or
+			 * half-erased patch of media looks like from outside
+			 * - and no amount of timing analysis on a single pass
+			 * can tell the two apart, because a single pass has
+			 * nothing to disagree with. This is the one piece of
+			 * evidence the extra revolutions provide that cannot
+			 * be had any other way, so it overrides.
+			 */
+			if (rm && rm->nused > 1) {
+				int seen = interval_votes(rm, iv, j);
+
+				if (seen >= 0 && seen < rm->nused) {
+					double q = 1.0 - (double)seen /
+					                 (double)rm->nused;
+					if (q > MAX_PERR)
+						q = MAX_PERR;
+					if (q > p) {
+						p = q;
+						ev = DR_EV_DISSENT;
+						margin = 0.0;
+					}
+					ndissent++;
 				}
 			}
 
@@ -308,6 +362,18 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 		         nflux, nrev, nweak,
 		         (nweak && !weak_useful) ? ", ignored - too many" : "");
 
+	if (rm) {
+		v->nrev = rm->nrev;
+		v->nrev_used = rm->nused;
+		v->rev_resid = rm->resid / (v->period > 0.0 ? v->period : 1.0);
+		v->rev_dissent = ndissent;
+		snprintf(v->passes, sizeof(v->passes),
+		         "%d of %d pass(es) over the track combined; they "
+		         "disagree by %.3f cell on average and about %d "
+		         "reversal(s) outright",
+		         rm->nused, rm->nrev, v->rev_resid, ndissent);
+	}
+
 	return v;
 }
 
@@ -316,6 +382,7 @@ void dr_view_free(dr_view *v)
 	if (!v)
 		return;
 	dr_flux_free((dr_flux_map *)v->flux);
+	dr_revs_free((dr_revmap *)v->revs);
 	dr_fit_release(v->fit);
 	free(v->msg);
 	free(v->cells);

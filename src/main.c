@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -37,12 +38,14 @@ static const char *usage_text =
 "  --track T --side S --id R     select by physical address instead\n"
 "\n"
 "engine options:\n"
-"  --mode M          auto | pattern | rebin | bits   (default auto)\n"
+"  --mode M          auto | pattern | revs | rebin | bits (default auto)\n"
 "                      pattern: restore the repeat the data almost obeys\n"
+"                      revs   : let every pass in the dump vote on where\n"
+"                               the reversals are (flux dumps only)\n"
 "                      rebin  : re-read the flux under another legal\n"
 "                               binning of the transitions (MFM + flux)\n"
 "                      bits   : search bit flips (works without flux)\n"
-"                    auto tries pattern, then rebin, then bits\n"
+"                    auto runs them all and ranks on one scale\n"
 "  --max-outliers N  pattern engine: bytes allowed off-pattern (24)\n"
 "  --dropout-bias N  nats favouring a lost 1 over a gained 1 (1.6)\n"
 "  --burst-gain G    how much likelier an error is right after another\n"
@@ -153,6 +156,7 @@ static int parse_args(int argc, char **argv, args *a)
 			if (!strcmp(m, "bits"))         a->opt.mode = DR_MODE_BITS;
 			else if (!strcmp(m, "rebin"))   a->opt.mode = DR_MODE_REBIN;
 			else if (!strcmp(m, "pattern")) a->opt.mode = DR_MODE_PATTERN;
+			else if (!strcmp(m, "revs"))    a->opt.mode = DR_MODE_REVS;
 			else                            a->opt.mode = DR_MODE_AUTO;
 		}
 		else if (!strcmp(o, "--apply"))    a->apply = atoi(NEXT());
@@ -270,6 +274,52 @@ static const char *bar(double p)
 	return "     ";
 }
 
+/*
+ * Where the passes vote against the reading libhxcfe picked.
+ *
+ * Only worth printing when they actually differ, and then only the bytes
+ * that changed - on a text sector this is usually self-evidently right
+ * or self-evidently wrong at a glance, which is more than a CRC can say
+ * when there are more contested reversals than it has bits.
+ */
+static void print_majority(dr_view *v)
+{
+	uint8_t *msg;
+	int contested = 0, majority = 0, i, shown = 0;
+
+	if (v->nrev_used < 2)
+		return;
+	msg = malloc((size_t)v->msg_len);
+	if (!msg)
+		return;
+	if (dr_revs_reading(v, msg, &contested, &majority) < 0 || !majority) {
+		free(msg);
+		return;
+	}
+
+	printf("\nthe passes vote for a different reading\n");
+	printf("  %d reversal(s) were not unanimous; the majority overrules "
+	       "this reading on %d of them\n", contested, majority);
+
+	for (i = 0; i < v->msg_len; i++) {
+		if (msg[i] == v->msg[i])
+			continue;
+		if (shown == 0)
+			printf("  byte   was   ->  passes say\n");
+		if (shown++ == 24) {
+			printf("  ... and %d more\n",
+			       v->msg_len - i);
+			break;
+		}
+		printf("  %4d   %02X %c  ->  %02X %c\n", i,
+		       v->msg[i], isprint(v->msg[i]) ? v->msg[i] : '.',
+		       msg[i], isprint(msg[i]) ? msg[i] : '.');
+	}
+	if (!shown)
+		printf("  ...and decodes to the same bytes anyway\n");
+	free(msg);
+}
+
 static void print_view(dr_view *v, int top)
 {
 	int i, k, n;
@@ -288,6 +338,9 @@ static void print_view(dr_view *v, int top)
 	       v->syndrome ? "INVALID" : "valid");
 	printf("evidence  : %s%s\n", v->model,
 	       v->flux_available ? "" : "  (no flux stream in this image)");
+	if (v->passes[0])
+		printf("passes    : %s\n", v->passes);
+	print_majority(v);
 
 	/* --- decoded bytes with a confidence bar ---------------------- */
 	printf("\ndecoded message (worst-bit confidence bar per byte)\n");
@@ -423,6 +476,16 @@ static void print_budget(dr_repair_result *r)
 	if (r->uncertain_bits > 16)
 		printf("            %d message bit(s) are in doubt; the CRC "
 		       "pins down 16\n", r->uncertain_bits);
+	/*
+	 * Nothing protects the CRC bytes. When the dump's own passes read
+	 * them differently, the number every candidate here was matched
+	 * against is a guess, and matching a guess proves nothing at all.
+	 */
+	if (r->crc_contested)
+		printf("            the passes disagree about the stored CRC "
+		       "itself, so nothing below is\n"
+		       "            evidence - they match a target that may "
+		       "never have been on the disk\n");
 }
 
 /*
@@ -634,6 +697,13 @@ static void print_candidates(dr_view *v, dr_repair_result *r, int limit)
 		return;
 	}
 
+	if (r->crc_contested)
+		printf("warning   : the dump's passes disagree about the "
+		       "stored CRC itself, so nothing\n"
+		       "            below is evidence - every candidate "
+		       "matches a target that may\n"
+		       "            never have been on the disk\n");
+
 	printf("result    : %d CRC-valid candidate(s) at weight %d%s\n",
 	       r->count, r->list[0].weight,
 	       r->truncated ? " (list truncated)" : "");
@@ -693,6 +763,8 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 		memset(&r, 0, sizeof(r));
 		if (engine == DR_MODE_PATTERN)
 			dr_pattern_search(v, &a->opt, &r);
+		else if (a->opt.mode == DR_MODE_REVS)
+			dr_revs_search(v, &a->opt, &r);
 		else if (engine == DR_MODE_REBIN)
 			dr_rebin_search(v, &a->opt, &r);
 		else
@@ -705,6 +777,7 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 	printf(" %3d/%d s%-3d  %-8s  ",
 	       sl[idx].track, sl[idx].side, sl[idx].sector_id,
 	       engine == DR_MODE_PATTERN ? "pattern" :
+	       engine == DR_MODE_REVS ? "passes" :
 	       engine == DR_MODE_REBIN ? "re-bin" : "bits");
 
 	if (!r.count) {
@@ -1072,6 +1145,8 @@ int main(int argc, char **argv)
 				memset(&r, 0, sizeof(r));
 				if (engine == DR_MODE_PATTERN)
 					rs = dr_pattern_search(v, &a.opt, &r);
+				else if (a.opt.mode == DR_MODE_REVS)
+					rs = dr_revs_search(v, &a.opt, &r);
 				else if (engine == DR_MODE_REBIN)
 					rs = dr_rebin_search(v, &a.opt, &r);
 				else

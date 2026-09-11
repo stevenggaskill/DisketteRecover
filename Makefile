@@ -16,7 +16,8 @@ LDLIBS   := -lhxcfe -lm
 LDFLAGS  += -L$(HXCBUILD) -Wl,-rpath,$(abspath $(HXCBUILD))
 
 SRCS := src/main.c src/dr_core.c src/dr_view.c src/dr_flux.c \
-        src/dr_repair.c src/dr_rebin.c src/dr_pattern.c src/dr_crc.c src/dr_json.c src/dr_http.c \
+        src/dr_repair.c src/dr_rebin.c src/dr_revs.c src/dr_pattern.c \
+        src/dr_crc.c src/dr_json.c src/dr_http.c \
         src/dr_web.c src/dr_web_plot.c
 OBJS := $(SRCS:.c=.o)
 

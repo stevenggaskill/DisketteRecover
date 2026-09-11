@@ -104,11 +104,12 @@ The residuals of a real dump are near-Gaussian out to about 4 sigma and
 then break cleanly into a separate population of genuine mis-reads, so
 that is where the defect detector draws its line.
 
-### 4. Three engines, strongest evidence first
+### 4. Four engines, ranked on one scale
 
 There are several ways to make a sector's CRC come out right, and they
-suit different damage. `--mode auto` (the default) tries them in order of
-how decisive their evidence is when it applies.
+suit different damage. `--mode auto` (the default) runs them all and
+scores their answers against each other on a single scale, so the engine
+that happens to answer first does not win by default.
 
 **Restoring the data's own regularity** (`--mode pattern`). Sector data
 is very often not random, and it is regular in two different ways, so the
@@ -134,6 +135,15 @@ Either way the engine lists the bytes that break the model and enumerates
 by how few of them it has to leave broken. It needs no flux at all, and
 when it fires it is by far the most decisive thing available.
 
+**Letting every pass vote** (`--mode revs`, whenever the dump holds more
+than one revolution). A KryoFlux or SuperCard Pro dump normally holds the
+same track read five times round. libhxcfe decodes each pass, scores them
+by how many sectors came out with a good CRC and hands back the winner;
+for a sector that no pass got right, everything the other four saw is
+thrown away, and it is exactly the evidence worth keeping. What the extra
+passes are and are not good for is
+[section 4b](#4b-what-the-other-revolutions-are-actually-good-for).
+
 **Re-binning the flux** (`--mode rebin`, whenever there are timings and
 the track is MFM). Real disks rarely lose a bit outright; they put a
 reversal in the wrong bin, and the failure conserves something. See the
@@ -157,6 +167,79 @@ image that carries no other evidence.
 Whichever engine runs, its results are re-scored by the same data model
 before ranking, so a reading that turns a run of `0xF6` into noise ends
 up where it belongs even when its CRC checks perfectly.
+
+### 4b. What the other revolutions are actually good for
+
+The obvious thing to do with five reads of the same sector is to vote on
+the decoded bytes. On these dumps that is usually the wrong move, and
+measuring why is what the engine is built around.
+
+**The reversals do not move.** Aligned pass against pass with an
+alignment that is free to insert and delete reversals, two revolutions of
+the same sector agree on the length of *every* interval to about 0.03 of
+a cell. On eight of Disk 2's nine bad sectors the passes dispute at most
+two reversals out of three thousand, and on six of them not one. That is
+not a surprise once stated: the reversals are magnetised into the oxide,
+and reading them again reads the same magnets.
+
+**The decode does move - a lot.** The same five passes of Disk 2's
+track 0 side 0 sector 16 decode to byte strings that differ in 385 of 518
+places, and to five *different* stored CRCs (C017, F000, 3FC0, 3FC0,
+02FA). Nothing about the disk changed between those reads. What changed
+is where libhxcfe's PLL happened to slip, and once it slips a cell every
+byte after it is shifted.
+
+So voting on bytes would be voting on the PLL's opinion, which is the
+part that is unreliable, and throwing away the flux, which is the part
+that is not. The combining happens on the flux instead, before anything
+is decoded: align, average the intervals the passes agree on - which
+divides read noise by the root of the count - and *count the reversals
+they do not agree on*.
+
+That count is the thing no single pass can produce, and it separates two
+failures that look identical from one read:
+
+```
+sector      passes  disagree by   contested reversals
+0/0 s15        5/5    0.034 cell            0
+0/0 s16        5/5    0.021 cell            2
+0/0 s18        5/5    0.029 cell            0
+0/1 s18        5/5    0.082 cell          239      <-- weak bits
+41/1 s17       5/5    0.030 cell            0
+```
+
+Every sector but one has flux the passes agree on completely: the damage
+is in what was written, permanent, and a search over readings is the
+right response. `0/1 s18` is a different animal - a fifth of a cell of
+disagreement and 239 reversals that some passes see and others do not.
+That is the read amplifier firing on noise, which is what unmagnetised or
+half-erased media looks like from the outside, and no amount of analysis
+of a single pass can tell it from a clean read. Those cells are marked
+`dissent` in the zoomed view and priced by the vote, not by the timings.
+
+The engine then takes the reading the passes vote for - which is a
+different, better-evidenced reading than the one pass libhxcfe picked -
+and searches outwards from it by reversing the least lopsided votes
+first, on the grounds that a 3-2 vote is barely a vote and the CRC is a
+better arbiter than one extra pass.
+
+**What it does not do.** On these two disks it repairs nothing new. It is
+worth being exact about why, because the reason is interesting: on
+`0/1 s18` the passes read the sector's English text visibly better than
+the one libhxcfe chose -
+
+```
+pass 1  terested in li#ensing the deD..(garbage)      <- libhxcfe's pick
+pass 3  terested in licensing the design tO e re
+pass 4  terested in licensing the d%sign to a re
+vote    terested in licensing the design to ...
+```
+
+- but the damage runs from byte 244 to the end of the sector, and a
+16-bit CRC cannot arbitrate 274 bytes. The right conclusion is not that
+the sector is nearly recovered; it is that half of it is gone, and the
+tool now has the evidence to say so instead of returning 256 equally
+plausible fictions.
 
 ### 4a. What MFM's three interval widths actually buy you
 
@@ -283,6 +366,15 @@ PC/Atari/Amstrad family) and **ISO/IBM FM** (System 3740). Re-binning is
 MFM-only. Amiga MFM uses a checksum rather than a CRC-16 and is not
 handled yet; nor are the GCR formats.
 
+And the limit that the revolutions made explicit: **nothing protects the
+CRC bytes.** They are two bytes of the sector like any other, so a sector
+damaged near its end has a *stored* CRC that may itself be wrong, and
+then every "CRC-valid" reading the search returns matches a target that
+was never on the disk. On Disk 2's `0/1 s18` the five passes decode to
+five different stored CRCs. Where the passes read the CRC bytes
+differently from the reading being repaired, the tool now says so and
+labels the whole candidate list as evidence of nothing.
+
 ### A worked case: two real KryoFlux dumps
 
 **Disk 1** - an 84-track dump of a 720K disk, 1440 sectors, two bad:
@@ -370,8 +462,26 @@ byte 218: 0x23 -> 0x63    '#' -> 'c'
   now: "...we are interested in licensing the de..."
 ```
 
-One bit, reading 0 where a 1 was written. The rest of that sector's
-damage falls in its binary tail, where nothing constrains the answer.
+One bit, reading 0 where a 1 was written.
+
+The five passes in the dump then say how far that sector can go. Each
+pass reads the text a little differently, and the pass libhxcfe picked is
+the worst of the five:
+
+```
+pass 1  terested in li#ensing the deD..(garbage)      <- libhxcfe's pick
+pass 3  terested in licensing the design tO e re
+pass 4  terested in licensing the d%sign to a re
+vote    terested in licensing the design to ...
+```
+
+Two more words, recovered by letting the passes vote rather than trusting
+one of them. And then it stops: from byte 244 to the end of the sector
+the passes disagree about 239 reversals - a fifth of a cell of scatter,
+which is unmagnetised media, not a mis-read - and the damage takes the
+stored CRC with it. 274 bytes, no redundancy, and a checksum that is
+itself a guess. That sector is not coming back, and the useful output is
+knowing where the recoverable part ends.
 
 ### The errors that actually happen
 
@@ -498,15 +608,20 @@ selection:
   --all             work through every sector with a CRC error
 
 engine options:
-  --mode M          auto | pattern | rebin | bits   (default auto)
+  --mode M          auto | pattern | revs | rebin | bits (default auto)
                       pattern: restore the repeat the data almost obeys
+                      revs   : let every pass in the dump vote on where
+                               the reversals are (flux dumps only)
                       rebin  : re-read the flux under another legal
                                binning of the transitions (MFM + flux)
                       bits   : search bit flips (works without flux)
-                    auto tries pattern, then rebin, then bits
+                    auto runs them all and ranks on one scale
   --max-outliers N  pattern engine: bytes allowed off-pattern (24)
   --restore-only    only consider putting dropped reversals back
   --dropout-bias N  nats favouring a restored 1 over a removed one (1.6)
+  --burst-gain G    how much likelier an error is right after another
+                    one (110; 0 turns the burst prior off)
+  --burst-len B     bits over which that lift decays (60)
   --bin-budget N    nats of timing cost a re-bin may spend (12)
   --max-ambiguous N refuse to search past this many open intervals (48)
   --max-explore N   cap on re-binning assignments tested (500000)

@@ -31,6 +31,7 @@ static const char *ev_name(int e)
 	case DR_EV_WEAKBIT:   return "weak";
 	case DR_EV_FLUX:      return "flux";
 	case DR_EV_VIOLATION: return "violation";
+	case DR_EV_DISSENT:   return "dissent";
 	default:              return "none";
 	}
 }
@@ -92,7 +93,10 @@ void dr_json_view(dr_ctx *c, dr_view *v, FILE *f)
 	           "\"data_offset\":%d,\"data_len\":%d,"
 	           "\"syndrome\":%u,\"stored_crc\":%u,\"computed_crc\":%u,"
 	           "\"crc_valid\":%s,\"flux\":%s,\"stride\":%d,"
-	           "\"base_cell\":%d,\"track_len\":%d,\"model\":",
+	           "\"base_cell\":%d,\"track_len\":%d,"
+	           "\"revolutions\":%d,\"revolutions_used\":%d,"
+	           "\"rev_resid_cells\":%.4g,\"rev_dissent\":%d,"
+	           "\"model\":",
 	        v->sector_index, v->sect.track, v->sect.side, v->sect.sector_id,
 	        enc_name(v->encoding), v->field,
 	        v->sect.sector_size, v->sect.bitrate,
@@ -102,7 +106,8 @@ void dr_json_view(dr_ctx *c, dr_view *v, FILE *f)
 	        v->syndrome ? "false" : "true",
 	        v->flux_available ? "true" : "false",
 	        v->stride, v->base_cell,
-	        ((HXCFE_SIDE *)v->side)->tracklen);
+	        ((HXCFE_SIDE *)v->side)->tracklen,
+	        v->nrev, v->nrev_used, v->rev_resid, v->rev_dissent);
 	json_str(f, v->model);
 
 	/* bytes */
@@ -168,7 +173,9 @@ void dr_json_candidates(const dr_view *v, const dr_repair_result *r,
 		fprintf(f, "{\"count\":%d,\"offset\":%d,\"pool\":%d,"
 		           "\"searched_weight\":%d,\"truncated\":%s,"
 		           "\"margin\":%.6g,\"flux\":%s,\"rebin\":%s,"
-		           "\"pattern\":%s,\"period\":%d,\"coverage\":%.4f,"
+		           "\"pattern\":%s,\"revs\":%s,\"contested\":%d,"
+		           "\"majority\":%d,\"crc_contested\":%s,"
+		           "\"period\":%d,\"coverage\":%.4f,"
 		           "\"outliers\":%d,"
 		           "\"ambiguous\":%d,\"uncertain_bits\":%d,"
 		           "\"explored\":%ld,\"floor_cost\":%.6g,"
@@ -179,6 +186,9 @@ void dr_json_candidates(const dr_view *v, const dr_repair_result *r,
 		        v->flux_available ? "true" : "false",
 		        r->rebin ? "true" : "false",
 		        r->pattern ? "true" : "false",
+		        r->revs ? "true" : "false",
+		        r->contested, r->majority,
+		        r->crc_contested ? "true" : "false",
 		        r->period, r->coverage, r->outliers,
 		        r->ambiguous, r->uncertain_bits, r->explored,
 		        r->floor_cost, r->current_cost,
