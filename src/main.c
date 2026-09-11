@@ -23,6 +23,11 @@ static const char *usage_text =
 "  convert  <image>              write the image out in another format\n"
 "  formats                       list libhxcfe export formats\n"
 "\n"
+"inspect options:\n"
+"  --bytes A:B       zoom in on message bytes A..B - shows the cells, the\n"
+"                    flux interval each reversal came from, and the bits\n"
+"                    they decode to\n"
+"\n"
 "selection:\n"
 "  --sector N        sector index from `scan` (default: first bad CRC)\n"
 "  --track T --side S --id R     select by physical address instead\n"
@@ -84,6 +89,7 @@ typedef struct {
 	const char *out;
 	const char *format;
 	const char *bits;
+	const char *bytes;
 	char *const *sets;
 	int    nsets;
 	dr_options opt;
@@ -141,6 +147,7 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--out"))      a->out = NEXT();
 		else if (!strcmp(o, "--format"))   a->format = NEXT();
 		else if (!strcmp(o, "--bits"))     a->bits = NEXT();
+		else if (!strcmp(o, "--bytes"))    a->bytes = NEXT();
 		else if (!strcmp(o, "--port"))     a->port = atoi(NEXT());
 		else if (!strcmp(o, "--bind"))     a->bind = NEXT();
 		else if (!strcmp(o, "--set")) {
@@ -285,6 +292,8 @@ static void print_view(dr_view *v, int top)
 	}
 
 	/* --- least trusted bits --------------------------------------- */
+	if (top <= 0)
+		return;
 	n = v->msg_bits - v->first_bit;
 	if (n <= 0)
 		return;
@@ -339,6 +348,77 @@ static void print_view(dr_view *v, int top)
 }
 
 /* ------------------------------------------------------------------ */
+/*
+ * The zoomed view: for each byte, the sixteen cells it occupies, the bit
+ * they decode to, and the flux interval that put each reversal where it
+ * is. This is the picture the whole tool is built around - everything
+ * else is a search over what these numbers could have meant.
+ */
+static void print_bytes(dr_view *v, int b0, int b1)
+{
+	int b, i, k;
+
+	if (b0 < 0) b0 = 0;
+	if (b1 >= v->msg_len) b1 = v->msg_len - 1;
+
+	printf("\nzoom: message bytes %d..%d   ('|' = flux reversal, "
+	       "'.' = none)\n", b0, b1);
+	printf("      each byte spans %d cells; a data bit is a reversal in "
+	       "its data cell\n      with none in its clock cell\n\n",
+	       v->stride);
+
+	for (b = b0; b <= b1; b++) {
+		int base = b * v->stride;
+		char cells[80], bits[80];
+		int first_iv = 1;
+
+		if (base + v->stride > v->ncells)
+			break;
+
+		memset(cells, ' ', sizeof(cells));
+		memset(bits, ' ', sizeof(bits));
+
+		for (i = 0; i < v->stride; i++)
+			cells[i] = v->cells[base + i].state ? '|' : '.';
+		for (k = 0; k < 8; k++) {
+			int cc, dc, bit;
+
+			dr_bit_cells(v->encoding, 0, k, &cc, &dc);
+			bit = (v->encoding == DR_ENC_ISO_FM)
+			        ? v->cells[base + dc].state
+			        : (!v->cells[base + cc].state &&
+			           v->cells[base + dc].state);
+			bits[dc] = (char)('0' + bit);
+		}
+		cells[v->stride] = 0;
+		bits[v->stride] = 0;
+
+		printf(" %4d %-5s %02X %c  %s\n", b, v->bytes[b].role,
+		       v->msg[b],
+		       (v->msg[b] >= 32 && v->msg[b] < 127) ? v->msg[b] : '.',
+		       cells);
+		printf("                   %s", bits);
+
+		for (i = 0; i < v->stride; i++) {
+			dr_cell *c = &v->cells[base + i];
+
+			if (!c->state || c->interval_ticks < 0)
+				continue;
+			if (first_iv) {
+				printf("   ");
+				first_iv = 0;
+			} else {
+				printf(", ");
+			}
+			printf("%.2fT->%dT", c->interval_cells, c->bin);
+			if (c->best_bin > 0 && c->best_bin != c->bin)
+				printf(" (fits %dT, p=%.2f)",
+				       c->best_bin, c->p_bin);
+		}
+		printf("\n");
+	}
+}
+
 static void print_pattern(dr_view *v, dr_repair_result *r, int limit)
 {
 	int i, k;
@@ -849,7 +929,23 @@ int main(int argc, char **argv)
 		if (!strcmp(a.cmd, "inspect")) {
 			if (a.json)
 				dr_json_view(c, v, stdout), printf("\n");
-			else
+			else if (a.bytes) {
+				int b0 = 0, b1 = 0;
+				char *colon;
+				char *dup = strdup(a.bytes);
+
+				colon = strchr(dup, ':');
+				if (colon) {
+					*colon = 0;
+					b0 = atoi(dup);
+					b1 = atoi(colon + 1);
+				} else {
+					b0 = b1 = atoi(dup);
+				}
+				free(dup);
+				print_view(v, 0);
+				print_bytes(v, b0, b1);
+			} else
 				print_view(v, 24);
 			dr_view_free(v);
 			dr_close(c);
