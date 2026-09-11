@@ -161,6 +161,9 @@ double dr_timing_adjust(const dr_timing *t, double meas,
 /* Collect the intervals covering the view's cell window. Returns the
  * count, or -1 when there is no usable flux. */
 double dr_cell_period(const dr_view *v);
+/* Decode the message as if the decoder had been `slip` cells out of step
+ * from window cell `at` onward. */
+void   dr_decode_slipped(const dr_view *v, int at, int slip, uint8_t *out);
 int    dr_intervals_collect(dr_view *v, dr_interval **out, double *period);
 void   dr_timing_fit(const dr_interval *iv, int n, dr_timing *t);
 double dr_bin_cost(const dr_timing *t, double meas, int k);

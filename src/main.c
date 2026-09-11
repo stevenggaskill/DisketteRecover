@@ -75,6 +75,8 @@ static const char *usage_text =
 "\n"
 "damage options:\n"
 "  --bits a,b,c      message bit indices to flip\n"
+"  --slip B:N        shift the sector's cells by N from byte B on, the\n"
+"                    way a decoder does when it loses its place\n"
 "  --drop-only       only clear bits that read 1, so the damage is a\n"
 "                    lost reversal - what real media actually does\n"
 "  --out FILE        required\n"
@@ -103,6 +105,7 @@ typedef struct {
 	const char *out;
 	const char *format;
 	const char *bits;
+	const char *slip;
 	const char *bytes;
 	char *const *sets;
 	int    nsets;
@@ -165,6 +168,7 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--out"))      a->out = NEXT();
 		else if (!strcmp(o, "--format"))   a->format = NEXT();
 		else if (!strcmp(o, "--bits"))     a->bits = NEXT();
+		else if (!strcmp(o, "--slip"))     a->slip = NEXT();
 		else if (!strcmp(o, "--bytes"))    a->bytes = NEXT();
 		else if (!strcmp(o, "--port"))     a->port = atoi(NEXT());
 		else if (!strcmp(o, "--bind"))     a->bind = NEXT();
@@ -336,6 +340,11 @@ static void print_view(dr_view *v, int top)
 	printf("crc       : stored %04X, computed %04X, syndrome %04X -> %s\n",
 	       v->stored_crc, v->computed_crc, v->syndrome,
 	       v->syndrome ? "INVALID" : "valid");
+	if (v->crc_suspect && v->syndrome)
+		printf("            the damage reaches the CRC bytes, so the "
+		       "stored value is a guess too -\n"
+		       "            a reading that matches it has proved "
+		       "less than it looks\n");
 	printf("evidence  : %s%s\n", v->model,
 	       v->flux_available ? "" : "  (no flux stream in this image)");
 	if (v->passes[0])
@@ -462,8 +471,22 @@ static void print_budget(dr_repair_result *r)
 	double chance;
 
 	if (r->explored > 0) {
-		chance = (double)r->explored / 65536.0;
-		printf("budget    : %ld reading(s) were possible; a 16-bit CRC "
+		/*
+		 * Allowing k bits of the stored CRC to be wrong widens the
+		 * target from one value to sum(C(16,j), j<=k) of them, so
+		 * the coincidence it rules out shrinks accordingly. Saying
+		 * "one in 65536" after correcting two of its bits would be
+		 * off by a factor of 137.
+		 */
+		double accept = 1.0, term = 1.0;
+		int j;
+
+		for (j = 1; j <= r->crc_fixed && j <= 16; j++) {
+			term = term * (16 - j + 1) / j;
+			accept += term;
+		}
+		chance = (double)r->explored * accept / 65536.0;
+		printf("budget    : %ld reading(s) were possible; the CRC "
 		       "passes ~%.3g of them\n", r->explored, chance);
 		if (r->count == 1 && chance < 0.2)
 			printf("            by chance, so the single survivor is "
@@ -564,6 +587,21 @@ static void print_pattern(dr_view *v, dr_repair_result *r, int limit)
 	int i, k;
 
 	printf("\ndata      : %s\n", r->note);
+	/*
+	 * A phase correction is not a detail. It says the bytes were never
+	 * wrong - the decoder lost its place - and it rewrites every byte
+	 * after it, so anyone reading the diff needs to know.
+	 */
+	if (r->slip)
+		printf("phase     : the decoder was %d cell(s) out of step "
+		       "from byte %d on; every byte after that\n"
+		       "            was re-framed rather than corrupted\n",
+		       r->slip < 0 ? -r->slip : r->slip, r->slip_byte);
+	if (r->crc_fixed)
+		printf("warning   : the damage reaches the stored CRC, and "
+		       "%d of its bits had to be corrected\n"
+		       "            too - so it confirms this reading with "
+		       "%d bits, not 16\n", r->crc_fixed, 16 - r->crc_fixed);
 	printf("search    : restoring the repeat - %d byte(s) break it; "
 	       "%ld reading(s) tested\n", r->outliers, r->explored);
 
@@ -1046,6 +1084,27 @@ int main(int argc, char **argv)
 		int bits[DR_MAX_WEIGHT * 4], nb = 0;
 		char *dup, *tok;
 
+		if (a.slip) {
+			int at = 0, cells = 0;
+
+			if (sscanf(a.slip, "%d:%d", &at, &cells) != 2 ||
+			    !cells || !a.out) {
+				fprintf(stderr, "damage --slip wants "
+				                "BYTE:CELLS, and --out\n");
+				dr_close(c);
+				return 2;
+			}
+			if (dr_damage_slip(c, idx, at, cells) < 0 ||
+			    dr_export(c, a.out, a.format) < 0) {
+				fprintf(stderr, "%s\n", dr_last_error(c));
+				dr_close(c);
+				return 1;
+			}
+			printf("shifted sector %d by %+d cell(s) from byte %d; "
+			       "wrote %s\n", idx, cells, at, a.out);
+			dr_close(c);
+			return 0;
+		}
 		if (!a.bits || !a.out) {
 			fprintf(stderr, "damage needs --bits and --out\n");
 			dr_close(c);

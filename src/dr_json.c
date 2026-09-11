@@ -92,7 +92,8 @@ void dr_json_view(dr_ctx *c, dr_view *v, FILE *f)
 	           "\"msg_len\":%d,\"msg_bits\":%d,\"first_bit\":%d,"
 	           "\"data_offset\":%d,\"data_len\":%d,"
 	           "\"syndrome\":%u,\"stored_crc\":%u,\"computed_crc\":%u,"
-	           "\"crc_valid\":%s,\"flux\":%s,\"stride\":%d,"
+	           "\"crc_valid\":%s,\"crc_suspect\":%s,"
+	           "\"flux\":%s,\"stride\":%d,"
 	           "\"base_cell\":%d,\"track_len\":%d,"
 	           "\"revolutions\":%d,\"revolutions_used\":%d,"
 	           "\"rev_resid_cells\":%.4g,\"rev_dissent\":%d,"
@@ -104,6 +105,7 @@ void dr_json_view(dr_ctx *c, dr_view *v, FILE *f)
 	        v->data_offset, v->data_len,
 	        v->syndrome, v->stored_crc, v->computed_crc,
 	        v->syndrome ? "false" : "true",
+	        v->crc_suspect ? "true" : "false",
 	        v->flux_available ? "true" : "false",
 	        v->stride, v->base_cell,
 	        ((HXCFE_SIDE *)v->side)->tracklen,
@@ -175,6 +177,7 @@ void dr_json_candidates(const dr_view *v, const dr_repair_result *r,
 		           "\"margin\":%.6g,\"flux\":%s,\"rebin\":%s,"
 		           "\"pattern\":%s,\"revs\":%s,\"contested\":%d,"
 		           "\"majority\":%d,\"crc_contested\":%s,"
+		           "\"slip\":%d,\"crc_fixed\":%d,"
 		           "\"period\":%d,\"coverage\":%.4f,"
 		           "\"outliers\":%d,"
 		           "\"ambiguous\":%d,\"uncertain_bits\":%d,"
@@ -189,6 +192,7 @@ void dr_json_candidates(const dr_view *v, const dr_repair_result *r,
 		        r->revs ? "true" : "false",
 		        r->contested, r->majority,
 		        r->crc_contested ? "true" : "false",
+		        r->slip, r->crc_fixed,
 		        r->period, r->coverage, r->outliers,
 		        r->ambiguous, r->uncertain_bits, r->explored,
 		        r->floor_cost, r->current_cost,

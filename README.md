@@ -375,7 +375,7 @@ five different stored CRCs. Where the passes read the CRC bytes
 differently from the reading being repaired, the tool now says so and
 labels the whole candidate list as evidence of nothing.
 
-### A worked case: two real KryoFlux dumps
+### A worked case: four real KryoFlux dumps
 
 **Disk 1** - an 84-track dump of a 720K disk, 1440 sectors, two bad:
 sector 6 on side 1 of tracks 72 *and* 73. The same sector on adjacent
@@ -417,8 +417,8 @@ the first reading tried. Both sectors, byte-exact, applied and verified
 by libhxcfe's own decoder.
 
 **Disk 2** - a 1.44 MB dump, 2882 sectors, nine bad, and this time the
-sectors hold real data rather than filler. Three repair uniquely; the
-rest stay ambiguous and are reported as such rather than guessed.
+sectors hold real data rather than filler. Four repair uniquely; the rest
+stay ambiguous and are reported as such rather than guessed.
 
 The first of them, track 0 side 0 sector 15, is worth following through.
 The flux says the damage runs from byte 182 to byte 255 - intervals 10 to
@@ -483,6 +483,20 @@ stored CRC with it. 274 bytes, no redundancy, and a checksum that is
 itself a guess. That sector is not coming back, and the useful output is
 knowing where the recoverable part ends.
 
+**GasAcc** - 2916 sectors, one bad, and it is the sector that taught this
+tool the most: see [the one wrong answer](#the-one-wrong-answer-and-what-it-cost-to-find-it)
+below. It repairs exactly, to 512 bytes of `0xF6`.
+
+**Zeus** - 2881 sectors, two bad: sector 9 on tracks 8 *and* 9, the same
+adjacent-track signature as Disk 1. The flux is healthy either side of a
+90-byte burst, the five passes agree on every reversal, and the content
+is structured binary with no repeat to lean on. Both stay ambiguous - 65
+and 56 CRC-valid readings, topping out at 98 and 3 times the runner-up.
+That is the honest end of the road for a 16-bit CRC over a burst this
+size, and the tool says so.
+
+Totals across the four: **9 of 14** bad sectors repaired and verified.
+
 ### The errors that actually happen
 
 Fourteen errors across these two disks have a verifiable truth - eleven
@@ -504,20 +518,92 @@ That gives a usable ranking of causes, most likely first:
 | error | mechanism | flux signature | data signature | seen |
 |---|---|---|---|---|
 | **dropout** | weak pulse misses the threshold, most often after a 4T gap | one interval covers two; the PLL splits it into an implausible pair | a 1 reads as 0 | **14/14** |
-| **mis-bin / phase slip** | PLL steals a cell from the next interval | adjacent intervals off by +1/-1, total conserved | usually one bit | the flux face of the above |
+| **mis-bin** | PLL steals a cell from the next interval | adjacent intervals off by +1/-1, total conserved | usually one bit | the flux face of the above |
 | **shift** | transition displaced but still detected | one interval long, the next short | one bit or none | synthetic only |
 | **spurious pulse** | noise clears the threshold | two intervals sum to one legal length | a 0 reads as 1 | **0/14** |
 | **speed drift** | motor wow, or a different drive | every interval scales together | none, if the PLL tracks | absorbed by the fitted model |
 | **weak / fuzzy bits** | deliberate protection, or unmagnetised media | differs between revolutions | not repeatable | none here |
 | **burst / erasure** | scratch or contamination | many implausible intervals over a span | many bits | Disk 1's tracks 72-73 |
+| **phase slip** | a burst leaves the decoder a cell out of step | the run either side of it re-bins | *every* byte after it | GasAcc track 74 |
+| **band collapse** | head-media separation; bit crowding | 2T and 4T both pulled towards 3T, ~0.3 cell | many bits | GasAcc track 74 |
 
-Across both disks, 27 bit errors now have a verifiable truth and all 27
+Across all four disks, 27 bit errors have a verifiable truth and all 27
 are reversals that went missing.
+
+The last two are worth separating out, because between them they produced
+the one confidently wrong answer this tool has given.
+
+**Band collapse.** The timing model is fitted per track, so a track whose
+bin centres have moved is handled - but on GasAcc's track 74 the centres
+move *within* a sector. Over bytes 331-515 a 2T next to a 4T reads 2.46
+cells and a 4T between 2Ts reads 3.59, against 2.10 and 3.90 in the clean
+part of the same sector; the gain falls from 1.00 to 0.83 and the
+neighbour terms triple. Both bands are pulled towards the middle, which
+is peak shift - adjacent transitions repelling each other - getting three
+times worse over a stretch. Head-to-media separation does this: the read
+pulse broadens, and a broader pulse leans on its neighbours harder.
+
+**Phase slip.** Give a run of intervals one cell too many and the byte
+boundary moves. Nothing is corrupted; everything after is *re-framed*. On
+GasAcc that turned a sector of `0xF6` filler into a long run of `0xBD` -
+and `0xBD` is not a corruption of `0xF6`, it is the same cell pattern
+read four cells later. No number of bit flips repairs that, which is the
+whole point: a search that only flips bits cannot even represent the
+answer.
 
 Two things follow, and both are built in. `--restore-only` searches only
 for reversals to put *back*, which is what the evidence says errors are;
 it also cuts a weight-3 search roughly eightfold. And `--dropout-bias`
 tilts the ranking that way without forbidding the alternative.
+
+### The one wrong answer, and what it cost to find it
+
+GasAcc has a single bad sector. The tool repaired it, reported a margin
+of 340 to 1, and re-decoded it clean. The answer was wrong.
+
+The sector is 512 bytes of `0xF6` filler with a burst defect two thirds
+of the way in. The defect left the decoder four cells out of step, so the
+last 180 bytes read as a run of `0xBD` - re-framed, not corrupted - and
+*the last two bytes of the sector are the CRC*. Nothing protects them.
+The stored value came back `8AFD`; the true CRC of an all-`0xF6` sector
+is `2BF6`. The search was matching a target that had never been on the
+disk, and with 180 damaged bytes to play with it found a three-bit flip
+that hit it. One in 65536 is a long shot; one in 65536 across millions of
+readings is a certainty.
+
+Three things were wrong and all three are now fixed.
+
+**The data model gave up too early.** `--max-outliers` bounds the
+*enumeration* - how many combinations of "leave this byte broken" to try
+- and it was also gating the single reading that leaves none of them
+broken. That reading is one trial however many outliers there are, and it
+is the one Occam nominates, so it is now always tried.
+
+**A degenerate model was outscoring the true one.** A counter with step
+zero is a repeat, and it was winning by *abstaining*: it declined to
+predict the 82 bytes it found awkward, which flattered its coverage to
+99.5% while explaining fewer bytes than the plain repeat it was imitating.
+Counters with a zero step are now rejected outright - `fit_periodic`
+already describes repeats, and it commits to every byte.
+
+**Nothing could express the answer.** A phase slip re-frames every byte
+after it; a candidate is a list of bit flips; 180 bytes do not fit in
+one. Candidates now carry an optional cell-phase correction, and the
+pattern engine searches for one whenever a repeat fits the head of a
+field and collapses. On this sector it finds `+4 cells at byte 418`,
+recovers 464 of 514 bytes at a stroke, and the remaining 48 are restored
+by the model in a single reading. The result is 512 bytes of `0xF6` with
+stored CRC `2BF6` - and with the phase put back, the CRC bytes read
+correctly on their own, which is as close to independent confirmation as
+this gets.
+
+Two guards came out of it. `inspect` now says when the timings under the
+CRC bytes were themselves in doubt, because a reading that matches a
+guessed checksum has proved less than it looks. And where a trustworthy
+model determines the data but the stored CRC disagrees by a bit or two,
+the repair may correct *those* bits - and then says so, and prices the
+result honestly: two corrected bits widen the CRC's target from one value
+in 65536 to 137, and the reported budget says so.
 
 ### Ranking: Occam's razor, made explicit
 

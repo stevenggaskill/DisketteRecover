@@ -381,6 +381,55 @@ void dr_repair_free(dr_repair_result *r)
 	r->count = 0;
 }
 
+/*
+ * One cell of the window, reaching past its end when a phase correction
+ * pulls cells in from the gap that follows the sector.
+ */
+static int window_cell(const dr_view *v, int i)
+{
+	HXCFE_SIDE *side = (HXCFE_SIDE *)v->side;
+
+	if (i >= 0 && i < v->ncells)
+		return v->cells[i].state;
+	if (!side)
+		return 0;
+	return dr_getcell(side, v->base_cell + i);
+}
+
+/*
+ * Decode the message with a cell-phase correction applied.
+ *
+ * A decoder that gives one run of intervals too many or too few cells
+ * does not corrupt a byte - it moves the byte boundary, and everything
+ * after it decodes as a different byte string entirely. Undoing that
+ * means reading the tail from `slip` cells further along, which is what
+ * this does; the reversals themselves do not move.
+ */
+void dr_decode_slipped(const dr_view *v, int at, int slip, uint8_t *out)
+{
+	int b, k;
+
+	for (b = 0; b < v->msg_len; b++) {
+		uint8_t val = 0;
+
+		for (k = 0; k < 8; k++) {
+			int cc, dc, s;
+
+			dr_bit_cells(v->encoding, b * v->stride, k, &cc, &dc);
+			s = (cc >= at) ? slip : 0;
+			val = (uint8_t)(val << 1);
+			if (v->encoding == DR_ENC_ISO_FM) {
+				if (window_cell(v, dc + s))
+					val |= 1;
+			} else if (!window_cell(v, cc + s) &&
+			           window_cell(v, dc + s)) {
+				val |= 1;
+			}
+		}
+		out[b] = val;
+	}
+}
+
 uint8_t *dr_candidate_message(const dr_view *v, const dr_candidate *cand)
 {
 	uint8_t *m;
@@ -392,7 +441,10 @@ uint8_t *dr_candidate_message(const dr_view *v, const dr_candidate *cand)
 	m = malloc((size_t)v->msg_len);
 	if (!m)
 		return NULL;
-	memcpy(m, v->msg, (size_t)v->msg_len);
+	if (cand->slip)
+		dr_decode_slipped(v, cand->slip_at, cand->slip, m);
+	else
+		memcpy(m, v->msg, (size_t)v->msg_len);
 
 	for (i = 0; i < cand->weight; i++) {
 		int p = cand->bits[i];
@@ -403,11 +455,13 @@ uint8_t *dr_candidate_message(const dr_view *v, const dr_candidate *cand)
 }
 
 /* Rewrite the message bytes touched by `bits` back into the track. */
-static int patch_bits(dr_ctx *c, dr_view *v, const int *bits, int nbits)
+static int patch_bits(dr_ctx *c, dr_view *v, const dr_candidate *cand)
 {
 	HXCFE_SIDE *side = (HXCFE_SIDE *)v->side;
+	const int *bits = cand->bits;
+	int nbits = cand->weight;
 	uint8_t *m;
-	int i, b;
+	int i, b, first = v->msg_len;
 
 	if (!side)
 		return -1;
@@ -415,7 +469,10 @@ static int patch_bits(dr_ctx *c, dr_view *v, const int *bits, int nbits)
 	m = malloc((size_t)v->msg_len);
 	if (!m)
 		return -1;
-	memcpy(m, v->msg, (size_t)v->msg_len);
+	if (cand->slip)
+		dr_decode_slipped(v, cand->slip_at, cand->slip, m);
+	else
+		memcpy(m, v->msg, (size_t)v->msg_len);
 
 	for (i = 0; i < nbits; i++) {
 		int p = bits[i];
@@ -426,11 +483,22 @@ static int patch_bits(dr_ctx *c, dr_view *v, const int *bits, int nbits)
 		m[p >> 3] ^= (uint8_t)(0x80 >> (p & 7));
 	}
 
-	/* Re-encode each touched byte so the cell stream stays legal. */
+	/* Re-encode each touched byte so the cell stream stays legal. A
+	 * phase correction moves every byte after it, so from there on the
+	 * whole tail is rewritten. */
+	if (cand->slip) {
+		first = cand->slip_at / v->stride;
+		if (first < 0)
+			first = 0;
+		for (b = first; b < v->msg_len; b++)
+			dr_write_byte(side, v->encoding,
+			              v->base_cell + b * v->stride, m[b]);
+	}
 	for (i = 0; i < nbits; i++) {
 		b = bits[i] >> 3;
-		dr_write_byte(side, v->encoding,
-		              v->base_cell + b * v->stride, m[b]);
+		if (b < first)
+			dr_write_byte(side, v->encoding,
+			              v->base_cell + b * v->stride, m[b]);
 	}
 
 	memcpy(v->msg, m, (size_t)v->msg_len);
@@ -448,7 +516,49 @@ int dr_apply(dr_ctx *c, dr_view *v, const dr_candidate *cand)
 {
 	if (!c || !v || !cand)
 		return -1;
-	return patch_bits(c, v, cand->bits, cand->weight);
+	return patch_bits(c, v, cand);
+}
+
+/*
+ * Plant a cell-phase slip: from `at_byte` on, shift the sector's cells
+ * by `cells`, as a decoder does when it gives a run of intervals one
+ * cell too many or too few. The bytes are not corrupted - the boundary
+ * moves - which is why a bit-flip search cannot undo it.
+ */
+int dr_damage_slip(dr_ctx *c, int sector_index, int at_byte, int cells)
+{
+	dr_view *v;
+	HXCFE_SIDE *side;
+	uint8_t *tail;
+	int at, n, i, rc = 0;
+
+	if (!cells)
+		return -1;
+	v = dr_view_open(c, sector_index, NULL);
+	if (!v)
+		return -1;
+	side = (HXCFE_SIDE *)v->side;
+	at = at_byte * v->stride;
+	n = v->msg_len * v->stride - at;
+	if (at < 0 || n <= 0 || !side) {
+		dr_view_free(v);
+		return -1;
+	}
+
+	tail = malloc((size_t)n);
+	if (!tail) {
+		dr_view_free(v);
+		return -1;
+	}
+	for (i = 0; i < n; i++)
+		tail[i] = (uint8_t)dr_getcell(side, v->base_cell + at + i + cells);
+	for (i = 0; i < n; i++)
+		dr_setcell(side, v->base_cell + at + i, tail[i]);
+
+	free(tail);
+	c->dirty = 1;
+	dr_view_free(v);
+	return rc;
 }
 
 int dr_damage(dr_ctx *c, int sector_index, const int *bits, int nbits,
@@ -491,7 +601,16 @@ int dr_damage(dr_ctx *c, int sector_index, const int *bits, int nbits,
 		keep[nkeep++] = b;
 	}
 
-	rc = nkeep ? patch_bits(c, v, keep, nkeep) : 0;
+	if (nkeep) {
+		dr_candidate cd;
+
+		memset(&cd, 0, sizeof(cd));
+		cd.weight = nkeep;
+		memcpy(cd.bits, keep, (size_t)nkeep * sizeof(*keep));
+		rc = patch_bits(c, v, &cd);
+	} else {
+		rc = 0;
+	}
 	if (rc == 0)
 		rc = nkeep;
 	dr_view_free(v);

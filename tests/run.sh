@@ -122,6 +122,57 @@ else
 	echo "  skip counter tests (no python3)"
 fi
 
+echo "== a decoder that lost its place, not a bit"
+# A run of intervals given one cell too many moves the byte boundary:
+# every byte after it decodes as something else, so no number of bit
+# flips repairs it. This is what a sector of filler with a burst defect
+# actually looks like, and matching the CRC without noticing is how a
+# tool confidently returns nonsense.
+if command -v python3 >/dev/null 2>&1; then
+	"$dr" damage "$out/fill.hfe" --sector 5 --slip 300:4 \
+	      --out "$out/slip.hfe" >/dev/null 2>&1
+	check "one bad sector from a phase slip" \
+	      "$(badcount "$out/slip.hfe")" "1"
+
+	sj=$("$dr" repair "$out/slip.hfe" --mode pattern --json 2>/dev/null)
+	# The reported figure is the correction, so it is the negative of
+	# the damage: four cells were inserted, four have to come back out.
+	sl=$(printf '%s' "$sj" | sed -n 's/.*"slip":\(-\{0,1\}[0-9]*\).*/\1/p')
+	check "the slip was measured" "$sl" "-4"
+	sc=$(printf '%s' "$sj" | sed -n 's/^{"count":\([0-9]*\).*/\1/p')
+	check "one reading, once the phase is put back" "$sc" "1"
+
+	"$dr" repair "$out/slip.hfe" --apply 0 --out "$out/sfix.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/fill_ref.img" "$out/sfix.img"
+	then ok "phase slip recovered exactly"
+	else bad "phase slip recovered exactly"; fi
+
+	echo "== ...with the stored CRC damaged along with it"
+	# The CRC bytes are the last two bytes of the sector and nothing
+	# protects them. A repair that insists on matching them exactly
+	# rejects the truth and accepts whatever matches the corruption.
+	"$dr" damage "$out/slip.hfe" --sector 5 --drop-only --bits 4129 \
+	      --out "$out/slipcrc.hfe" >/dev/null 2>&1
+	# crc_suspect is a flux judgement - it asks whether the timings
+	# under the CRC cells were in doubt - so on a sector-level image
+	# there is nothing to judge it on, and it stays false. The data
+	# model still catches the damage, which is the point.
+	su=$("$dr" inspect "$out/slipcrc.hfe" --json 2>/dev/null |
+	     sed -n 's/.*"crc_suspect":\(true\|false\).*/\1/p')
+	check "no flux, so no flux verdict on the CRC" "$su" "false"
+
+	cf=$("$dr" repair "$out/slipcrc.hfe" --mode pattern --json 2>/dev/null |
+	     sed -n 's/.*"crc_fixed":\([0-9]*\).*/\1/p')
+	check "one stored-CRC bit was corrected" "$cf" "1"
+
+	"$dr" repair "$out/slipcrc.hfe" --apply 0 --out "$out/scfix.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/fill_ref.img" "$out/scfix.img"
+	then ok "recovered exactly despite the damaged CRC"
+	else bad "recovered exactly despite the damaged CRC"; fi
+fi
+
 echo "== --restore-only narrows the search"
 a=$("$dr" repair "$out/b2.hfe" --json 2>/dev/null |
     sed -n 's/.*"count":\([0-9]*\).*/\1/p' | head -1)

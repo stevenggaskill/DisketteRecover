@@ -129,6 +129,7 @@ typedef struct {
 	/* Per-message-bit error probability (msg_bits entries).          */
 	float    *bit_perr;
 
+	int       crc_suspect;   /* the stored CRC is inside the damage   */
 	int       flux_available;/* 1 if flux timings were aligned        */
 	void     *flux;          /* dr_flux_map *, kept for the re-binner */
 	void     *revs;          /* dr_revmap *, the other passes         */
@@ -165,9 +166,11 @@ typedef enum {
 /* ------------------------------------------------------------------ */
 /* A repair candidate: a set of message bits to flip.                  */
 /* ------------------------------------------------------------------ */
-/* A bit-flip search never goes deep, but a re-binning result can move
- * a whole burst worth of bits at once. */
-#define DR_MAX_WEIGHT 96
+/* A bit-flip search never goes deep, but a re-binning result - or a data
+ * model restoring a whole damaged span - can move a great many bits at
+ * once. A sector of filler with seventy bytes of burst damage needs well
+ * over a hundred. */
+#define DR_MAX_WEIGHT 256
 #define DR_MAX_SEARCH_WEIGHT 6
 
 typedef struct {
@@ -180,6 +183,13 @@ typedef struct {
 	/* Re-binning results only: how the flux was re-read. */
 	int     rebins;                /* intervals given a different bin */
 	double  flux_cost;             /* -log likelihood of the timings  */
+
+	/* A cell-phase correction: from cell `slip_at` of the message
+	 * onward, the decoder was `slip` cells out of step. Every byte
+	 * after the slip decodes differently, which is why this cannot be
+	 * expressed as a list of bit flips. */
+	int     slip_at;
+	int     slip;
 
 	dr_mode origin;                /* which engine proposed it        */
 
@@ -214,6 +224,9 @@ typedef struct {
 	int           contested;        /* reversals the passes disputed   */
 	int           majority;         /* of those, overruled by the many */
 	int           crc_contested;    /* ...that land in the CRC bytes    */
+	int           slip;             /* cells of phase the repair undoes */
+	int           slip_byte;        /* ...from this message byte on     */
+	int           crc_fixed;        /* stored-CRC bits it had to correct*/
 	int           period;           /* the repeat it locked onto       */
 	int           outliers;         /* bytes that break the pattern    */
 	double        coverage;         /* fraction of bytes on-pattern    */
@@ -241,6 +254,8 @@ typedef struct {
 	double  burst_gain;     /* error odds multiplier right after an   */
 	                        /* error - 0 disables the burst prior     */
 	double  burst_len;      /* how fast that decays, in message bits  */
+	int     crc_budget;     /* stored-CRC bits a repair may correct,  */
+	                        /* when the damage reaches them (2)       */
 } dr_options;
 
 void        dr_options_default(dr_options *o);
@@ -333,6 +348,8 @@ int         dr_export(dr_ctx *c, const char *path, const char *format);
 /* Deliberately corrupt decoded data bits - used to build test images.
  * With drop_only, a bit is touched only if it currently reads 1, so the
  * damage is a lost reversal: the failure real media actually produces. */
+int         dr_damage_slip(dr_ctx *c, int sector_index, int at_byte,
+                           int cells);
 int         dr_damage(dr_ctx *c, int sector_index, const int *bits, int nbits,
                       int drop_only);
 

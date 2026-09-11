@@ -362,6 +362,30 @@ dr_view *dr_view_open(dr_ctx *c, int sector_index, const dr_options *opt)
 		         nflux, nrev, nweak,
 		         (nweak && !weak_useful) ? ", ignored - too many" : "");
 
+	/*
+	 * Is the stored CRC inside the damage?
+	 *
+	 * Nothing protects the two CRC bytes - they are the last two bytes
+	 * of the sector and a defect that reaches the end takes them with
+	 * it. When that happens the search is matching a target that was
+	 * never on the disk, and it will find something: the CRC has 65536
+	 * values and a damaged sector offers far more readings than that.
+	 * This is not hypothetical. It is how a sector of plain 0xF6 filler
+	 * with a lost cell came back "repaired" with a three-bit flip that
+	 * left a hundred and eighty bytes of nonsense in place, matching a
+	 * checksum that was itself nonsense.
+	 */
+	{
+		int lo = (v->msg_len - 2) * v->stride;
+		int hi = v->msg_len * v->stride;
+
+		for (i = lo; i < hi && i < v->ncells; i++)
+			if (v->cells[i].p_err > 0.05) {
+				v->crc_suspect = 1;
+				break;
+			}
+	}
+
 	if (rm) {
 		v->nrev = rm->nrev;
 		v->nrev_used = rm->nused;

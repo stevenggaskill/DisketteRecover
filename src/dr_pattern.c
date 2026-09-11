@@ -28,6 +28,9 @@
 
 #include "dr_internal.h"
 
+#define DBG(...) do { if (getenv("DR_DEBUG")) \
+	fprintf(stderr, "dr_pattern: " __VA_ARGS__); } while (0)
+
 #define MAX_PERIOD  256
 #define ALPHA       0.08     /* add-alpha smoothing for the byte model */
 #define BYTE_NATS   5.545    /* ln(256): the surprise of one wrong byte */
@@ -301,6 +304,17 @@ static int fit_counter(const uint8_t *data, int n, dr_fit *best)
 			diffs[i] = (rec_value(data, phase + (i + 1) * rec, rec, be) -
 			            rec_value(data, phase + i * rec, rec, be)) & mask;
 		step = mode_u64(diffs, nrec - 1, &nstep);
+
+		/*
+		 * A counter that does not count is a repeat, and fit_periodic
+		 * already describes repeats - better, because it commits to
+		 * every byte instead of abstaining wherever the records
+		 * disagree. Letting the degenerate parameterisation compete
+		 * hands the field to whichever model declines to look at the
+		 * damage, which is exactly backwards.
+		 */
+		if (!step)
+			continue;
 
 		/*
 		 * A table often fills only part of a sector, so the step need
@@ -817,6 +831,9 @@ int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
 			out->period = part[m].period;
 			out->outliers = part[m].outliers;
 			out->coverage = part[m].coverage;
+			out->slip = part[m].slip;
+			out->slip_byte = part[m].slip_byte;
+			out->crc_fixed = part[m].crc_fixed;
 		}
 		if (modes[m] == DR_MODE_BITS)
 			out->npool = part[m].npool;
@@ -869,6 +886,91 @@ struct pcand {
 	uint16_t mask;         /* which ones, as a bitmask over outliers  */
 };
 
+/*
+ * Look for a cell-phase correction that brings a re-framed tail back
+ * into line with the model.
+ *
+ * Scored against the prediction rather than against a re-fit, because a
+ * re-fit per trial costs a hundred times more and the prediction already
+ * extrapolates across the whole field - that is what a model is for.
+ * Only positions inside the span the model cannot explain are worth
+ * trying: a slip outside it would have broken the part that fits.
+ *
+ * Returns the number of bytes the best correction recovers, 0 if none is
+ * worth having.
+ */
+#define SLIP_MAX 6           /* cells a decoder can plausibly lose      */
+
+static int agree(const uint8_t *msg, const dr_fit *f, int off, int n)
+{
+	int i, k = 0;
+
+	for (i = 0; i < n; i++)
+		if (f->known[i] && f->pred[i] == msg[off + i])
+			k++;
+	return k;
+}
+
+static int find_slip(const dr_view *v, const dr_fit *f, uint8_t *best,
+                     int *at_out, int *slip_out)
+{
+	uint8_t *try = NULL;
+	int lo = -1, hi = -1, i, d, b;
+	int base, bestk = -1, gain;
+
+	*at_out = 0;
+	*slip_out = 0;
+
+	for (i = 0; i < v->data_len; i++)
+		if (f->known[i] && f->pred[i] != (v->msg + v->data_offset)[i]) {
+			if (lo < 0)
+				lo = i;
+			hi = i;
+		}
+	if (lo < 0 || hi - lo < 8)
+		return 0;              /* nothing re-framed, just damaged */
+
+	base = agree(v->msg, f, v->data_offset, v->data_len);
+
+	try = malloc((size_t)v->msg_len);
+	if (!try)
+		return 0;
+
+	for (b = lo; b <= hi; b++) {
+		int at = (v->data_offset + b) * v->stride;
+
+		for (d = -SLIP_MAX; d <= SLIP_MAX; d++) {
+			int k;
+
+			if (!d)
+				continue;
+			dr_decode_slipped(v, at, d, try);
+			k = agree(try, f, v->data_offset, v->data_len);
+			if (k > bestk) {
+				bestk = k;
+				*at_out = at;
+				*slip_out = d;
+				memcpy(best, try, (size_t)v->msg_len);
+			}
+		}
+	}
+	free(try);
+
+	/*
+	 * Insist on a real improvement. A slip that recovers a handful of
+	 * bytes is a coincidence; one that recovers a tail is the diagnosis.
+	 */
+	gain = bestk - base;
+	DBG("slip: damaged bytes %d..%d, base agree %d, best %d (%+d cells at "
+	    "byte %d), gain %d\n", lo, hi, base, bestk, *slip_out,
+	    *at_out / v->stride, gain);
+	if (gain < 16 || gain < v->data_len / 32) {
+		*slip_out = 0;
+		return 0;
+	}
+	return gain;
+}
+
 int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 {
 	dr_options defopt;
@@ -879,6 +981,11 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 	uint8_t *fixed = NULL;
 	dr_candidate *found = NULL;
 	int nfound = 0, fcap = 0;
+	const uint8_t *msg0;
+	uint8_t *slipped = NULL, *cmsg = NULL;
+	uint16_t base_syn;
+	int crc_may_be_damaged = 0;
+	int slip_at = 0, slip = 0, max_leave = 12, crc_fixed = 0;
 	int n, i, j, leave, nout = 0, rc = 0, have_fit = 0, have_model = 0;
 	long explored = 0;
 	double coverage;
@@ -904,6 +1011,65 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 		return 0;
 	}
 	have_fit = 1;
+
+	/*
+	 * Did the decoder lose its place rather than lose a bit?
+	 *
+	 * If a run of intervals was given one cell too many or too few,
+	 * the byte boundary moves and every byte after it decodes as
+	 * something else entirely - not corrupted, just re-framed. A model
+	 * that fits the head of a field and then collapses is the
+	 * signature, and no amount of bit-flipping repairs it, because the
+	 * bits are not wrong.
+	 *
+	 * The fitted prediction is what makes this cheap to test: it
+	 * extrapolates over the whole field whether or not the field
+	 * agrees, so a re-framed tail can simply be scored against it.
+	 */
+	{
+		dr_fit rep;
+
+		/*
+		 * Scored against the *repeat*, not against whichever model
+		 * won overall. A slip is exactly what breaks a repeat - the
+		 * bytes are right, the boundary is not - and a repeat
+		 * extrapolates over damage instead of abstaining on it,
+		 * which is what a search for the damage needs.
+		 */
+		if (fit_periodic(data, n, &rep) == 0) {
+			if (rep.outliers > 0) {
+				slipped = malloc((size_t)v->msg_len);
+				if (!slipped) {
+					fit_free(&rep);
+					rc = -1;
+					goto done;
+				}
+				find_slip(v, &rep, slipped, &slip_at, &slip);
+			}
+			fit_free(&rep);
+		}
+		if (slip) {
+			dr_fit g;
+			int ok = (fit_best(slipped + v->data_offset, n, &g) == 0);
+
+			DBG("slip: unslipped fit '%s' explains %d (%d out); "
+			    "slipped fit '%s' explains %d (%d out)\n",
+			    f.desc, f.explained, f.outliers,
+			    ok ? g.desc : "-", ok ? g.explained : -1,
+			    ok ? g.outliers : -1);
+			if (ok && g.explained > f.explained) {
+				fit_free(&f);
+				f = g;
+				data = slipped + v->data_offset;
+			} else {
+				slip = 0;
+			}
+		}
+		if (!slip) {
+			free(slipped);
+			slipped = NULL;
+		}
+	}
 
 	coverage = (f.explained + f.outliers)
 	        ? (double)f.explained / (double)(f.explained + f.outliers) : 0.0;
@@ -934,17 +1100,38 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 		         "too loose to trust", f.desc, coverage * 100.0);
 		goto done;
 	}
-	if (f.outliers > opt->max_outliers) {
-		snprintf(out->note, sizeof(out->note),
-		         "%s leaves %d byte(s) unexplained - too many to "
-		         "enumerate (raise --max-outliers)", f.desc, f.outliers);
-		goto done;
-	}
+	/*
+	 * The cap is on the *enumeration*, not on the model. Restoring
+	 * every outlier is a single reading however many there are, and it
+	 * is the one Occam nominates, so it is always tried; only the
+	 * combinations that leave some of them broken have to be bounded.
+	 */
+	if (f.outliers > opt->max_outliers)
+		max_leave = 0;
+
+	/*
+	 * Everything below is relative to the reading the model actually
+	 * fits - which is the re-framed one if a phase correction won.
+	 */
+	msg0 = slip ? slipped : v->msg;
+	base_syn = dr_crc16(msg0, v->msg_len);
+
+	/*
+	 * The stored CRC is only in doubt if the damage reaches it. A
+	 * sector whose last bytes fit the model has a CRC that was read
+	 * cleanly, and there is no excuse for touching it.
+	 */
+	for (i = v->data_len - 8; i < v->data_len; i++)
+		if (i >= 0 && f.known[i] && f.pred[i] != data[i])
+			crc_may_be_damaged = 1;
+	if (slip && slip_at < (v->msg_len - 2) * v->stride)
+		crc_may_be_damaged = 1;
 
 	masks = malloc((size_t)v->msg_bits * sizeof(uint16_t));
 	outpos = malloc((size_t)f.outliers * sizeof(int));
 	fixed = malloc((size_t)n);
-	if (!masks || !outpos || !fixed) {
+	cmsg = malloc((size_t)v->msg_len);
+	if (!masks || !outpos || !fixed || !cmsg) {
 		rc = -1;
 		goto done;
 	}
@@ -975,7 +1162,9 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 	for (leave = 0; leave <= nout && !nfound; leave++) {
 		int idx[24], t;
 
-		if (nout > 24 || leave > 12)
+		if (leave > max_leave)
+			break;
+		if (leave && (nout > 24 || leave > 12))
 			break;
 		if (leave > nout)
 			break;
@@ -988,8 +1177,8 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 			idx[i] = i;
 
 		for (;;) {
-			uint16_t syn = v->syndrome;
-			int bits[DR_MAX_WEIGHT], nb = 0, ok = 1;
+			uint16_t syn = base_syn;
+			int bits[DR_MAX_WEIGHT], nb = 0, ok = 1, ncrc;
 
 			explored++;
 
@@ -1018,6 +1207,61 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 				}
 			}
 
+			/*
+			 * A damaged CRC is still a measurement.
+			 *
+			 * The two CRC bytes sit at the end of the sector with
+			 * nothing protecting them, so damage that reaches the
+			 * tail corrupts them too - and then demanding an exact
+			 * match rejects the true reading and accepts whatever
+			 * else happens to match the corrupted target. When a
+			 * trustworthy model determines the data, the honest
+			 * question is how many of the 16 stored bits agree,
+			 * not whether all of them do. One wrong bit still
+			 * leaves a 1-in-3855 coincidence; two leaves 1 in 478,
+			 * which is where this stops.
+			 */
+			ncrc = 0;
+			if (ok && nb && syn && crc_may_be_damaged) {
+				uint16_t want, have;
+				uint8_t d[2];
+
+				/*
+				 * Ask what CRC the corrected data implies and
+				 * compare it with the two bytes as read,
+				 * rather than trying to steer the syndrome to
+				 * zero with bit masks - the masks of the
+				 * stored CRC's own bits are not unit vectors,
+				 * and treating them as if they were is a way
+				 * to be confidently wrong.
+				 */
+				memcpy(cmsg, msg0, (size_t)v->msg_len);
+				memcpy(cmsg + v->data_offset, fixed, (size_t)n);
+				want = dr_crc16(cmsg, v->msg_len - 2);
+				have = (uint16_t)((cmsg[v->msg_len - 2] << 8) |
+				                   cmsg[v->msg_len - 1]);
+				d[0] = (uint8_t)((want ^ have) >> 8);
+				d[1] = (uint8_t)((want ^ have) & 0xFF);
+
+				for (i = 0; i < 2; i++)
+					for (j = 0; j < 8; j++)
+						if (d[i] & (0x80 >> j))
+							ncrc++;
+				if (ncrc > opt->crc_budget ||
+				    nb + ncrc > DR_MAX_WEIGHT) {
+					ok = 0;
+				} else {
+					for (i = 0; i < 2; i++)
+						for (j = 0; j < 8; j++)
+							if (d[i] & (0x80 >> j))
+								bits[nb++] =
+								  (v->msg_len
+								   - 2 + i) * 8
+								  + j;
+					syn = 0;
+				}
+			}
+
 			if (ok && nb && !syn) {
 				if (nfound == fcap) {
 					int nc = fcap ? fcap * 2 : 16;
@@ -1032,12 +1276,16 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 
 					memset(cd, 0, sizeof(*cd));
 					cd->weight = nb;
+					cd->slip_at = slip_at;
+					cd->slip = slip;
 					for (j = 0; j < nb; j++) {
 						cd->bits[j] = bits[j];
 						cd->before[j] = (uint8_t)
-						  ((v->msg[bits[j] >> 3] >>
+						  ((msg0[bits[j] >> 3] >>
 						    (7 - (bits[j] & 7))) & 1);
 					}
+					if (ncrc > crc_fixed)
+						crc_fixed = ncrc;
 					cd->data_prior = dmodel_delta(&m, data,
 					                              fixed, n);
 					cd->log_likelihood = cd->data_prior;
@@ -1058,6 +1306,19 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 	}
 
 	out->explored = explored;
+	out->slip = slip;
+	out->slip_byte = slip_at / v->stride;
+	out->crc_fixed = crc_fixed;
+	if (slip && nfound)
+		snprintf(out->note, sizeof(out->note),
+		         "%.100s, once the decoder's %d-cell slip at byte %d "
+		         "is taken out%s", f.desc, slip < 0 ? -slip : slip,
+		         slip_at / v->stride,
+		         crc_fixed ? " - and the stored CRC is damaged too"
+		                   : "");
+	else if (crc_fixed)
+		snprintf(out->note, sizeof(out->note),
+		         "%.180s - and the stored CRC is damaged too", f.desc);
 
 	if (nfound > 0) {
 		double best;
@@ -1093,6 +1354,8 @@ done:
 	if (have_fit)
 		fit_free(&f);
 	free(found);
+	free(cmsg);
+	free(slipped);
 	free(fixed);
 	free(outpos);
 	free(masks);
