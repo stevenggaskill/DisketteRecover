@@ -69,6 +69,43 @@ check "one reading, from the data alone" "$pc" "1"
 if cmp -s "$out/ref.img" "$out/fp.img"; then ok "4 dropped bits recovered exactly"
 else bad "4 dropped bits recovered exactly"; fi
 
+echo "== the counter model, on a table of incrementing records"
+# Tables of counters are everywhere on a disk - index tables, timing
+# lists, sector maps. The model has to get their carries right, or it
+# invents outliers and the CRC then matches anything.
+if command -v python3 >/dev/null 2>&1; then
+	python3 - "$out/counter.img" <<'EOF'
+import sys
+n = 80*2*9*512
+b = bytearray(n)
+v = 0x558557
+for i in range(0, n - 2, 3):          # 3-byte LE records, step 0x2002
+    b[i] = v & 0xFF; b[i+1] = (v >> 8) & 0xFF; b[i+2] = (v >> 16) & 0xFF
+    v = (v + 0x2002) & 0xFFFFFF
+open(sys.argv[1], "wb").write(bytes(b))
+EOF
+	"$dr" convert "$out/counter.img" --out "$out/counter.hfe" >/dev/null 2>&1
+	"$dr" convert "$out/counter.hfe" --out "$out/counter_ref.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	# drop six transitions, the way a weak patch of media would
+	"$dr" damage "$out/counter.hfe" --sector 5 \
+	      --bits 811,1509,1622,2743,3004,3971 \
+	      --out "$out/cbad.hfe" >/dev/null 2>&1
+	check "one bad sector" "$(badcount "$out/cbad.hfe")" "1"
+
+	cj=$("$dr" repair "$out/cbad.hfe" --mode pattern --json 2>/dev/null)
+	cc=$(printf '%s' "$cj" | sed -n 's/^{"count":\([0-9]*\).*/\1/p')
+	check "the counter model finds one reading" "$cc" "1"
+
+	"$dr" repair "$out/cbad.hfe" --apply 0 --out "$out/cfix.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/counter_ref.img" "$out/cfix.img"
+	then ok "counter table recovered exactly"
+	else bad "counter table recovered exactly"; fi
+else
+	echo "  skip counter tests (no python3)"
+fi
+
 echo "== --restore-only narrows the search"
 a=$("$dr" repair "$out/b2.hfe" --json 2>/dev/null |
     sed -n 's/.*"count":\([0-9]*\).*/\1/p' | head -1)

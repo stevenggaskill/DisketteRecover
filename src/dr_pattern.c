@@ -42,19 +42,388 @@ struct dr_model {
 	int       have2;
 };
 
+/* ------------------------------------------------------------------ */
+/* Fitting a model to the data field                                   */
+/* ------------------------------------------------------------------ */
+/*
+ * Both models below produce the same thing: a predicted byte for every
+ * position it has an opinion about. The repair engine then works on the
+ * positions where the prediction and the read disagree.
+ *
+ * The distinction that matters is between a model that is wrong and one
+ * that has no opinion. A model which mistakes a legitimate carry for an
+ * error manufactures outliers, and every manufactured outlier is another
+ * free byte for the CRC to match by luck. Thirty free bytes against
+ * sixteen bits of CRC will always produce a "valid" reading, and it will
+ * always be nonsense. So a model has to explain the regular parts of the
+ * field exactly, or admit it cannot.
+ */
+typedef struct {
+	uint8_t *pred;
+	uint8_t *known;
+	int      outliers;
+	int      explained;
+	dr_fit_kind kind;
+	int      period;
+	int      rec, phase, big_endian;
+	uint64_t step, v0;
+	char     desc[160];
+} dr_fit;
+
+static void fit_free(dr_fit *f)
+{
+	free(f->pred);
+	free(f->known);
+	f->pred = f->known = NULL;
+}
+
+static int fit_alloc(dr_fit *f, int n)
+{
+	memset(f, 0, sizeof(*f));
+	f->pred = calloc((size_t)n, 1);
+	f->known = calloc((size_t)n, 1);
+	return (f->pred && f->known) ? 0 : -1;
+}
+
+/*
+ * Score a fit by what it would cost to describe the field with it: every
+ * byte it gets right is free, every byte it gets wrong costs a byte to
+ * correct, and every byte it declines to model costs one too.
+ *
+ * Ranking by "fewest outliers" alone is a trap - it rewards a model for
+ * abstaining. A longer record size that quietly says nothing about the
+ * damaged bytes shows no outliers at all and looks like the better fit,
+ * right up until there is nothing left to correct.
+ */
+static long fit_score(const dr_fit *f, int n)
+{
+	int unknown = n - f->explained - f->outliers;
+
+	return (long)f->explained - 8L * f->outliers - (long)unknown;
+}
+
+static void fit_count(dr_fit *f, const uint8_t *d, int n)
+{
+	int i;
+
+	f->outliers = f->explained = 0;
+	for (i = 0; i < n; i++) {
+		if (!f->known[i])
+			continue;
+		if (f->pred[i] == d[i])
+			f->explained++;
+		else
+			f->outliers++;
+	}
+}
+
+/* A fit is only usable if what it claims to model, it models almost
+ * perfectly - 90% is not "mostly right", it is fifty invented outliers
+ * in a 512-byte sector. A narrow fit that is trustworthy beats a broad
+ * one that is not, so trust is the first comparison and description
+ * length only the tie-break. */
+static int fit_trusted(const dr_fit *f)
+{
+	int seen = f->explained + f->outliers;
+
+	return seen > 0 && f->explained * 10 >= seen * 9;
+}
+
+/* ---- the repeat a field almost obeys ------------------------------ */
 static const int periods[] = {
 	1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256
 };
 #define NPERIODS ((int)(sizeof(periods) / sizeof(periods[0])))
 
-/* ------------------------------------------------------------------ */
-/* Find the repeat the data field almost obeys                         */
-/* ------------------------------------------------------------------ */
+static int fit_periodic(const uint8_t *data, int n, dr_fit *best)
+{
+	dr_fit cur;
+	int pi, i, r, have = 0;
+
+	memset(best, 0, sizeof(*best));
+
+	for (pi = 0; pi < NPERIODS; pi++) {
+		int p = periods[pi];
+		int modal[MAX_PERIOD];
+
+		if (p > n / 4)
+			break;
+
+		for (r = 0; r < p; r++) {
+			int c[256], j, bestv = 0, bestc = -1;
+
+			memset(c, 0, sizeof(c));
+			for (j = r; j < n; j += p)
+				c[data[j]]++;
+			for (j = 0; j < 256; j++)
+				if (c[j] > bestc) {
+					bestc = c[j];
+					bestv = j;
+				}
+			modal[r] = bestv;
+		}
+
+		if (fit_alloc(&cur, n) < 0)
+			return -1;
+		for (i = 0; i < n; i++) {
+			cur.pred[i] = (uint8_t)modal[i % p];
+			cur.known[i] = 1;
+		}
+		cur.kind = DR_FIT_PERIODIC;
+		cur.period = p;
+		fit_count(&cur, data, n);
+		snprintf(cur.desc, sizeof(cur.desc),
+		         "period %d repeat", p);
+
+		if (!have || fit_score(&cur, n) > fit_score(best, n)) {
+			if (have)
+				fit_free(best);
+			*best = cur;
+			have = 1;
+		} else {
+			fit_free(&cur);
+		}
+		if (have && !best->outliers)
+			break;
+	}
+	return have ? 0 : -1;
+}
+
+/* ---- a counter: fixed-size records advancing by a fixed step ------ */
+static int cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return (x < y) ? -1 : (x > y);
+}
+
+static uint64_t mode_u64(uint64_t *v, int n, int *count)
+{
+	int i, run = 1, bestn = 0;
+	uint64_t best = 0;
+
+	if (n <= 0) {
+		*count = 0;
+		return 0;
+	}
+	qsort(v, (size_t)n, sizeof(*v), cmp_u64);
+	for (i = 1; i <= n; i++) {
+		if (i < n && v[i] == v[i - 1]) {
+			run++;
+			continue;
+		}
+		if (run > bestn) {
+			bestn = run;
+			best = v[i - 1];
+		}
+		run = 1;
+	}
+	*count = bestn;
+	return best;
+}
+
+static uint64_t rec_value(const uint8_t *d, int off, int rec, int be)
+{
+	uint64_t v = 0;
+	int k;
+
+	if (be)
+		for (k = 0; k < rec; k++)
+			v = (v << 8) | d[off + k];
+	else
+		for (k = rec - 1; k >= 0; k--)
+			v = (v << 8) | d[off + k];
+	return v;
+}
+
+static void rec_store(uint8_t *d, int off, int rec, int be, uint64_t v)
+{
+	int k;
+
+	if (be)
+		for (k = rec - 1; k >= 0; k--) {
+			d[off + k] = (uint8_t)(v & 0xFF);
+			v >>= 8;
+		}
+	else
+		for (k = 0; k < rec; k++) {
+			d[off + k] = (uint8_t)(v & 0xFF);
+			v >>= 8;
+		}
+}
+
+/*
+ * Tables of counters are everywhere on a disk - index tables, timing
+ * lists, sector maps, directory offsets. Modelling the record as one
+ * integer rather than as independent byte columns is what makes carries
+ * come out right: a column-wise model sees the carry that ticks a high
+ * byte over as an error and "corrects" it, which is exactly how a search
+ * talks itself into a thirty-byte answer.
+ *
+ * Record alignment matters as much as record size. A table of 24-bit
+ * counters that starts one byte into the field looks, column by column,
+ * like a bizarre permutation; lined up on its real boundary it is plain
+ * little-endian with a constant step.
+ */
+static int fit_counter(const uint8_t *data, int n, dr_fit *best)
+{
+	dr_fit cur;
+	uint64_t *diffs, *v0s, *win;
+	int rec, phase, be, have = 0;
+	const int W = 8;               /* records voting on the local origin */
+
+	memset(best, 0, sizeof(*best));
+
+	diffs = malloc((size_t)(n + 1) * sizeof(uint64_t));
+	v0s   = malloc((size_t)(n + 1) * sizeof(uint64_t));
+	win   = malloc((size_t)(2 * W + 2) * sizeof(uint64_t));
+	if (!diffs || !v0s || !win) {
+		free(diffs); free(v0s); free(win);
+		return -1;
+	}
+
+	for (rec = 1; rec <= 8; rec++) {
+	for (phase = 0; phase < rec; phase++) {
+	for (be = 0; be < 2; be++) {
+		int nrec = (n - phase) / rec;
+		uint64_t mask, step;
+		int i, r, nstep, minstep, known = 0;
+
+		if (nrec < 16)
+			continue;
+		if (rec == 1 && be)
+			continue;                /* no byte order to choose */
+		mask = (rec >= 8) ? ~(uint64_t)0
+		                  : (((uint64_t)1 << (8 * rec)) - 1);
+
+		for (i = 0; i + 1 < nrec; i++)
+			diffs[i] = (rec_value(data, phase + (i + 1) * rec, rec, be) -
+			            rec_value(data, phase + i * rec, rec, be)) & mask;
+		step = mode_u64(diffs, nrec - 1, &nstep);
+
+		/*
+		 * A table often fills only part of a sector, so the step need
+		 * not carry a majority of the whole field - but it does have
+		 * to carry a real run of records, not a coincidence.
+		 */
+		minstep = nrec / 8;
+		if (minstep < 6)
+			minstep = 6;
+		if (nstep < minstep)
+			continue;
+
+		for (r = 0; r < nrec; r++)
+			v0s[r] = (rec_value(data, phase + r * rec, rec, be) -
+			          (uint64_t)r * step) & mask;
+
+		if (fit_alloc(&cur, n) < 0) {
+			free(diffs); free(v0s); free(win);
+			return -1;
+		}
+
+		/*
+		 * Decide the origin locally. Where a run of records agrees on
+		 * one origin, the model owns that stretch and any record that
+		 * disagrees inside it is damage. Where the neighbourhood
+		 * cannot agree - past the end of the table, or in data that
+		 * was never a counter - the model says nothing at all, which
+		 * is the whole point: a byte it has no opinion about is not a
+		 * byte the CRC gets to play with.
+		 */
+		for (r = 0; r < nrec; r++) {
+			int lo = r - W, hi = r + W, nw = 0, sup;
+			uint64_t v0;
+
+			if (lo < 0) lo = 0;
+			if (hi >= nrec) hi = nrec - 1;
+			for (i = lo; i <= hi; i++)
+				win[nw++] = v0s[i];
+			v0 = mode_u64(win, nw, &sup);
+			if (sup * 5 < nw * 3)          /* under 60% agreement */
+				continue;
+
+			rec_store(cur.pred, phase + r * rec, rec, be,
+			          (v0 + (uint64_t)r * step) & mask);
+			memset(cur.known + phase + r * rec, 1, (size_t)rec);
+			known += rec;
+		}
+
+		/* A model that only recognises a corner of the field is not
+		 * worth preferring over one that covers it. */
+		if (known * 8 < n) {
+			fit_free(&cur);
+			continue;
+		}
+
+		cur.kind = DR_FIT_COUNTER;
+		cur.rec = rec;
+		cur.phase = phase;
+		cur.big_endian = be;
+		cur.step = step;
+		cur.v0 = v0s[0];
+		fit_count(&cur, data, n);
+		snprintf(cur.desc, sizeof(cur.desc),
+		         "%d-byte %s records at offset %d counting by 0x%llX, "
+		         "over %d of %d bytes",
+		         rec, be ? "big-endian" : "little-endian", phase,
+		         (unsigned long long)step, known, n);
+
+		if (!have || (fit_trusted(&cur) && !fit_trusted(best)) ||
+		    (fit_trusted(&cur) == fit_trusted(best) &&
+		     (fit_score(&cur, n) > fit_score(best, n) ||
+		      (fit_score(&cur, n) == fit_score(best, n) &&
+		       cur.rec < best->rec)))) {
+			if (have)
+				fit_free(best);
+			*best = cur;
+			have = 1;
+		} else {
+			fit_free(&cur);
+		}
+	}}}
+
+	free(diffs);
+	free(v0s);
+	free(win);
+	return have ? 0 : -1;
+}
+
+/* Pick whichever model describes the field best, trusted fits first. */
+static int fit_best(const uint8_t *data, int n, dr_fit *out)
+{
+	dr_fit a, b;
+	int ha, hb;
+
+	ha = (fit_periodic(data, n, &a) == 0);
+	hb = (fit_counter(data, n, &b) == 0);
+
+	if (ha && hb) {
+		int ta = fit_trusted(&a), tb = fit_trusted(&b);
+
+		if (ta != tb) {
+			if (tb) { fit_free(&a); *out = b; }
+			else    { fit_free(&b); *out = a; }
+			return 0;
+		}
+		if (fit_score(&b, n) > fit_score(&a, n)) {
+			fit_free(&a);
+			*out = b;
+		} else {
+			fit_free(&b);
+			*out = a;
+		}
+		return 0;
+	}
+	if (ha) { *out = a; return 0; }
+	if (hb) { *out = b; return 0; }
+	return -1;
+}
+
 int dr_pattern_analyse(const dr_view *v, dr_pattern_info *info)
 {
 	const uint8_t *data;
-	int n, pi, i, best_p = 1, best_out = -1;
-	int hist[256];
+	dr_fit f;
+	int n, i, hist[256];
 
 	memset(info, 0, sizeof(*info));
 	if (!v || !v->msg || v->data_len <= 0)
@@ -76,45 +445,25 @@ int dr_pattern_analyse(const dr_view *v, dr_pattern_info *info)
 		}
 	}
 
-	/* Shortest period that explains the most bytes. Longer periods can
-	 * only fit better, so they have to beat the incumbent outright. */
-	for (pi = 0; pi < NPERIODS; pi++) {
-		int p = periods[pi];
-		int modal[MAX_PERIOD], out = 0, r;
-
-		if (p > n / 4)
-			break;
-
-		for (r = 0; r < p; r++) {
-			int c[256], j, bestv = 0, bestc = -1;
-
-			memset(c, 0, sizeof(c));
-			for (j = r; j < n; j += p)
-				c[data[j]]++;
-			for (j = 0; j < 256; j++)
-				if (c[j] > bestc) {
-					bestc = c[j];
-					bestv = j;
-				}
-			modal[r] = bestv;
-		}
-
-		for (i = 0; i < n; i++)
-			if (data[i] != modal[i % p])
-				out++;
-
-		if (best_out < 0 || out < best_out) {
-			best_out = out;
-			best_p = p;
-			memcpy(info->modal, modal, (size_t)p * sizeof(int));
-		}
-		if (!out)
-			break;
+	if (fit_best(data, n, &f) < 0) {
+		info->kind = DR_FIT_NONE;
+		snprintf(info->desc, sizeof(info->desc), "no usable regularity");
+		return 0;
 	}
 
-	info->period = best_p;
-	info->outliers = best_out < 0 ? n : best_out;
-	info->coverage = 1.0 - (double)info->outliers / (double)n;
+	info->kind = f.kind;
+	info->period = f.period;
+	info->rec = f.rec;
+	info->phase = f.phase;
+	info->big_endian = f.big_endian;
+	info->step = f.step;
+	info->v0 = f.v0;
+	info->outliers = f.outliers;
+	info->explained = f.explained;
+	info->coverage = (f.explained + f.outliers)
+	        ? (double)f.explained / (double)(f.explained + f.outliers) : 0.0;
+	snprintf(info->desc, sizeof(info->desc), "%s", f.desc);
+	fit_free(&f);
 	return 0;
 }
 
@@ -284,15 +633,16 @@ struct pcand {
 int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 {
 	dr_options defopt;
-	dr_pattern_info info;
+	dr_fit f;
 	struct dmodel m;
 	uint16_t *masks = NULL;
 	int *outpos = NULL;
 	uint8_t *fixed = NULL;
 	dr_candidate *found = NULL;
 	int nfound = 0, fcap = 0;
-	int n, i, j, leave, rc = 0;
+	int n, i, j, leave, nout = 0, rc = 0, have_fit = 0, have_model = 0;
 	long explored = 0;
+	double coverage;
 	const uint8_t *data;
 
 	memset(out, 0, sizeof(*out));
@@ -305,39 +655,55 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 	if (!v || !v->msg || v->data_len <= 0)
 		return -1;
 
-	if (dr_pattern_analyse(v, &info) < 0)
-		return -1;
-
-	out->period = info.period;
-	out->outliers = info.outliers;
-	out->coverage = info.coverage;
-
 	data = v->msg + v->data_offset;
 	n = v->data_len;
 
-	if (!info.outliers) {
+	if (fit_best(data, n, &f) < 0) {
 		snprintf(out->note, sizeof(out->note),
-		         "the data field already repeats exactly - the CRC "
-		         "error is not in the data");
+		         "no usable regularity in this data - nothing for "
+		         "Occam to work with");
 		return 0;
 	}
-	if (info.coverage < 0.5) {
-		snprintf(out->note, sizeof(out->note),
-		         "no usable repeat in this data (best period %d "
-		         "explains only %.0f%% of it) - nothing for Occam to "
-		         "work with", info.period, info.coverage * 100.0);
-		return 0;
+	have_fit = 1;
+
+	coverage = (f.explained + f.outliers)
+	        ? (double)f.explained / (double)(f.explained + f.outliers) : 0.0;
+	out->period = f.kind == DR_FIT_PERIODIC ? f.period : f.rec;
+	out->outliers = f.outliers;
+	out->coverage = coverage;
+
+	if (!f.outliers) {
+		if (f.explained >= n)
+			snprintf(out->note, sizeof(out->note),
+			         "%s explains the field exactly - the CRC error "
+			         "is not in the data", f.desc);
+		else
+			snprintf(out->note, sizeof(out->note),
+			         "%s, and the part it covers is intact - the "
+			         "damage is in the %d byte(s) it cannot model",
+			         f.desc, n - f.explained);
+		goto done;
 	}
-	if (info.outliers > opt->max_outliers) {
+	/*
+	 * A model that only half fits is worse than none: its disagreements
+	 * are its own failures, not the disk's, and every one of them is a
+	 * byte the CRC can then match by luck.
+	 */
+	if (coverage < 0.90) {
 		snprintf(out->note, sizeof(out->note),
-		         "period %d leaves %d bytes off-pattern - too many to "
-		         "enumerate (raise --max-outliers)",
-		         info.period, info.outliers);
-		return 0;
+		         "best fit (%s) explains only %.0f%% of the field - "
+		         "too loose to trust", f.desc, coverage * 100.0);
+		goto done;
+	}
+	if (f.outliers > opt->max_outliers) {
+		snprintf(out->note, sizeof(out->note),
+		         "%s leaves %d byte(s) unexplained - too many to "
+		         "enumerate (raise --max-outliers)", f.desc, f.outliers);
+		goto done;
 	}
 
 	masks = malloc((size_t)v->msg_bits * sizeof(uint16_t));
-	outpos = malloc((size_t)info.outliers * sizeof(int));
+	outpos = malloc((size_t)f.outliers * sizeof(int));
 	fixed = malloc((size_t)n);
 	if (!masks || !outpos || !fixed) {
 		rc = -1;
@@ -348,24 +714,31 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 		rc = -1;
 		goto done;
 	}
+	have_model = 1;
 
-	j = 0;
 	for (i = 0; i < n; i++)
-		if (data[i] != info.modal[i % info.period])
-			outpos[j++] = i;
+		if (f.known[i] && f.pred[i] != data[i])
+			outpos[nout++] = i;
+
+	/* How much is genuinely in doubt, against the 16 bits the CRC has? */
+	for (i = 0; i < nout; i++) {
+		uint8_t diff = (uint8_t)(data[outpos[i]] ^ f.pred[outpos[i]]);
+		for (j = 0; j < 8; j++)
+			if (diff & (0x80 >> j))
+				out->uncertain_bits++;
+	}
 
 	/*
 	 * Enumerate by how many outliers we decline to correct. Restoring
 	 * the whole pattern is the simplest explanation, so it is tried
-	 * first; each byte we have to leave broken makes the reading less
-	 * likely, so those come later.
+	 * first; each byte left broken makes the reading less likely.
 	 */
-	for (leave = 0; leave <= info.outliers && !nfound; leave++) {
+	for (leave = 0; leave <= nout && !nfound; leave++) {
 		unsigned long combo, limit;
 
-		if (info.outliers > 20)
+		if (nout > 20)
 			break;
-		limit = 1UL << info.outliers;
+		limit = 1UL << nout;
 
 		for (combo = 0; combo < limit; combo++) {
 			uint16_t syn = v->syndrome;
@@ -376,16 +749,16 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 			explored++;
 
 			memcpy(fixed, data, (size_t)n);
-			for (i = 0; i < info.outliers; i++) {
+			for (i = 0; i < nout && ok; i++) {
 				int pos = outpos[i];
 				uint8_t want, diff;
 
 				if (combo & (1UL << i))
 					continue;          /* left broken */
-				want = (uint8_t)info.modal[pos % info.period];
+				want = f.pred[pos];
 				fixed[pos] = want;
 				diff = (uint8_t)(want ^ data[pos]);
-				for (j = 0; j < 8 && ok; j++) {
+				for (j = 0; j < 8; j++) {
 					int bit;
 					if (!(diff & (0x80 >> j)))
 						continue;
@@ -425,7 +798,6 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 	}
 
 	out->explored = explored;
-	dmodel_free(&m);
 
 	if (nfound > 0) {
 		double best;
@@ -448,16 +820,18 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 
 	if (!out->note[0])
 		snprintf(out->note, sizeof(out->note),
-		         "period %d explains %.1f%% of the field "
-		         "(%d distinct value(s), commonest 0x%02X x%d)",
-		         info.period, info.coverage * 100.0, info.distinct,
-		         info.top_value, info.top_count);
+		         "%s - explains %.1f%% of the field", f.desc,
+		         coverage * 100.0);
 
 	out->list = found;
 	out->count = nfound;
 	found = NULL;
 
 done:
+	if (have_model)
+		dmodel_free(&m);
+	if (have_fit)
+		fit_free(&f);
 	free(found);
 	free(fixed);
 	free(outpos);

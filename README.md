@@ -111,14 +111,28 @@ suit different damage. `--mode auto` (the default) tries them in order of
 how decisive their evidence is when it applies.
 
 **Restoring the data's own regularity** (`--mode pattern`). Sector data
-is very often not random: a freshly formatted MS-DOS disk is 512 bytes of
-`0xF6`, an unused directory block is `0x00` or `0xE5`, a padded tail
-repeats. When 506 of 512 bytes read `0xF6` and the other six are each
-`0xF6` with a single bit missing, Occam has already answered the
-question - and the CRC only has to confirm it. This engine finds the
-repeat the field almost obeys, lists the bytes that break it, and
-enumerates by how few of them it has to leave broken. It needs no flux at
-all, and when it fires it is by far the most decisive thing available.
+is very often not random, and it is regular in two different ways, so the
+engine fits both and keeps whichever describes the field better.
+
+*Repeats.* A freshly formatted MS-DOS disk is 512 bytes of `0xF6`, an
+unused directory block is `0x00` or `0xE5`, a padded tail repeats. When
+506 of 512 bytes read `0xF6` and the other six are each `0xF6` with a
+single bit missing, Occam has already answered the question and the CRC
+only has to confirm it.
+
+*Counters.* Index tables, timing lists, sector maps and directory offsets
+are all fixed-size records holding a number that goes up by a constant.
+Modelling the record as one integer rather than as independent byte
+columns is what makes the carries come out right - and getting carries
+wrong is not a small error, it is how a search talks itself into a
+thirty-byte answer (see below). Record **alignment** matters as much as
+record size: a table of 24-bit counters that starts one byte into the
+field looks, column by column, like a bizarre byte permutation; lined up
+on its real boundary it is plain little-endian with a constant step.
+
+Either way the engine lists the bytes that break the model and enumerates
+by how few of them it has to leave broken. It needs no flux at all, and
+when it fires it is by far the most decisive thing available.
 
 **Re-binning the flux** (`--mode rebin`, whenever there are timings and
 the track is MFM). Real disks rarely lose a bit outright; they put a
@@ -311,10 +325,44 @@ the first reading tried. Both sectors, byte-exact, applied and verified
 by libhxcfe's own decoder.
 
 **Disk 2** - a 1.44 MB dump, 2882 sectors, nine bad, and this time the
-sectors hold real data rather than filler. Two repair uniquely; the rest
-stay ambiguous and are reported as such rather than guessed. But one of
-them is a word-processor document, and there the data model speaks for
-itself - the top four candidates all agree on:
+sectors hold real data rather than filler. Three repair uniquely; the
+rest stay ambiguous and are reported as such rather than guessed.
+
+The first of them, track 0 side 0 sector 15, is worth following through.
+The flux says the damage runs from byte 182 to byte 255 - intervals 10 to
+16 sigma from any legal bin centre, a `2.08T` called a 4T next to a
+`3.42T` called a 2T. Re-binning narrows it but cannot settle it. The data
+is what settles it:
+
+```
+data      : 3-byte little-endian records at offset 1 counting by 0x2002,
+            over 510 of 512 bytes - explains 97.6% of the field
+search    : restoring the repeat - 12 byte(s) break it; 794 reading(s) tested
+result    : 1 CRC-valid reading(s) from the data model
+budget    : 794 reading(s) were possible; a 16-bit CRC passes ~0.0121 of them
+            by chance, so the single survivor is ~98.8% likely to be right
+
+ rank  bytes  bits  restore  remove  data evidence
+    0      8    13       13       0      70.0 nats
+```
+
+Thirteen bits, every one of them a reversal put back, every one inside
+the span the flux independently flagged.
+
+That sector is also where an earlier, sloppier version of this engine
+went wrong, and the failure is instructive. Modelling the record as three
+independent byte columns made the high byte look constant, so every
+legitimate carry looked like an error - 34 outliers instead of 12. Given
+34 free bytes, the search duly produced a CRC-valid reading that changed
+30 of them, most at the carry points. It was nonsense, and it was
+*guaranteed*: 2^34 candidates against a CRC that accepts one in 65536
+will always turn something up. **The number that matters is not whether a
+reading passes the CRC but how many readings were on offer** - which is
+why the tool now reports exactly that.
+
+One of the still-unrepaired sectors is a word-processor document, and
+there the data model speaks for itself - the top four candidates all
+agree on:
 
 ```
 byte 218: 0x23 -> 0x63    '#' -> 'c'
@@ -352,6 +400,9 @@ That gives a usable ranking of causes, most likely first:
 | **speed drift** | motor wow, or a different drive | every interval scales together | none, if the PLL tracks | absorbed by the fitted model |
 | **weak / fuzzy bits** | deliberate protection, or unmagnetised media | differs between revolutions | not repeatable | none here |
 | **burst / erasure** | scratch or contamination | many implausible intervals over a span | many bits | Disk 1's tracks 72-73 |
+
+Across both disks, 27 bit errors now have a verifiable truth and all 27
+are reversals that went missing.
 
 Two things follow, and both are built in. `--restore-only` searches only
 for reversals to put *back*, which is what the evidence says errors are;

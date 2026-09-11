@@ -193,7 +193,7 @@ typedef struct {
 	int           period;           /* the repeat it locked onto       */
 	int           outliers;         /* bytes that break the pattern    */
 	double        coverage;         /* fraction of bytes on-pattern    */
-	char          note[160];
+	char          note[256];
 } dr_repair_result;
 
 typedef enum {
@@ -263,15 +263,27 @@ int         dr_rebin_search(dr_view *v, const dr_options *o,
 int         dr_pattern_search(dr_view *v, const dr_options *o,
                               dr_repair_result *out);
 
+/* Which regularity the data field turned out to obey. */
+typedef enum {
+	DR_FIT_NONE = 0,
+	DR_FIT_PERIODIC,        /* byte[i] == modal[i mod period]         */
+	DR_FIT_COUNTER          /* fixed-size records counting by a step  */
+} dr_fit_kind;
+
 /* Describe the regularity found, for `inspect`. */
 typedef struct {
-	int    period;
-	int    outliers;
+	dr_fit_kind kind;
+	int    period;          /* periodic fit: the repeat length        */
+	int    rec, phase;      /* counter fit: record size and alignment */
+	int    big_endian;
+	uint64_t step, v0;
+	int    outliers;        /* bytes the model does not explain       */
+	int    explained;
 	double coverage;
-	int    modal[256];      /* the repeating pattern, `period` long   */
 	int    distinct;        /* distinct byte values in the field      */
 	int    top_value;
 	int    top_count;
+	char   desc[160];
 } dr_pattern_info;
 
 int         dr_pattern_analyse(const dr_view *v, dr_pattern_info *info);

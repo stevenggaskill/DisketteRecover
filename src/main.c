@@ -349,6 +349,36 @@ static void print_view(dr_view *v, int top)
 
 /* ------------------------------------------------------------------ */
 /*
+ * What a CRC-valid reading is actually worth.
+ *
+ * A 16-bit CRC lets one reading in 65536 through by chance, so the
+ * question is never "does it pass" but "how many readings were even on
+ * offer". A model that narrows the field to a few hundred candidates
+ * makes a single survivor decisive; a search that leaves thirty bytes
+ * free will always find one, and it will mean nothing.
+ */
+static void print_budget(dr_repair_result *r)
+{
+	double chance;
+
+	if (r->explored > 0) {
+		chance = (double)r->explored / 65536.0;
+		printf("budget    : %ld reading(s) were possible; a 16-bit CRC "
+		       "passes ~%.3g of them\n", r->explored, chance);
+		if (r->count == 1 && chance < 0.2)
+			printf("            by chance, so the single survivor is "
+			       "~%.1f%% likely to be right\n",
+			       100.0 * (1.0 - chance));
+		else if (chance > 2.0)
+			printf("            by chance - too many to trust any "
+			       "single survivor\n");
+	}
+	if (r->uncertain_bits > 16)
+		printf("            %d message bit(s) are in doubt; the CRC "
+		       "pins down 16\n", r->uncertain_bits);
+}
+
+/*
  * The zoomed view: for each byte, the sixteen cells it occupies, the bit
  * they decode to, and the flux interval that put each reversal where it
  * is. This is the picture the whole tool is built around - everything
@@ -444,6 +474,8 @@ static void print_pattern(dr_view *v, dr_repair_result *r, int limit)
 		                       : "NOT a clear winner - inspect first");
 	}
 
+	print_budget(r);
+
 	printf("\n rank  bytes  bits  restore  remove  data evidence  "
 	       "changed bytes\n");
 	printf(" ----  -----  ----  -------  ------  -------------  "
@@ -518,17 +550,7 @@ static void print_rebin(dr_view *v, dr_repair_result *r, int limit)
 		                       : "NOT a clear winner - inspect before applying");
 	}
 
-	/* A 16-bit CRC can only settle 16 unknowns. Say plainly when the
-	 * disturbed region carries more than that. */
-	if (r->uncertain_bits > 0) {
-		printf("budget    : %d message bit(s) still in doubt across the "
-		       "disturbed region;\n"
-		       "            a 16-bit CRC pins down 16, so expect ~%.3g "
-		       "reading(s) to pass it\n",
-		       r->uncertain_bits,
-		       r->uncertain_bits > 16
-		           ? pow(2.0, r->uncertain_bits - 16) : 1.0);
-	}
+	print_budget(r);
 	if (r->current_cost > 0.0)
 		printf("            re-binning explains the timings far better "
 		       "than the decoder did:\n"
