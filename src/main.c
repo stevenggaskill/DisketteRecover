@@ -946,7 +946,7 @@ static void print_fs(dr_ctx *c, int idx)
 	if (!fs)
 		return;
 	in = dr_fs_stat(fs);
-	if (dr_fs_locate(fs, idx, &loc) != 0)
+	if (dr_fs_locate(fs, c, idx, &loc) != 0)
 		return;
 
 	printf("filesystem: %s, %d sectors/track, %d head(s), %d file(s) in the "
@@ -970,7 +970,7 @@ static const uint8_t *mirror_for(dr_ctx *c, dr_view *v, int idx,
 
 	*proven = 0;
 	*ndiff = 0;
-	if (!fs || dr_fs_locate(fs, idx, loc) != 0)
+	if (!fs || dr_fs_locate(fs, c, idx, loc) != 0)
 		return NULL;
 	m = dr_fs_mirror(fs, loc);
 	if (!m || v->data_len != 512)
@@ -1036,7 +1036,7 @@ static void print_referee(dr_ctx *c, dr_view *v, dr_repair_result *r,
 	char note[200];
 
 	note[0] = 0;
-	if (!fs || dr_fs_locate(fs, idx, &loc) != 0)
+	if (!fs || dr_fs_locate(fs, c, idx, &loc) != 0)
 		return;
 	if (loc.area == DR_AREA_FREE || loc.area == DR_AREA_OUTSIDE) {
 		dr_fs_verdict vd;
@@ -1146,7 +1146,7 @@ static int write_variants(args *a, int idx, dr_view *v,
 		    dr_export(cc, path, a->format) == 0) {
 			wrote++;
 			vfs = dr_fs_open(cc);
-			if (vfs && dr_fs_locate(vfs, idx, &loc) == 0 &&
+			if (vfs && dr_fs_locate(vfs, cc, idx, &loc) == 0 &&
 			    dr_fs_score(vfs, &loc, msg + v->data_offset,
 			                v->data_len, &vd) == 0 && vd.checked)
 				scored = 1;
@@ -1208,6 +1208,43 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 	}
 
 	margin = top_margin(&r);
+
+	/* Before any of that is weighed: is there a second copy of these
+	 * bytes on this disk that something independent confirms? A proof
+	 * outranks every ranking, so it is taken first and the search's
+	 * answer is not consulted at all. */
+	if (apply) {
+		dr_fs *fs = fs_of(c);
+		dr_fs_loc loc;
+		const uint8_t *m = NULL;
+		uint8_t sis[512];
+		char how[200];
+		int proven = 0, ndiff = 0;
+
+		how[0] = 0;
+		m = mirror_for(c, v, idx, &loc, &proven, &ndiff);
+		if (!proven)
+			m = NULL;
+		if (!m && fs && dr_fs_locate(fs, c, idx, &loc) == 0 &&
+		    v->data_len == (int)sizeof(sis) &&
+		    dr_fs_sister(fs, &loc, sis, v->data_len, how,
+		                 (int)sizeof(how)) == 1) {
+			m = sis;
+			proven = 2;
+		}
+		if (m && dr_set_data(c, v, m, v->data_len) == 0) {
+			printf(" %3d/%d s%-3d  %-8s  ",
+			       sl[idx].track, sl[idx].side, sl[idx].sector_id,
+			       "2nd copy");
+			printf("%s  -> APPLIED, proven not ranked\n",
+			       proven == 2 ? "the same archive entry, twice "
+			                     "on this disk"
+			                   : "the other copy of this FAT");
+			dr_repair_free(&r);
+			dr_view_free(v);
+			return 1;
+		}
+	}
 
 	printf(" %3d/%d s%-3d  %-8s  ",
 	       sl[idx].track, sl[idx].side, sl[idx].sector_id,
@@ -1317,6 +1354,11 @@ static int cmd_repair_all(dr_ctx *c, args *a)
 
 	printf("\n%d of %d repaired and verified\n", fixed, ntodo);
 	free(todo);
+	if (g_fs) {
+		dr_fs_free(g_fs);
+		g_fs = NULL;
+		g_fs_tried = 0;
+	}
 
 	if (a->out && fixed) {
 		if (dr_export(c, a->out, a->format) < 0) {
@@ -1436,7 +1478,7 @@ int main(int argc, char **argv)
 					if (!shown++)
 						printf("\nwhere the bad "
 						       "sectors land\n");
-					if (dr_fs_locate(fs, i, &loc) != 0) {
+					if (dr_fs_locate(fs, c, i, &loc) != 0) {
 						/* Not addressable by the
 						 * filesystem at all: a track
 						 * past the formatted area, or
@@ -1704,7 +1746,7 @@ int main(int argc, char **argv)
 
 				m = mirror_for(c, v, idx, &loc, &proven, &ndiff);
 				if (!m && fs_of(c) &&
-				    dr_fs_locate(fs_of(c), idx, &loc) == 0 &&
+				    dr_fs_locate(fs_of(c), c, idx, &loc) == 0 &&
 				    v->data_len == (int)sizeof(sis)) {
 					int sr = dr_fs_sister(fs_of(c), &loc,
 					                      sis, v->data_len,

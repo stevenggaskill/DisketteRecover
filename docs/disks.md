@@ -31,13 +31,18 @@ That is not visible from the CRC; it is visible from the filesystem.
 |---|---|---|---|
 | Disk 2 | `0/0 s15` | the other copy of the FAT | its CRC-16 is `7D26`, the value stored on the damaged sector |
 | Disk 2 | `0/0 s16`, `0/0 s18` | the other copy of the FAT | redundancy only - the damage took the stored CRC with it |
-| Sand | `24/1 s10` | `slscntc5.rep`, archived twice on this disk | inflates, CRC-32 `70DEE435` |
+| Sand | `24/1 s10` | `slsdtai5.rep`, archived twice on this disk | inflates, CRC-32 `6C6F80FC` |
 | Sand | `25/1 s10` | `faxcover.adt`, archived twice | inflates, CRC-32 `3C4E1290` |
 | Sand | `26/1 s10` | `faxcover.tpl`, archived twice | inflates, CRC-32 `C486A5AA` |
 | Disk 2, LGTC0, Scott | 4 sectors | the search, applied on a clear margin | libhxcfe re-decode reads them clean |
 
-Sand's fourth, `27/1 s10`, is inside `Contacts.adx`, whose other copy on
-the disk is a different version of the file. The search finds **245**
+After those three, `CONTAC~1.ZIP` verifies **101 of 101** entries -
+every file in it inflates and matches its recorded CRC-32. The archive
+is whole.
+
+Sand's fourth, `27/1 s10`, is inside `Contacts.adx` in the *other*
+archive, and that one's counterpart is a different version of the file,
+so there is nothing to copy from. The search finds **245**
 CRC-valid readings there; the referee refutes every one of them. That
 verdict is worth more than a guess would have been.
 

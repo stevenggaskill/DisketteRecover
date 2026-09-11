@@ -6,12 +6,13 @@ images the demo uses. Nothing is downloaded.
 
 ## Requirements
 
-A C compiler, `make`, `unzip`, and (for the flux half of the demo)
-`python3`. On Linux or macOS that is usually all already there:
+A C compiler, `make`, `unzip`, zlib's headers, and (for the flux half of
+the demo) `python3`. On Linux or macOS that is usually all already
+there:
 
 ```sh
 # Debian / Ubuntu
-sudo apt install build-essential unzip python3
+sudo apt install build-essential unzip python3 zlib1g-dev
 
 # macOS
 xcode-select --install
@@ -56,12 +57,30 @@ re-runs HxC's own decoder over the result.
 ## On your own disks
 
 ```sh
-./disketterecover scan    mydisk.scp     # where are the CRC errors?
+./disketterecover scan    mydisk.scp --fs   # where are the CRC errors,
+                                           # and what is actually in them?
 ./disketterecover inspect mydisk.scp     # zoom into the first one
 ./disketterecover repair  mydisk.scp     # rank the corrections
 ./disketterecover serve   mydisk.scp     # ...in a browser
 ./disketterecover formats                # what it can write back out
 ```
+
+**Start with `scan --fs`.** It reads the FAT filesystem and says what
+each bad sector *is*, which changes what you should do about it:
+
+* *free space, or outside the filesystem* - nothing was lost. On the
+  eight disks tested so far this covers 29 of the 43 bad sectors, and
+  three whole disks.
+* *a FAT sector* - the same bytes are written twice on every FAT disk.
+  `repair --from-copy` takes the other copy, and often the damaged
+  sector's own stored CRC confirms it outright.
+* *inside a file* - `repair --fs` puts every candidate reading to that
+  file's own checksum where the format has one. A ZIP entry's CRC-32 is
+  thirty-two bits about the data you care about; the sector CRC is
+  sixteen about the sector, and hundreds of readings can satisfy it.
+* if several readings survive, `repair --variants 5 --out disk.hfe`
+  writes `disk_a1.hfe` ... `disk_a5.hfe`, all of them mountable, so you
+  can open each in a disk browser and see which one's files make sense.
 
 It reads whatever libhxcfe reads - HFE, IMG, ADF, DSK, IPF, SCP,
 KryoFlux streams, A2R, DFI, MFI, WOZ and a hundred others. The ranking

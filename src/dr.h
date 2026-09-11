@@ -435,7 +435,8 @@ void        dr_fs_free(dr_fs *fs);
 const dr_fs_info *dr_fs_stat(const dr_fs *fs);
 
 /* Where does this sector sit in the filesystem, and what is above it? */
-int         dr_fs_locate(dr_fs *fs, int sector_index, dr_fs_loc *out);
+int         dr_fs_locate(dr_fs *fs, dr_ctx *c, int sector_index,
+                         dr_fs_loc *out);
 
 /* The other FAT's copy of a FAT sector - exact redundancy, already on
  * the disk. Returns NULL unless the sector is in a FAT and the mirror

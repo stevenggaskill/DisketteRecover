@@ -358,10 +358,12 @@ const dr_fs_info *dr_fs_stat(const dr_fs *fs)
 /* Where a sector sits                                               */
 /* ---------------------------------------------------------------- */
 
-int dr_fs_locate(dr_fs *fs, int sector_index, dr_fs_loc *out)
+int dr_fs_locate(dr_fs *fs, dr_ctx *c, int sector_index, dr_fs_loc *out)
 {
 	const dr_fs_info *in;
-	long lba = -1, i;
+	const dr_sector *sl;
+	long lba = -1;
+	int n = 0;
 
 	if (!fs || !out)
 		return -1;
@@ -369,9 +371,18 @@ int dr_fs_locate(dr_fs *fs, int sector_index, dr_fs_loc *out)
 	out->mirror_sector = -1;
 	in = &fs->info;
 
-	for (i = 0; i < fs->nlba; i++)
-		if (fs->owner[i] == sector_index) { lba = i; break; }
-	if (lba < 0)
+	/* Derived fresh from the sector's address rather than read out of
+	 * the map built at open time: applying a repair re-scans, and a
+	 * cached index would then point at the wrong sector. */
+	sl = c ? dr_sectors(c, &n) : NULL;
+	if (sl && sector_index >= 0 && sector_index < n &&
+	    sl[sector_index].sector_size == SECSZ &&
+	    sl[sector_index].sector_id >= 1 &&
+	    sl[sector_index].sector_id <= in->spt)
+		lba = ((long)sl[sector_index].track * in->heads +
+		       sl[sector_index].side) * in->spt +
+		      (sl[sector_index].sector_id - 1);
+	if (lba < 0 || lba >= fs->nlba)
 		return -1;
 	out->lba = lba;
 
@@ -580,14 +591,23 @@ static int inflate_check(const uint8_t *src, long csz,
 	return 1;
 }
 
-/* Walk a ZIP's central directory and judge the entry the sector sits
- * inside. Returns 1 proven, 0 refuted, -1 no opinion. */
-static int zip_check(const uint8_t *buf, long len, long at,
+/* Walk a ZIP's central directory and judge every entry the sector
+ * overlaps. A 512-byte sector is bigger than a small archive member and
+ * routinely straddles a boundary: on Sand the damaged sector starts two
+ * bytes before the end of one entry and the damage itself is a hundred
+ * bytes into the next. Judging only the entry the sector starts in
+ * passes that sector while the file behind it stays broken.
+ * Returns 1 proven, 0 refuted, -1 no opinion. */
+static int zip_check(const uint8_t *buf, long len, long at, long span,
                      char *how, size_t howsz)
 {
 	long i, cd = -1;
-	int verdict = -1;
+	int verdict = -1, checked = 0, failed = 0;
+	char firstbad[80];
 
+	firstbad[0] = 0;
+	if (span < 1)
+		span = 1;
 	for (i = len - 22; i >= 0 && i > len - 70000; i--) {
 		if (buf[i] == 'P' && buf[i+1] == 'K' &&
 		    buf[i+2] == 5 && buf[i+3] == 6) {
@@ -602,7 +622,7 @@ static int zip_check(const uint8_t *buf, long len, long at,
 	for (i = cd; i + 46 <= len; ) {
 		unsigned long crc;
 		long csz, usz, lho, body;
-		int nlen, elen, clen, meth;
+		int nlen, elen, clen, meth, v;
 		char name[64];
 
 		if (!(buf[i] == 'P' && buf[i+1] == 'K' &&
@@ -631,29 +651,43 @@ static int zip_check(const uint8_t *buf, long len, long at,
 
 		if (lho < 0 || lho + 30 > len)
 			continue;
-		body = lho + 30 + u16le(buf + lho + 26) + u16le(buf + lho + 28);
+		body = lho + 30 + u16le(buf + lho + 26) +
+		       u16le(buf + lho + 28);
 		if (body + csz > len)
 			continue;
-		if (at < body || at >= body + csz)
-			continue;          /* not the entry we are judging */
+		if (body >= at + span || body + csz <= at)
+			continue;          /* no overlap with this sector */
 
 		if (meth == 0) {
 			unsigned long c = crc32(0L, Z_NULL, 0);
 			c = crc32(c, buf + body, (uInt)csz);
-			verdict = (csz == usz && c == crc);
+			v = (csz == usz && c == crc);
 		} else if (meth == 8) {
-			verdict = inflate_check(buf + body, csz, crc, usz);
+			v = inflate_check(buf + body, csz, crc, usz);
 		} else {
 			continue;
 		}
-		snprintf(how, howsz,
-		         "zip entry '%s' (%ld bytes packed): %s", name, csz,
-		         verdict == 1
-		           ? "inflates, and its CRC-32 matches - proven"
-		           : "does not inflate to its recorded CRC-32");
-		return verdict;
+		checked++;
+		if (!v) {
+			failed++;
+			if (!firstbad[0])
+				snprintf(firstbad, sizeof(firstbad), "%s", name);
+		}
 	}
-	return -1;
+	if (!checked)
+		return -1;
+	verdict = failed ? 0 : 1;
+	if (verdict)
+		snprintf(how, howsz,
+		         "all %d zip entr%s this sector touches inflate, and "
+		         "their CRC-32s match - proven", checked,
+		         checked == 1 ? "y" : "ies");
+	else
+		snprintf(how, howsz,
+		         "zip entry '%s' does not inflate to its recorded "
+		         "CRC-32 (%d of %d entries this sector touches fail)",
+		         firstbad, failed, checked);
+	return verdict;
 }
 
 /* A gzip member ends with a CRC-32 and a length. */
@@ -766,7 +800,7 @@ int dr_fs_score(dr_fs *fs, const dr_fs_loc *loc, const uint8_t *payload,
 		int v = -1;
 
 		if (buf) {
-			v = zip_check(buf, flen, loc->file_offset,
+			v = zip_check(buf, flen, loc->file_offset, len,
 			              out->how, sizeof(out->how));
 			if (v < 0)
 				v = gzip_check(buf, flen, out->how,
@@ -824,6 +858,7 @@ int dr_fs_score(dr_fs *fs, const dr_fs_loc *loc, const uint8_t *payload,
 
 typedef struct {
 	char          name[64];
+	long          hdr;           /* local file header offset          */
 	long          body, csz, usz;
 	unsigned long crc;
 	int           method;
@@ -874,6 +909,7 @@ static int zip_entries(const uint8_t *buf, long len, zip_entry *ents, int max)
 
 		if (lho < 0 || lho + 30 > len)
 			continue;
+		e->hdr = lho;
 		e->body = lho + 30 + u16le(buf + lho + 26) +
 		          u16le(buf + lho + 28);
 		if (e->body + e->csz > len)
@@ -903,7 +939,10 @@ int dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc, uint8_t *out, int len,
 	zip_entry *a = NULL, *b = NULL;
 	long mlen = 0, tlen = 0;
 	int na, nb, i, j, self = -1, rc = -1;
+	int spliced = 0, touched = 0;
+	char last[64];
 
+	last[0] = 0;
 	if (!fs || !loc || loc->area != DR_AREA_FILE || !out)
 		return -1;
 	for (i = 0; i < fs->nfiles; i++)
@@ -922,65 +961,81 @@ int dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc, uint8_t *out, int len,
 	if (!na)
 		goto out;
 
-	/* Which entry does the damaged sector sit inside? */
-	for (i = 0; i < na; i++)
-		if (loc->file_offset >= a[i].body &&
-		    loc->file_offset < a[i].body + a[i].csz)
-			break;
-	if (i == na)
+	/*
+	 * Every entry the sector overlaps, not just the one it starts in.
+	 * A 512-byte sector is bigger than a small archive member, and on
+	 * Sand the damaged one begins two bytes before the end of
+	 * 'slscntc5.rep' with all of the damage inside the next entry.
+	 * Splicing only the first left the file broken while the check
+	 * reported it proven.
+	 */
+	for (i = 0; i < na; i++) {
+		if (a[i].body >= loc->file_offset + len ||
+		    a[i].body + a[i].csz <= loc->file_offset)
+			continue;
+		touched++;
+		for (j = 0; j < fs->nfiles; j++) {
+			int k, got = 0;
+
+			free(theirs);
+			theirs = assemble_file(fs, j, &tlen);
+			if (!theirs)
+				continue;
+			nb = zip_entries(theirs, tlen, b, MAXENT);
+			for (k = 0; k < nb; k++) {
+				if (strcmp(b[k].name, a[i].name) ||
+				    b[k].csz != a[i].csz ||
+				    b[k].usz != a[i].usz ||
+				    b[k].crc != a[i].crc ||
+				    b[k].method != a[i].method)
+					continue;
+				if (j == self && b[k].body == a[i].body)
+					continue;    /* the very same bytes */
+				/* Take the local file header along with the
+				 * body when the two are laid out the same.
+				 * A sector that straddles entries covers the
+				 * header between them, and nothing else is
+				 * going to put that back. */
+				if (a[i].body - a[i].hdr == b[k].body - b[k].hdr)
+					memcpy(mine + a[i].hdr,
+					       theirs + b[k].hdr,
+					       (size_t)(a[i].body - a[i].hdr));
+				memcpy(mine + a[i].body, theirs + b[k].body,
+				       (size_t)a[i].csz);
+				spliced++;
+				got = 1;
+				snprintf(last, sizeof(last), "%s", a[i].name);
+				break;
+			}
+			if (got)
+				break;
+		}
+	}
+
+	if (!spliced)
 		goto out;
 
-	for (j = 0; j < fs->nfiles && rc < 0; j++) {
-		int k;
+	/* Let the archive's own checksums referee the result - every entry
+	 * the sector touches, spliced or not. */
+	{
+		char msg[200];
+		int v = zip_check(mine, mlen, loc->file_offset, len,
+		                  msg, sizeof(msg));
 
-		free(theirs);
-		theirs = assemble_file(fs, j, &tlen);
-		if (!theirs)
-			continue;
-		nb = zip_entries(theirs, tlen, b, MAXENT);
-		for (k = 0; k < nb; k++) {
-			uint8_t *save;
-			int good;
-
-			if (strcmp(b[k].name, a[i].name) ||
-			    b[k].csz != a[i].csz || b[k].usz != a[i].usz ||
-			    b[k].crc != a[i].crc || b[k].method != a[i].method)
-				continue;
-			if (j == self && b[k].body == a[i].body)
-				continue;      /* the very same bytes */
-
-			/* Try it, and let the archive's CRC-32 decide. */
-			save = malloc((size_t)a[i].csz);
-			if (!save)
-				continue;
-			memcpy(save, mine + a[i].body, (size_t)a[i].csz);
-			memcpy(mine + a[i].body, theirs + b[k].body,
-			       (size_t)a[i].csz);
-			good = (a[i].method == 8)
-			        ? inflate_check(mine + a[i].body, a[i].csz,
-			                        a[i].crc, a[i].usz)
-			        : 1;
-			if (good == 1) {
-				memcpy(out, mine + loc->file_offset,
-				       (size_t)len);
-				snprintf(how, (size_t)howsz,
-				         "'%s' is archived twice on this disk; "
-				         "the copy in %s inflates and matches "
-				         "its CRC-32 (%08lX) - proven",
-				         a[i].name, fs->files[j].name, a[i].crc);
-				rc = 1;
-			} else {
-				memcpy(out, mine + loc->file_offset,
-				       (size_t)len);
-				snprintf(how, (size_t)howsz,
-				         "'%s' is archived twice on this disk, "
-				         "but the second copy does not check out "
-				         "either", a[i].name);
-				rc = 0;
-			}
-			memcpy(mine + a[i].body, save, (size_t)a[i].csz);
-			free(save);
-			break;
+		memcpy(out, mine + loc->file_offset, (size_t)len);
+		if (v == 1) {
+			snprintf(how, (size_t)howsz,
+			         "'%s' is archived twice on this disk; with the "
+			         "second copy in place all %d entr%s this "
+			         "sector touches inflate and match their "
+			         "CRC-32 - proven", last, touched,
+			         touched == 1 ? "y" : "ies");
+			rc = 1;
+		} else {
+			snprintf(how, (size_t)howsz,
+			         "'%s' is archived twice on this disk, but the "
+			         "second copy does not check out either", last);
+			rc = 0;
 		}
 	}
 out:

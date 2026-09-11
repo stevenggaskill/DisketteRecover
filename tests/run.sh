@@ -418,6 +418,58 @@ PYEOF
 		bad "the FAT sector is recovered exactly"
 	fi
 
+	echo "== the same archive entry, twice on the same disk"
+	# Two backups of the same folder, weeks apart, sharing entries
+	# byte for byte - which is what Sand turned out to be carrying.
+	# The entries are small on purpose: a 512-byte sector straddles
+	# two or three of them, and splicing only the one the sector
+	# starts in leaves the file broken while reporting it fixed.
+	python3 - "$out" <<'PYEOF'
+import os, random, sys, zipfile
+out = sys.argv[1]
+random.seed(11)
+words = [bytes(random.choice(b'abcdefghijklmnopqrstuvwxyz')
+               for _ in range(random.randint(3, 9))) for _ in range(200)]
+# Small members on purpose: each packs to roughly 150 bytes, so one
+# 512-byte sector covers three or four of them.
+parts = [b' '.join(random.choice(words) for _ in range(30))
+         for _ in range(260)]
+for name in ('b1.zip', 'b2.zip'):
+    with zipfile.ZipFile(os.path.join(out, name), 'w',
+                         zipfile.ZIP_DEFLATED) as z:
+        for i, p in enumerate(parts):
+            z.writestr('part%03d.txt' % i, p)
+PYEOF
+	python3 "$here/tools/mkfat.py" "$out/two.img" \
+	        "BACKUP1.ZIP=$out/b1.zip" "BACKUP2.ZIP=$out/b2.zip"
+	"$dr" convert "$out/two.img" --out "$out/two.hfe" >/dev/null 2>&1
+	"$dr" convert "$out/two.hfe" --out "$out/two_ref.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	# LBA 30: cluster 10 of the first archive, well inside it
+	"$dr" damage "$out/two.hfe" --track 1 --side 1 --id 4 --drop-only \
+	      --bits 803,1701,2743 --out "$out/two_bad.hfe" >/dev/null 2>&1
+	check "one bad sector" "$(badcount "$out/two_bad.hfe")" "1"
+	pr=$("$dr" repair "$out/two_bad.hfe" --from-copy 2>/dev/null |
+	     sed -n 's/.*\(proven, not ranked\).*/proven/p')
+	check "the second copy is found and the archive confirms it" \
+	      "$pr" "proven"
+	# ...and it confirms every entry the sector touches, not just the
+	# one it starts in.
+	ents=$("$dr" repair "$out/two_bad.hfe" --from-copy 2>/dev/null |
+	       sed -n 's/.*all \([0-9]*\) entr.* this sector touches.*/\1/p')
+	if [ "${ents:-0}" -ge 2 ]; then
+		ok "every entry the sector straddles was checked ($ents)"
+	else
+		bad "every entry the sector straddles was checked ($ents)"
+	fi
+	"$dr" repair "$out/two_bad.hfe" --from-copy --out "$out/two_fix.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/two_ref.img" "$out/two_fix.img"; then
+		ok "the sector is recovered exactly from the other archive"
+	else
+		bad "the sector is recovered exactly from the other archive"
+	fi
+
 	echo "== one image per reading, to be looked at"
 	"$dr" repair "$out/fs_bad.hfe" --variants 3 --out "$out/v.hfe" \
 	      >/dev/null 2>&1
