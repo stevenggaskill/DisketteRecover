@@ -158,8 +158,12 @@ void dr_json_candidates(const dr_view *v, const dr_repair_result *r,
 	{
 		double margin = 0.0;
 
-		if (r->count > 1 && r->list[1].rel_likelihood > 0.0)
+		if (r->count <= 1)
+			margin = 1e308;                 /* nothing to beat */
+		else if (r->list[1].rel_likelihood > 0.0)
 			margin = 1.0 / r->list[1].rel_likelihood;
+		else
+			margin = 1e308;                 /* runner-up underflowed */
 
 		fprintf(f, "{\"count\":%d,\"offset\":%d,\"pool\":%d,"
 		           "\"searched_weight\":%d,\"truncated\":%s,"

@@ -64,13 +64,29 @@ int dr_intervals_collect(dr_view *v, dr_interval **out, double *period_out)
 	dr_flux_map *fx = (dr_flux_map *)v->flux;
 	HXCFE_SIDE *side = (HXCFE_SIDE *)v->side;
 	dr_interval *iv;
-	double period;
+	double period0 = 0.0;
 	int i, n = 0, prev = -1;
 
 	*out = NULL;
 	if (!fx || !fx->valid)
 		return -1;
 
+	/*
+	 * The cell period, sampled once where the sector starts and held
+	 * for the whole of it.
+	 *
+	 * That is not always true - a stretch rewritten in a different
+	 * drive runs at that drive's speed, and a few percent is enough to
+	 * push a 4T past the top of its bin, which is how a region ends up
+	 * decoded with 5- and 6-cell gaps that MFM cannot produce at all.
+	 * libhxcfe's per-byte rate does not rescue that: it is smoothed
+	 * over a 24-byte window and two filter passes, so following it
+	 * interval by interval destroys the fit rather than sharpening it
+	 * (measured - the model stops fitting at all). Recovering a local
+	 * rate well enough to help means fitting it from the flux
+	 * directly, and until that exists a sector with a speed splice is
+	 * reported rather than repaired.
+	 */
 	{
 		double bitrate = side->timingbuffer
 		        ? (double)side->timingbuffer[dr_wrap(side->tracklen,
@@ -80,9 +96,9 @@ int dr_intervals_collect(dr_view *v, dr_interval **out, double *period_out)
 			bitrate = (double)side->bitrate;
 		if (bitrate < 1000.0)
 			return -1;
-		period = (double)fx->tick_freq / (2.0 * bitrate);
+		period0 = (double)fx->tick_freq / (2.0 * bitrate);
 	}
-	if (period <= 0.0)
+	if (period0 <= 0.0)
 		return -1;
 
 	iv = malloc((size_t)v->ncells * sizeof(*iv));
@@ -104,7 +120,7 @@ int dr_intervals_collect(dr_view *v, dr_interval **out, double *period_out)
 		iv[n].gap   = i - prev;
 		iv[n].ticks = (p != 0xFFFFFFFFu && p < fx->nb_pulses)
 		                      ? fx->stream[p] : 0;
-		iv[n].meas  = iv[n].ticks ? (double)iv[n].ticks / period : -1.0;
+		iv[n].meas  = iv[n].ticks ? (double)iv[n].ticks / period0 : -1.0;
 		iv[n].adj   = iv[n].meas;
 		n++;
 		prev = i;
@@ -117,7 +133,7 @@ int dr_intervals_collect(dr_view *v, dr_interval **out, double *period_out)
 
 	*out = iv;
 	if (period_out)
-		*period_out = period;
+		*period_out = period0;
 	return n;
 }
 
@@ -254,6 +270,68 @@ void dr_timing_fit(const dr_interval *iv, int n, dr_timing *t)
 			keep = 0.10;
 	}
 
+	/*
+	 * Interval errors are not independent, and assuming they are is a
+	 * real mistake rather than a rounding one.
+	 *
+	 * What the medium and the head actually perturb is the *position*
+	 * of a reversal. An interval is the gap between two of them, so an
+	 * error e_j in one position lands in two consecutive intervals with
+	 * opposite sign: r_j = e_j - e_{j-1}. That makes adjacent interval
+	 * residuals correlated at -1/2, and it means a long interval
+	 * followed by an equally short one is a single displaced reversal,
+	 * not two independent 3-sigma surprises. Scoring them independently
+	 * charges twice for one event and blinds the search to the
+	 * compensating pairs that are the commonest failure of all.
+	 *
+	 * Measure the correlation, and recover the position noise from it:
+	 * var(r) = 2*sigma_pos^2 + sigma_indep^2 and cov(r_j, r_j+1) =
+	 * -sigma_pos^2, so sigma_pos^2 = -rho * var(r).
+	 */
+	{
+		double m = 0.0, v = 0.0, c = 0.0;
+		int used2 = 0, k, prev_ok = 0;
+		double prev_r = 0.0;
+
+		for (i = 0; i < n; i++) {
+			double x[4], r;
+
+			if (!usable(iv, i)) { prev_ok = 0; continue; }
+			design(iv, n, i, x);
+			r = iv[i].meas - (t->a + t->b * x[1] + t->c * x[2] +
+			                  t->d * x[3]);
+			if (fabs(r) > 3.5 * t->sigma) { prev_ok = 0; continue; }
+			m += r;
+			v += r * r;
+			if (prev_ok) {
+				c += prev_r * r;
+				used2++;
+			}
+			prev_r = r;
+			prev_ok = 1;
+			k = 0; (void)k;
+		}
+		if (v > 0.0 && used2 > 32) {
+			t->rho = c / v;
+			if (t->rho > -0.05) t->rho = -0.05;
+			if (t->rho < -0.75) t->rho = -0.75;
+		} else {
+			t->rho = -0.5;
+		}
+		/*
+		 * Residuals are measured against an anchor transition that
+		 * carries its own error, so what the search actually sees is
+		 * e_j - e_anchor, with twice the variance of a single
+		 * position. Dividing by sigma_pos alone halves the
+		 * denominator, doubles every cost, and turns a marginal
+		 * preference into a claimed certainty.
+		 */
+		t->sigma_pos = t->sigma * sqrt(-2.0 * t->rho);
+		if (t->sigma_pos < 0.01)
+			t->sigma_pos = 0.01;
+		(void)m;
+	}
+
 	if (t->b > 0.6 && t->b < 1.6 && t->n >= 32)
 		t->valid = 1;
 }
@@ -275,20 +353,6 @@ double dr_bin_cost(const dr_timing *t, double meas, int k)
 	if (meas <= 0.0)
 		return 0.0;
 	r = (meas - (t->a + t->b * (double)k)) / t->sigma;
-	return 0.5 * r * r;
-}
-
-/* Cost of explaining `meas` as a run of `cells` cells (one interval or
- * several merged), given the fitted model. */
-static double span_cost(const dr_timing *t, double meas, int cells, int parts)
-{
-	double mean, sig, r;
-
-	if (meas <= 0.0)
-		return 0.0;
-	mean = t->a * parts + t->b * (double)cells;
-	sig = t->sigma * sqrt((double)parts);
-	r = (meas - mean) / sig;
 	return 0.5 * r * r;
 }
 
@@ -376,7 +440,30 @@ struct ctx {
 	dr_timing     t;
 	double        p_drop, p_spur;
 	int           stride;
+
+	/* Running sums so a transition's position residual is a function of
+	 * the DP state alone: how far the reading has drifted from the
+	 * measurements by the time it reaches interval j having spent
+	 * `dev` extra cells. */
+	double       *cum_meas;   /* measured cells before interval j     */
+	double       *cum_pll;    /* cells the decoder assigned, same     */
 };
+
+/*
+ * The cost of standing at measured transition j after spending `dev`
+ * cells more than the decoder did. Because the noise is on positions,
+ * the penalty is on where the reading has drifted to - not on how wide
+ * any single interval came out. A pair that runs long then short costs
+ * almost nothing; a reading that drifts and stays drifted pays for every
+ * transition it stays wrong.
+ */
+static double pos_cost(const struct ctx *X, int j, int dev)
+{
+	double r = X->cum_meas[j] - (X->cum_pll[j] + (double)dev);
+	double z = r / X->t.sigma_pos;
+
+	return 0.5 * z * z;
+}
 
 /* Turn a chain of decisions into transition positions, decode the bytes
  * they touch, and record which message bits moved. */
@@ -529,7 +616,11 @@ static int run_search(struct ctx *X, int first, int last,
 			h[(size_t)j * DEV_SPAN + d] = BIG;
 	h[(size_t)M * DEV_SPAN + MAX_DEV] = 0.0;     /* done, no drift */
 
-	/* Suffix bounds. */
+	/*
+	 * Suffix bounds. A move's cost is the position residual at the
+	 * measured transition it lands on, so it depends only on where the
+	 * move leaves us - which is exactly the DP state.
+	 */
 	for (j = M - 1; j >= 0; j--) {
 		int idx = first + j;
 
@@ -541,34 +632,39 @@ static int run_search(struct ctx *X, int first, int last,
 				nd = d + (k - X->iv[idx].gap);
 				if (nd < 0 || nd >= DEV_SPAN)
 					continue;
-				c = dr_bin_cost(&X->t, X->iv[idx].adj, k) +
+				c = pos_cost(X, first + j + 1, nd - MAX_DEV) +
 				    h[(size_t)(j + 1) * DEV_SPAN + nd];
 				if (c < best) best = c;
 			}
 
-			{	/* dropout: this measurement hides two intervals */
+			{	/* dropout: this measurement hides two intervals.
+				 * The reversal we insert was never measured, so
+				 * it contributes no residual of its own. */
 				int k1, k2;
 				for (k1 = MIN_BIN; k1 <= MAX_BIN; k1++)
 				for (k2 = MIN_BIN; k2 <= MAX_BIN; k2++) {
 					nd = d + (k1 + k2 - X->iv[idx].gap);
 					if (nd < 0 || nd >= DEV_SPAN)
 						continue;
-					c = span_cost(&X->t, X->iv[idx].adj,
-					              k1 + k2, 2) + X->p_drop +
+					c = pos_cost(X, first + j + 1,
+					             nd - MAX_DEV) + X->p_drop +
 					    h[(size_t)(j + 1) * DEV_SPAN + nd];
 					if (c < best) best = c;
 				}
 			}
 
-			if (j + 1 < M) {      /* spurious: two make up one */
-				double m2 = X->iv[idx].adj + X->iv[idx + 1].adj;
+			if (j + 1 < M) {      /* spurious: two make up one.
+					       * The extra measured reversal
+					       * should not exist, so its
+					       * residual is not charged. */
 				int pll2 = X->iv[idx].gap + X->iv[idx + 1].gap;
 
 				for (k = MIN_BIN; k <= MAX_BIN; k++) {
 					nd = d + (k - pll2);
 					if (nd < 0 || nd >= DEV_SPAN)
 						continue;
-					c = span_cost(&X->t, m2, k, 1) + X->p_spur +
+					c = pos_cost(X, first + j + 2,
+					             nd - MAX_DEV) + X->p_spur +
 					    h[(size_t)(j + 2) * DEV_SPAN + nd];
 					if (c < best) best = c;
 				}
@@ -655,7 +751,7 @@ static int run_search(struct ctx *X, int first, int last,
 			if (ns < 0 || ns >= DEV_SPAN)
 				continue;
 			PUSH(0, k, 0, s.j + 1, ns,
-			     s.g + dr_bin_cost(&X->t, X->iv[idx].adj, k));
+			     s.g + pos_cost(X, first + s.j + 1, ns - MAX_DEV));
 		}
 		{
 			int k1, k2;
@@ -665,12 +761,11 @@ static int run_search(struct ctx *X, int first, int last,
 				if (ns < 0 || ns >= DEV_SPAN)
 					continue;
 				PUSH(1, k1, k2, s.j + 1, ns,
-				     s.g + span_cost(&X->t, X->iv[idx].adj,
-				                     k1 + k2, 2) + X->p_drop);
+				     s.g + pos_cost(X, first + s.j + 1,
+				                    ns - MAX_DEV) + X->p_drop);
 			}
 		}
 		if (s.j + 1 < M) {
-			double m2 = X->iv[idx].adj + X->iv[idx + 1].adj;
 			int pll2 = X->iv[idx].gap + X->iv[idx + 1].gap;
 
 			for (k = MIN_BIN; k <= MAX_BIN; k++) {
@@ -678,7 +773,8 @@ static int run_search(struct ctx *X, int first, int last,
 				if (ns < 0 || ns >= DEV_SPAN)
 					continue;
 				PUSH(2, k, 0, s.j + 2, ns,
-				     s.g + span_cost(&X->t, m2, k, 1) + X->p_spur);
+				     s.g + pos_cost(X, first + s.j + 2,
+				                    ns - MAX_DEV) + X->p_spur);
 			}
 		}
 		#undef PUSH
@@ -743,6 +839,13 @@ int dr_rebin_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 		return 0;
 	}
 
+	X.cum_meas = malloc((size_t)(X.niv + 2) * sizeof(double));
+	X.cum_pll  = malloc((size_t)(X.niv + 2) * sizeof(double));
+	if (!X.cum_meas || !X.cum_pll) {
+		rc = -1;
+		goto done;
+	}
+
 	dr_timing_fit(X.iv, X.niv, &X.t);
 	for (i = 0; i < X.niv; i++)
 		X.iv[i].adj = dr_timing_adjust(&X.t, X.iv[i].meas,
@@ -753,6 +856,18 @@ int dr_rebin_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 		         "could not fit a timing model to this track");
 		goto done;
 	}
+
+	/* Positions, in cells, as measured and as the decoder read them. */
+	X.cum_meas[0] = 0.0;
+	X.cum_pll[0] = 0.0;
+	for (i = 0; i < X.niv; i++) {
+		double m = (X.iv[i].adj > 0.0) ? X.iv[i].adj : (double)X.iv[i].gap;
+
+		X.cum_meas[i + 1] = X.cum_meas[i] + m;
+		X.cum_pll[i + 1] = X.cum_pll[i] + (double)X.iv[i].gap;
+	}
+	X.cum_meas[X.niv + 1] = X.cum_meas[X.niv];
+	X.cum_pll[X.niv + 1] = X.cum_pll[X.niv];
 
 	masks = malloc((size_t)v->msg_bits * sizeof(uint16_t));
 	dirty = calloc((size_t)X.niv, 1);
@@ -1074,6 +1189,8 @@ done:
 	free(found);
 	free(dirty);
 	free(masks);
+	free(X.cum_meas);
+	free(X.cum_pll);
 	free(X.iv);
 	return rc;
 }

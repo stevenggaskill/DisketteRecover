@@ -9,6 +9,8 @@
 
 #include "dr_internal.h"
 
+extern const char dr_web_plot[];
+
 static const char *usage_text =
 "DisketteRecover - CRC-guided flux-level floppy repair (built on libhxcfe)\n"
 "\n"
@@ -21,6 +23,8 @@ static const char *usage_text =
 "  damage   <image>              flip data bits on purpose (test images)\n"
 "  serve    <image>              browser UI for inspect + repair\n"
 "  convert  <image>              write the image out in another format\n"
+"  plot     <image>              write an interactive scatter of the flux\n"
+"                                transition widths to --out FILE.html\n"
 "  formats                       list libhxcfe export formats\n"
 "\n"
 "inspect options:\n"
@@ -41,6 +45,10 @@ static const char *usage_text =
 "                    auto tries pattern, then rebin, then bits\n"
 "  --max-outliers N  pattern engine: bytes allowed off-pattern (24)\n"
 "  --dropout-bias N  nats favouring a lost 1 over a gained 1 (1.6)\n"
+"  --burst-gain G    how much likelier an error is right after another\n"
+"                    one - errors clump, so a flip beside a flip is one\n"
+"                    event, not two (110; 0 turns the burst prior off)\n"
+"  --burst-len B     bits over which that lift decays (60)\n"
 "  --restore-only    only consider putting dropped reversals back;\n"
 "                    every verified error so far has been a 1 read as 0\n"
 "  --bin-budget N    nats of timing cost a re-bin may spend (12)\n"
@@ -64,6 +72,8 @@ static const char *usage_text =
 "\n"
 "damage options:\n"
 "  --bits a,b,c      message bit indices to flip\n"
+"  --drop-only       only clear bits that read 1, so the damage is a\n"
+"                    lost reversal - what real media actually does\n"
 "  --out FILE        required\n"
 "\n"
 "other:\n"
@@ -84,6 +94,7 @@ typedef struct {
 	int    apply;
 	int    autoapply;
 	int    all;
+	int    droponly;
 	int    port;
 	const char *bind;
 	const char *out;
@@ -133,7 +144,10 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--max-ambiguous")) a->opt.max_ambiguous = atoi(NEXT());
 		else if (!strcmp(o, "--max-outliers")) a->opt.max_outliers = atoi(NEXT());
 		else if (!strcmp(o, "--dropout-bias")) a->opt.dropout_bias = atof(NEXT());
+		else if (!strcmp(o, "--burst-gain")) a->opt.burst_gain = atof(NEXT());
+		else if (!strcmp(o, "--burst-len"))  a->opt.burst_len  = atof(NEXT());
 		else if (!strcmp(o, "--restore-only")) a->opt.restore_only = 1;
+		else if (!strcmp(o, "--drop-only")) a->droponly = 1;
 		else if (!strcmp(o, "--mode")) {
 			const char *m = NEXT();
 			if (!strcmp(m, "bits"))         a->opt.mode = DR_MODE_BITS;
@@ -349,6 +363,39 @@ static void print_view(dr_view *v, int top)
 
 /* ------------------------------------------------------------------ */
 /*
+ * How far the best reading beats the next one.
+ *
+ * A runner-up whose relative likelihood has underflowed to zero is not a
+ * close call - it is the most decisive result the ranking can produce,
+ * and reporting it as a margin of zero gets the conclusion exactly
+ * backwards.
+ */
+static double top_margin(const dr_repair_result *r)
+{
+	if (r->count <= 1)
+		return HUGE_VAL;            /* nothing else to weigh it against */
+	if (r->list[1].rel_likelihood <= 0.0)
+		return HUGE_VAL;
+	return 1.0 / r->list[1].rel_likelihood;
+}
+
+static void print_margin(const dr_repair_result *r, const char *what)
+{
+	double m = top_margin(r);
+
+	if (r->count <= 1)
+		return;
+	if (m == HUGE_VAL)
+		printf("margin    : the top %s is overwhelmingly more likely "
+		       "than the next; clear winner\n", what);
+	else
+		printf("margin    : the top %s is %.3g x more likely than the "
+		       "next; %s\n", what, m,
+		       m >= 100.0 ? "clear winner"
+		                  : "NOT a clear winner - inspect before applying");
+}
+
+/*
  * What a CRC-valid reading is actually worth.
  *
  * A 16-bit CRC lets one reading in 65536 through by chance, so the
@@ -465,14 +512,7 @@ static void print_pattern(dr_view *v, dr_repair_result *r, int limit)
 
 	printf("result    : %d CRC-valid reading(s) from the data model\n",
 	       r->count);
-	if (r->count > 1) {
-		double margin = r->list[1].rel_likelihood > 0.0
-		        ? 1.0 / r->list[1].rel_likelihood : 0.0;
-		printf("margin    : the top reading is %.3g x more likely than "
-		       "the next; %s\n", margin,
-		       margin >= 100.0 ? "clear winner"
-		                       : "NOT a clear winner - inspect first");
-	}
+	print_margin(r, "reading");
 
 	print_budget(r);
 
@@ -541,14 +581,7 @@ static void print_rebin(dr_view *v, dr_repair_result *r, int limit)
 		       "(%.1f more than the likeliest)\n",
 		       r->list[0].flux_cost,
 		       r->list[0].flux_cost - r->floor_cost);
-	if (r->count > 1) {
-		double margin = r->list[1].rel_likelihood > 0.0
-		        ? 1.0 / r->list[1].rel_likelihood : 0.0;
-		printf("margin    : the top re-reading is %.3g x more likely than "
-		       "the next; %s\n", margin,
-		       margin >= 100.0 ? "clear winner"
-		                       : "NOT a clear winner - inspect before applying");
-	}
+	print_margin(r, "re-reading");
 
 	print_budget(r);
 	if (r->current_cost > 0.0)
@@ -608,14 +641,7 @@ static void print_candidates(dr_view *v, dr_repair_result *r, int limit)
 	/* A 16-bit CRC only pins the data down to 1 in 65536, and a field
 	 * this long offers thousands of places to flip, so alternative
 	 * readings are normal. Say how much the top one actually wins by. */
-	if (r->count > 1) {
-		double margin = r->list[1].rel_likelihood > 0.0
-		        ? 1.0 / r->list[1].rel_likelihood : 0.0;
-		printf("margin    : the top candidate is %.3g x more likely than "
-		       "the next; %s\n", margin,
-		       margin >= 100.0 ? "clear winner"
-		                       : "NOT a clear winner - inspect before applying");
-	}
+	print_margin(r, "candidate");
 	if (!v->flux_available)
 		printf("note      : no flux timing in this image, so every bit "
 		       "carries the same prior.\n"
@@ -659,8 +685,11 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 		return 0;
 	}
 
-	engine = a->opt.mode == DR_MODE_AUTO ? DR_MODE_PATTERN : a->opt.mode;
-	for (;;) {
+	if (a->opt.mode == DR_MODE_AUTO) {
+		dr_repair_auto(c, v, &a->opt, &r);
+		engine = r.count ? r.list[0].origin : DR_MODE_BITS;
+	} else {
+		engine = a->opt.mode;
 		memset(&r, 0, sizeof(r));
 		if (engine == DR_MODE_PATTERN)
 			dr_pattern_search(v, &a->opt, &r);
@@ -669,27 +698,9 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 		else
 			dr_repair_search(v, &a->opt, &r);
 		dr_rescore_data(c, v, &a->opt, &r);
-
-		if (r.count || a->opt.mode != DR_MODE_AUTO)
-			break;
-		dr_repair_free(&r);
-		if (engine == DR_MODE_PATTERN) {
-			engine = (v->flux_available &&
-			          v->encoding == DR_ENC_ISO_MFM)
-			        ? DR_MODE_REBIN : DR_MODE_BITS;
-			continue;
-		}
-		if (engine == DR_MODE_REBIN) {
-			engine = DR_MODE_BITS;
-			continue;
-		}
-		break;
 	}
 
-	if (r.count > 1 && r.list[1].rel_likelihood > 0.0)
-		margin = 1.0 / r.list[1].rel_likelihood;
-	else if (r.count == 1)
-		margin = 1.0 / 0.0;          /* unique */
+	margin = top_margin(&r);
 
 	printf(" %3d/%d s%-3d  %-8s  ",
 	       sl[idx].track, sl[idx].side, sl[idx].sector_id,
@@ -708,6 +719,8 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 		printf("%d reading(s), ", r.count);
 		if (unique)
 			printf("unique");
+		else if (margin == HUGE_VAL)
+			printf("top overwhelms the next");
 		else
 			printf("top %.3g x next", margin);
 
@@ -873,6 +886,55 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	if (!strcmp(a.cmd, "plot")) {
+		dr_view *pv;
+		FILE *f;
+		const char *marker = "/*__DR_DATA__*/null";
+		const char *split;
+
+		idx = pick_sector(c, &a);
+		if (idx < 0) {
+			dr_close(c);
+			return 1;
+		}
+		if (!a.out) {
+			fprintf(stderr, "plot needs --out FILE.html\n");
+			dr_close(c);
+			return 2;
+		}
+		pv = dr_view_open(c, idx, &a.opt);
+		if (!pv) {
+			fprintf(stderr, "could not build a view for sector %d\n", idx);
+			dr_close(c);
+			return 1;
+		}
+		f = fopen(a.out, "wb");
+		if (!f) {
+			perror(a.out);
+			dr_view_free(pv);
+			dr_close(c);
+			return 1;
+		}
+		split = strstr(dr_web_plot, marker);
+		if (!split) {
+			fprintf(stderr, "plot template is missing its data slot\n");
+			fclose(f);
+			dr_view_free(pv);
+			dr_close(c);
+			return 1;
+		}
+		fwrite(dr_web_plot, 1, (size_t)(split - dr_web_plot), f);
+		dr_json_view(c, pv, f);
+		fputs(split + strlen(marker), f);
+		fclose(f);
+		printf("wrote %s - sector index %d, track %d side %d id %d\n",
+		       a.out, idx, pv->sect.track, pv->sect.side,
+		       pv->sect.sector_id);
+		dr_view_free(pv);
+		dr_close(c);
+		return 0;
+	}
+
 	if (!strcmp(a.cmd, "convert")) {
 		if (!a.out) {
 			fprintf(stderr, "convert needs --out\n");
@@ -922,8 +984,15 @@ int main(int argc, char **argv)
 			bits[nb++] = atoi(tok);
 		free(dup);
 
-		if (dr_damage(c, idx, bits, nb) < 0) {
+		nb = dr_damage(c, idx, bits, nb, a.droponly);
+		if (nb < 0) {
 			fprintf(stderr, "damage failed: %s\n", dr_last_error(c));
+			dr_close(c);
+			return 1;
+		}
+		if (!nb) {
+			fprintf(stderr, "no requested bit could be dropped "
+			                "(they all read 0 already)\n");
 			dr_close(c);
 			return 1;
 		}
@@ -982,69 +1051,38 @@ int main(int argc, char **argv)
 				print_view(v, 12);
 
 			/*
-			 * Engines in order of how decisive their evidence is
-			 * when it applies. The data's own regularity is the
-			 * strongest and the cheapest, so it goes first; flux
-			 * re-binning next, where there are timings to re-bin;
-			 * a bit-flip search last, since it works from the CRC
-			 * almost alone.
+			 * Every engine that applies gets a say, and their
+			 * candidates are ranked together on one scale. Taking
+			 * whichever engine answered first is how a fifteen-bit
+			 * re-reading gets applied while a one-bit dropout
+			 * repair sits unexamined in another engine's list.
 			 */
-			engine = a.opt.mode;
-			if (engine == DR_MODE_AUTO)
-				engine = DR_MODE_PATTERN;
+			if (a.opt.mode == DR_MODE_AUTO) {
+				if (dr_repair_auto(c, v, &a.opt, &r) < 0) {
+					fprintf(stderr, "search failed\n");
+					dr_view_free(v);
+					dr_close(c);
+					return 1;
+				}
+				engine = r.count ? r.list[0].origin : DR_MODE_BITS;
+			} else {
+				int rs;
 
-			for (;;) {
-				int rs = 0;
-
+				engine = a.opt.mode;
+				memset(&r, 0, sizeof(r));
 				if (engine == DR_MODE_PATTERN)
 					rs = dr_pattern_search(v, &a.opt, &r);
 				else if (engine == DR_MODE_REBIN)
 					rs = dr_rebin_search(v, &a.opt, &r);
 				else
 					rs = dr_repair_search(v, &a.opt, &r);
-
 				if (rs < 0) {
 					fprintf(stderr, "search failed\n");
 					dr_view_free(v);
 					dr_close(c);
 					return 1;
 				}
-
-				/* Rank every engine's output by the same data
-				 * model, so an implausible reading cannot win
-				 * just because its CRC happens to check. */
 				dr_rescore_data(c, v, &a.opt, &r);
-
-				if (r.count || a.opt.mode != DR_MODE_AUTO)
-					break;
-
-				if (!a.json) {
-					if (engine == DR_MODE_PATTERN)
-						print_pattern(v, &r, 16);
-					else if (engine == DR_MODE_REBIN)
-						print_rebin(v, &r, 16);
-				}
-				dr_repair_free(&r);
-
-				if (engine == DR_MODE_PATTERN) {
-					engine = (v->flux_available &&
-					          v->encoding == DR_ENC_ISO_MFM)
-					        ? DR_MODE_REBIN : DR_MODE_BITS;
-					if (!a.json)
-						printf("\nfalling back to %s.\n",
-						       engine == DR_MODE_REBIN
-						       ? "re-binning the flux"
-						       : "a bit-flip search");
-					continue;
-				}
-				if (engine == DR_MODE_REBIN) {
-					engine = DR_MODE_BITS;
-					if (!a.json)
-						printf("\nfalling back to a "
-						       "bit-flip search.\n");
-					continue;
-				}
-				break;
 			}
 
 			if (a.json) {

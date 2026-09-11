@@ -53,21 +53,37 @@ w=$("$dr" repair "$out/b2.hfe" --mode bits --json 2>/dev/null |
 check "bit-flip engine finds it at weight 2" "$w" "2"
 
 echo "== the data model, on a sector of filler with bits dropped"
-# 512 bytes of 0xF6 is what MS-DOS FORMAT leaves behind. Dropping a few
-# transitions turns some of them into 0x76 / 0xF2, and restoring the
-# repeat should put every one back in a single reading.
-"$dr" damage "$src" --sector 5 --bits 803,1701,2743,3001 \
-      --out "$out/p0.hfe" >/dev/null 2>&1
-pj=$("$dr" repair "$out/p0.hfe" --mode pattern --json 2>/dev/null)
-pat=$(printf '%s' "$pj" | sed -n 's/.*"pattern":\(true\|false\).*/\1/p')
-check "the pattern engine ran" "$pat" "true"
-pc=$(printf '%s' "$pj" | sed -n 's/^{"count":\([0-9]*\).*/\1/p')
-check "one reading, from the data alone" "$pc" "1"
+# 512 bytes of 0xF6 is what MS-DOS FORMAT leaves behind, and it is what
+# both bad sectors of a real disk turned out to be. Dropping a few
+# reversals turns some of them into 0x76 / 0xF2; restoring the repeat
+# should put every one back in a single reading.
+if command -v python3 >/dev/null 2>&1; then
+	python3 -c "
+import sys
+open(sys.argv[1],'wb').write(b'\xF6' * (80*2*9*512))
+" "$out/fill.img"
+	"$dr" convert "$out/fill.img" --out "$out/fill.hfe" >/dev/null 2>&1
+	"$dr" convert "$out/fill.hfe" --out "$out/fill_ref.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	"$dr" damage "$out/fill.hfe" --sector 5 --drop-only \
+	      --bits 803,1701,2743,3001,3517,2119 \
+	      --out "$out/p0.hfe" >/dev/null 2>&1
+	check "one bad sector" "$(badcount "$out/p0.hfe")" "1"
 
-"$dr" repair "$out/p0.hfe" --apply 0 --out "$out/fp.img" \
-      --format RAW_LOADER >/dev/null 2>&1
-if cmp -s "$out/ref.img" "$out/fp.img"; then ok "4 dropped bits recovered exactly"
-else bad "4 dropped bits recovered exactly"; fi
+	pj=$("$dr" repair "$out/p0.hfe" --mode pattern --json 2>/dev/null)
+	pat=$(printf '%s' "$pj" | sed -n 's/.*"pattern":\(true\|false\).*/\1/p')
+	check "the pattern engine ran" "$pat" "true"
+	pc=$(printf '%s' "$pj" | sed -n 's/^{"count":\([0-9]*\).*/\1/p')
+	check "one reading, from the data alone" "$pc" "1"
+
+	"$dr" repair "$out/p0.hfe" --apply 0 --out "$out/fp.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/fill_ref.img" "$out/fp.img"
+	then ok "dropped reversals recovered exactly"
+	else bad "dropped reversals recovered exactly"; fi
+else
+	echo "  skip filler tests (no python3)"
+fi
 
 echo "== the counter model, on a table of incrementing records"
 # Tables of counters are everywhere on a disk - index tables, timing
@@ -88,7 +104,7 @@ EOF
 	"$dr" convert "$out/counter.hfe" --out "$out/counter_ref.img" \
 	      --format RAW_LOADER >/dev/null 2>&1
 	# drop six transitions, the way a weak patch of media would
-	"$dr" damage "$out/counter.hfe" --sector 5 \
+	"$dr" damage "$out/counter.hfe" --sector 5 --drop-only \
 	      --bits 811,1509,1622,2743,3004,3971 \
 	      --out "$out/cbad.hfe" >/dev/null 2>&1
 	check "one bad sector" "$(badcount "$out/cbad.hfe")" "1"

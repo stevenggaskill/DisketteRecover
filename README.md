@@ -427,6 +427,34 @@ score = data plausibility  +  flux plausibility  +  error-type prior
   interval timings, under the fitted bin centres.
 * **error-type prior** - restoring a dropped reversal beats inventing a
   spurious one.
+* **burst prior** - an error next to another error is one event, not two.
+
+That last term matters more than it looks. Scoring bits independently at
+a 2e-4 error rate says the typical gap between two errors is thousands of
+bits, so a five-bit answer is charged as five separate miracles and loses
+to any one-bit answer that happens to satisfy the CRC. The disks say
+otherwise. Across every fix that has a verifiable truth, 21 of the 22
+gaps between consecutive errors are under 160 bits and half are under 16
+- and the two ground-truth sectors on Disk 1, whose contents are known
+independently of any engine here, show the same clumping on their own, so
+it is not an artefact of whatever found them:
+
+```
+D1 72/1 s6   gaps   8, 69, 51, 149, 8
+D1 73/1 s6   gaps   77, 67, 8, 101
+D2 0/0 s15   gaps   14, 1, 3, 1, 3, 1, 8, 155, 149, 15, 1, 58
+D2 0/0 s16   gaps   2269
+```
+
+Which is physics rather than coincidence: one weak spot in the oxide, one
+off-track excursion, one speed wobble takes out a neighbourhood of
+reversals, not a bit. So a flip standing `d` bits from the previous flip
+is charged at `q * (1 + G*exp(-d/B))` instead of `q`, with `G` = 110 and
+`B` = 60 bits fitted to the table above (`--burst-gain`, `--burst-len`;
+`--burst-gain 0` turns it off). It does not invent fixes out of nothing -
+what it does is stop the independence assumption from throwing away the
+right answer, and every confirmed repair on both disks got stronger for
+it, Disk 2's counter sector by three orders of magnitude.
 
 A CRC accepts one reading in 65536 by chance. That is plenty when you are
 choosing between a few hundred candidates and nothing else to go on, and
@@ -565,6 +593,39 @@ confidently they were binned (green under the threshold, red where the
 decoder had to guess), the decoded bits, and the byte boundaries. The
 candidate currently selected is outlined in blue, with its flipped bits
 picked out in the bit row and in the hex dump.
+
+### The flux as a scatter plot
+
+`serve` shows one sector's cells in detail. `plot` shows the whole
+sector's timing at once, which is the view that tells you *what kind* of
+damage you are looking at:
+
+```sh
+disketterecover plot dump.raw --track 0 --side 0 --id 16 --out s16.html
+```
+
+![flux transition widths](docs/flux-scatter.png)
+
+One dot per flux reversal: x is the transition, y is the measured
+interval in cell periods, colour is the bin the decoder chose, and a ring
+marks a transition whose timing fits a different bin than the one it got.
+A healthy read is three flat bands at 2T, 3T and 4T.
+
+The second panel is the one worth reading. It plots the running
+difference between where the decoder thinks it is and where the flux says
+it is, in cell periods. Because the noise is on transition *positions*
+and an interval is the gap between two of them, one displaced reversal
+shows as a step that comes straight back; a genuine mis-read shows as a
+step that stays; and a stretch written at a different speed shows as a
+*slope*, which no amount of bit-flipping will fix.
+
+The picture above is Disk 2's track 0 side 0 sector 16, one of the
+sectors this tool cannot repair, and it shows why: the three bands hold
+for 800 transitions, blow apart for 370 of them, and re-form. Over that
+stretch the flux accounts for 905 cell periods where the decoder laid
+down 943 cells - a 4.2% local rate error against 0.4% either side - and
+the PLL emits ten gaps of 5 and 6 cells, which MFM cannot produce at all.
+That is not a handful of bit errors for a 16-bit CRC to pin down.
 
 ## Making test images
 

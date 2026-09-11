@@ -316,6 +316,7 @@ void dr_view_free(dr_view *v)
 	if (!v)
 		return;
 	dr_flux_free((dr_flux_map *)v->flux);
+	dr_fit_release(v->fit);
 	free(v->msg);
 	free(v->cells);
 	free(v->bytes);

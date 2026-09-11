@@ -17,7 +17,7 @@ LDFLAGS  += -L$(HXCBUILD) -Wl,-rpath,$(abspath $(HXCBUILD))
 
 SRCS := src/main.c src/dr_core.c src/dr_view.c src/dr_flux.c \
         src/dr_repair.c src/dr_rebin.c src/dr_pattern.c src/dr_crc.c src/dr_json.c src/dr_http.c \
-        src/dr_web.c
+        src/dr_web.c src/dr_web_plot.c
 OBJS := $(SRCS:.c=.o)
 
 BIN  := disketterecover
@@ -39,6 +39,9 @@ $(OBJS): src/dr.h src/dr_internal.h | $(LIBHXCFE)
 src/dr_web.c: web/index.html tools/embed.sh
 	sh tools/embed.sh dr_web_index $< > $@
 
+src/dr_web_plot.c: web/plot.html tools/embed.sh
+	sh tools/embed.sh dr_web_plot $< > $@
+
 hxc: $(LIBHXCFE)
 
 $(LIBHXCFE):
@@ -54,7 +57,7 @@ test: $(BIN)
 	sh tests/run.sh
 
 clean:
-	rm -f $(OBJS) $(BIN) src/dr_web.c
+	rm -f $(OBJS) $(BIN) src/dr_web.c src/dr_web_plot.c
 
 distclean: clean
 	-$(MAKE) -C $(HXC)/libhxcfe/build clean

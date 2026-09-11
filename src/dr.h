@@ -130,6 +130,7 @@ typedef struct {
 
 	int       flux_available;/* 1 if flux timings were aligned        */
 	void     *flux;          /* dr_flux_map *, kept for the re-binner */
+	void     *fit;           /* cached structural model of the data   */
 	double    period;        /* ticks per cell                        */
 	double    fit_a, fit_b;  /* measured cell length ~ a + b*bin      */
 	double    fit_sigma;
@@ -143,6 +144,13 @@ typedef struct {
 	int       first_bit;     /* first message bit eligible for repair */
 	int       sector_index;
 } dr_view;
+
+typedef enum {
+	DR_MODE_AUTO = 0,       /* try each engine, cheapest evidence first*/
+	DR_MODE_BITS,
+	DR_MODE_REBIN,
+	DR_MODE_PATTERN         /* trust the data's own regularity        */
+} dr_mode;
 
 /* ------------------------------------------------------------------ */
 /* A repair candidate: a set of message bits to flip.                  */
@@ -162,6 +170,8 @@ typedef struct {
 	/* Re-binning results only: how the flux was re-read. */
 	int     rebins;                /* intervals given a different bin */
 	double  flux_cost;             /* -log likelihood of the timings  */
+
+	dr_mode origin;                /* which engine proposed it        */
 
 	/* How much likelier this reading's data is under the sector's own
 	 * statistics than what was decoded (nats; higher is better). */
@@ -196,12 +206,7 @@ typedef struct {
 	char          note[256];
 } dr_repair_result;
 
-typedef enum {
-	DR_MODE_AUTO = 0,       /* try each engine, cheapest evidence first*/
-	DR_MODE_BITS,
-	DR_MODE_REBIN,
-	DR_MODE_PATTERN         /* trust the data's own regularity        */
-} dr_mode;
+
 
 typedef struct {
 	double good_threshold;  /* p_err below this = "assumed good"      */
@@ -219,6 +224,9 @@ typedef struct {
 	int     max_outliers;   /* pattern engine: bytes off-pattern      */
 	double  dropout_bias;   /* nats favouring a lost 1 over a gained 1*/
 	int     restore_only;   /* only consider putting reversals back   */
+	double  burst_gain;     /* error odds multiplier right after an   */
+	                        /* error - 0 disables the burst prior     */
+	double  burst_len;      /* how fast that decays, in message bits  */
 } dr_options;
 
 void        dr_options_default(dr_options *o);
@@ -257,6 +265,11 @@ int         dr_repair_search(dr_view *v, const dr_options *o,
  * the transitions, keeping the total cell count intact. */
 int         dr_rebin_search(dr_view *v, const dr_options *o,
                             dr_repair_result *out);
+
+/* Run every engine that applies and rank their candidates together on
+ * one scale, rather than taking whichever answers first. */
+int         dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *o,
+                           dr_repair_result *out);
 
 /* Occam's razor: most sector data is not random. Find the pattern the
  * field almost obeys, and see whether restoring it satisfies the CRC. */
@@ -303,8 +316,11 @@ int         dr_verify(dr_ctx *c, int sector_index);
 /* Export the (possibly patched) floppy through libhxcfe. */
 int         dr_export(dr_ctx *c, const char *path, const char *format);
 
-/* Deliberately corrupt decoded data bits - used to build test images. */
-int         dr_damage(dr_ctx *c, int sector_index, const int *bits, int nbits);
+/* Deliberately corrupt decoded data bits - used to build test images.
+ * With drop_only, a bit is touched only if it currently reads 1, so the
+ * damage is a lost reversal: the failure real media actually produces. */
+int         dr_damage(dr_ctx *c, int sector_index, const int *bits, int nbits,
+                      int drop_only);
 
 /* ------------------------------------------------------------------ */
 /* CRC helpers (CRC-16/CCITT-FALSE, poly 0x1021, init 0xFFFF)          */

@@ -8,3 +8,4 @@ tests/out/
 src/dr_web.c
 docs/*.tmp
 demo-out/
+src/dr_web_plot.c

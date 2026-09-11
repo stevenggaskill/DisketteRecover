@@ -30,6 +30,7 @@
 
 #define MAX_PERIOD  256
 #define ALPHA       0.08     /* add-alpha smoothing for the byte model */
+#define BYTE_NATS   5.545    /* ln(256): the surprise of one wrong byte */
 
 struct dr_model {
 	uint16_t *c2;        /* 256^3 counts, saturating                  */
@@ -532,19 +533,107 @@ static double dmodel_delta(const struct dmodel *m, const uint8_t *cur,
 /* ------------------------------------------------------------------ */
 /* Shared re-scoring hook used by every engine                         */
 /* ------------------------------------------------------------------ */
+/* ---- the fit, cached on the view ---------------------------------- */
+void *dr_fit_get(dr_view *v)
+{
+	dr_fit *f;
+
+	if (!v || !v->msg || v->data_len <= 0)
+		return NULL;
+	if (v->fit)
+		return v->fit;
+
+	f = calloc(1, sizeof(*f));
+	if (!f)
+		return NULL;
+	if (fit_best(v->msg + v->data_offset, v->data_len, f) < 0 ||
+	    !fit_trusted(f)) {
+		fit_free(f);
+		free(f);
+		return NULL;
+	}
+	v->fit = f;
+	return f;
+}
+
+int dr_fit_outliers(void *fitp, const uint8_t *data, int n)
+{
+	dr_fit *f = fitp;
+	int i, out = 0;
+
+	if (!f)
+		return -1;
+	for (i = 0; i < n; i++)
+		if (f->known[i] && f->pred[i] != data[i])
+			out++;
+	return out;
+}
+
+void dr_fit_release(void *fitp)
+{
+	dr_fit *f = fitp;
+
+	if (!f)
+		return;
+	fit_free(f);
+	free(f);
+}
+
+/*
+ * Put every engine's candidates on one scale.
+ *
+ * The engines reason in different currencies - a re-binning scores flux
+ * timings, a bit-flip search scores per-bit confidence, the data model
+ * scores bytes - and their raw numbers are not comparable. Ranked only
+ * within an engine, a fifteen-bit re-reading that rewrites nine bytes
+ * can be declared a certainty while a one-bit dropout repair sits
+ * unexamined in another engine's list.
+ *
+ * So the score is recomputed here from scratch, out of terms that mean
+ * the same thing wherever the candidate came from:
+ *
+ *   data      how much likelier the resulting bytes are under a model
+ *             of this disk's data
+ *   flux      the per-bit confidence the timings assign to each bit the
+ *             candidate moves
+ *   physics   restoring a dropped reversal beats inventing one
+ *
+ * A reading that moves fifteen bits pays the flux term fifteen times.
+ */
+/* The candidate's flips in ascending bit order, as indices into its own
+ * arrays - the burst prior needs the distance to the previous one. */
+static void order_bits(const dr_candidate *cd, int *ord)
+{
+	int i, j;
+
+	for (i = 0; i < cd->weight; i++)
+		ord[i] = i;
+	for (i = 1; i < cd->weight; i++) {
+		int key = ord[i];
+
+		for (j = i - 1; j >= 0 && cd->bits[ord[j]] > cd->bits[key]; j--)
+			ord[j + 1] = ord[j];
+		ord[j + 1] = key;
+	}
+}
+
 int dr_rescore_data(dr_ctx *c, dr_view *v, const dr_options *opt,
                     dr_repair_result *r)
 {
 	struct dmodel local;
 	const uint8_t *cur;
-	uint8_t *base = NULL;
 	double base_score = 0.0;
-	int i, k, use_disk = 0;
+	void *fit;
+	int ord[DR_MAX_WEIGHT];
+	int i, k, use_disk = 0, before = 0;
 
 	if (!v || !r || !r->count || v->data_len <= 0)
 		return 0;
 
 	cur = v->msg + v->data_offset;
+	fit = dr_fit_get(v);
+	if (fit)
+		before = dr_fit_outliers(fit, cur, v->data_len);
 
 	/* Prefer a model of the whole disk; fall back to this sector's own
 	 * statistics when there is nothing else to learn from. */
@@ -555,52 +644,96 @@ int dr_rescore_data(dr_ctx *c, dr_view *v, const dr_options *opt,
 			use_disk = 1;
 	}
 
-	if (use_disk) {
-		base_score = dr_model_score(c->model, cur, v->data_len);
-	} else if (dmodel_build(&local, cur, v->data_len) < 0) {
-		return -1;
-	}
-
-	base = malloc((size_t)v->data_len);
-	if (!base) {
-		if (!use_disk)
-			dmodel_free(&local);
-		return -1;
+	if (!fit) {
+		if (use_disk)
+			base_score = dr_model_score(c->model, cur, v->data_len);
+		else if (dmodel_build(&local, cur, v->data_len) < 0)
+			return -1;
 	}
 
 	for (i = 0; i < r->count; i++) {
 		dr_candidate *cd = &r->list[i];
 		uint8_t *msg = dr_candidate_message(v, cd);
+		double flux = 0.0;
 
 		if (!msg)
 			continue;
 
-		if (use_disk)
+		/*
+		 * Prefer the strongest data model available. A byte n-gram
+		 * cannot represent a counter - ask it whether restoring a
+		 * table of incrementing records is an improvement and it will
+		 * say no, because it never learned the increment. Where a
+		 * structural fit holds, the honest measure of a reading is
+		 * how many bytes it leaves off-pattern.
+		 */
+		if (fit) {
+			int after = dr_fit_outliers(fit, msg + v->data_offset,
+			                            v->data_len);
+			cd->data_prior = (double)(before - after) * BYTE_NATS;
+		} else if (use_disk) {
 			cd->data_prior = dr_model_score(c->model,
 			        msg + v->data_offset, v->data_len) - base_score;
-		else
+		} else {
 			cd->data_prior = dmodel_delta(&local, cur,
 			        msg + v->data_offset, v->data_len);
+		}
 
 		cd->restores = cd->removes = 0;
+		order_bits(cd, ord);
 		for (k = 0; k < cd->weight; k++) {
-			if (cd->before[k])
+			double q;
+			int b = cd->bits[ord[k]];
+
+			if (cd->before[ord[k]])
 				cd->removes++;     /* reading says 1, we say 0 */
 			else
 				cd->restores++;    /* reading says 0, we say 1 */
+
+			/* What the timings think of moving this particular
+			 * bit. A confident cell is expensive to overrule. */
+			q = (b >= 0 && b < v->msg_bits) ? v->bit_perr[b] : 1e-4;
+
+			/*
+			 * ...and what the bit before it says. Errors on this
+			 * medium are not memoryless: every reading we have
+			 * been able to confirm puts its errors in clumps.
+			 * Over the confirmed fixes on both disks, 21 of the
+			 * 22 gaps between consecutive errors are under 160
+			 * bits and half are under 16, where an independent
+			 * error rate of 2e-4 per bit would put the typical
+			 * gap in the thousands. The ground-truth sectors on
+			 * their own show the same thing, so it is not an
+			 * artefact of the engine that found them.
+			 *
+			 * That is physics, not coincidence - one weak spot
+			 * in the oxide, one off-track excursion, one speed
+			 * wobble takes out a neighbourhood of reversals, not
+			 * a bit. So a flip standing next to another flip is
+			 * charged as the continuation of one event rather
+			 * than as a second independent miracle.
+			 */
+			if (k > 0 && opt->burst_gain > 0.0 &&
+			    opt->burst_len > 0.0) {
+				double d = (double)(b - cd->bits[ord[k - 1]]);
+				double lift = 1.0 + opt->burst_gain *
+				        exp(-d / opt->burst_len);
+				q *= lift;
+			}
+			if (q <= 0.0) q = 1e-9;
+			if (q >= 0.5) q = 0.499999;
+			flux += log(q) - log(1.0 - q);
 		}
 
 		/* Media loses transitions far more readily than it invents
 		 * them - a weak pulse falls under the detector's threshold,
-		 * whereas noise has to clear it. So putting a 1 back is the
-		 * commoner repair. Mild, and only a tie-breaker. */
-		cd->log_likelihood += cd->data_prior
+		 * whereas noise has to clear it. */
+		cd->log_likelihood = cd->data_prior + flux
 		        + opt->dropout_bias * (cd->restores - cd->removes);
 		free(msg);
 	}
 
-	free(base);
-	if (!use_disk)
+	if (!fit && !use_disk)
 		dmodel_free(&local);
 
 	/* re-sort and re-normalise */
@@ -619,6 +752,104 @@ int dr_rescore_data(dr_ctx *c, dr_view *v, const dr_options *opt,
 			r->list[i].rel_likelihood =
 			        exp(r->list[i].log_likelihood - best);
 	}
+	return 0;
+}
+
+/* Are two candidates the same set of bit flips? */
+static int same_flips(const dr_candidate *a, const dr_candidate *b)
+{
+	int i;
+
+	if (a->weight != b->weight)
+		return 0;
+	for (i = 0; i < a->weight; i++)
+		if (a->bits[i] != b->bits[i])
+			return 0;
+	return 1;
+}
+
+int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
+                   dr_repair_result *out)
+{
+	dr_options defopt;
+	dr_repair_result part[3];
+	dr_mode modes[3] = { DR_MODE_PATTERN, DR_MODE_REBIN, DR_MODE_BITS };
+	dr_candidate *all = NULL;
+	int nall = 0, i, j, m;
+
+	if (!opt) {
+		dr_options_default(&defopt);
+		opt = &defopt;
+	}
+	memset(out, 0, sizeof(*out));
+	memset(part, 0, sizeof(part));
+
+	for (m = 0; m < 3; m++) {
+		if (modes[m] == DR_MODE_PATTERN)
+			dr_pattern_search(v, opt, &part[m]);
+		else if (modes[m] == DR_MODE_REBIN)
+			dr_rebin_search(v, opt, &part[m]);
+		else
+			dr_repair_search(v, opt, &part[m]);
+
+		for (i = 0; i < part[m].count; i++)
+			part[m].list[i].origin = modes[m];
+
+		/* Keep the running commentary of whichever engine had most
+		 * to say about the damage. */
+		if (part[m].note[0] && !out->note[0])
+			snprintf(out->note, sizeof(out->note), "%s",
+			         part[m].note);
+		if (part[m].ambiguous > out->ambiguous)
+			out->ambiguous = part[m].ambiguous;
+		if (part[m].uncertain_bits > out->uncertain_bits)
+			out->uncertain_bits = part[m].uncertain_bits;
+		out->explored += part[m].explored;
+		out->truncated |= part[m].truncated;
+		if (part[m].floor_cost > out->floor_cost) {
+			out->floor_cost = part[m].floor_cost;
+			out->current_cost = part[m].current_cost;
+		}
+		if (modes[m] == DR_MODE_PATTERN) {
+			out->period = part[m].period;
+			out->outliers = part[m].outliers;
+			out->coverage = part[m].coverage;
+		}
+		if (modes[m] == DR_MODE_BITS)
+			out->npool = part[m].npool;
+		out->searched_weight += part[m].searched_weight;
+		nall += part[m].count;
+	}
+
+	if (nall) {
+		all = malloc((size_t)nall * sizeof(*all));
+		if (!all) {
+			for (m = 0; m < 3; m++)
+				dr_repair_free(&part[m]);
+			return -1;
+		}
+		nall = 0;
+		for (m = 0; m < 3; m++)
+			for (i = 0; i < part[m].count; i++) {
+				int dup = 0;
+				for (j = 0; j < nall && !dup; j++)
+					dup = same_flips(&all[j],
+					                 &part[m].list[i]);
+				if (!dup)
+					all[nall++] = part[m].list[i];
+			}
+	}
+	for (m = 0; m < 3; m++)
+		dr_repair_free(&part[m]);
+
+	out->list = all;
+	out->count = nall;
+	if (nall > opt->max_results) {
+		out->count = opt->max_results;
+		out->truncated = 1;
+	}
+
+	dr_rescore_data(c, v, opt, out);
 	return 0;
 }
 
@@ -734,27 +965,37 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 	 * first; each byte left broken makes the reading less likely.
 	 */
 	for (leave = 0; leave <= nout && !nfound; leave++) {
-		unsigned long combo, limit;
+		int idx[24], t;
 
-		if (nout > 20)
+		if (nout > 24 || leave > 12)
 			break;
-		limit = 1UL << nout;
+		if (leave > nout)
+			break;
 
-		for (combo = 0; combo < limit; combo++) {
+		/* Enumerate the C(nout, leave) subsets directly. Walking all
+		 * 2^nout masks and filtering by popcount looks equivalent and
+		 * is not: it does twenty million iterations to find the few
+		 * thousand of the right size. */
+		for (i = 0; i < leave; i++)
+			idx[i] = i;
+
+		for (;;) {
 			uint16_t syn = v->syndrome;
 			int bits[DR_MAX_WEIGHT], nb = 0, ok = 1;
 
-			if (__builtin_popcountl(combo) != leave)
-				continue;
 			explored++;
 
 			memcpy(fixed, data, (size_t)n);
 			for (i = 0; i < nout && ok; i++) {
 				int pos = outpos[i];
 				uint8_t want, diff;
+				int skip = 0;
 
-				if (combo & (1UL << i))
+				for (t = 0; t < leave; t++)
+					if (idx[t] == i) { skip = 1; break; }
+				if (skip)
 					continue;          /* left broken */
+
 				want = f.pred[pos];
 				fixed[pos] = want;
 				diff = (uint8_t)(want ^ data[pos]);
@@ -769,31 +1010,42 @@ int dr_pattern_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 				}
 			}
 
-			if (!ok || !nb || syn)
-				continue;
-
-			if (nfound == fcap) {
-				int nc = fcap ? fcap * 2 : 16;
-				dr_candidate *nl = realloc(found,
-				        (size_t)nc * sizeof(*nl));
-				if (!nl) { rc = -1; goto done; }
-				found = nl;
-				fcap = nc;
-			}
-			{
-				dr_candidate *cd = &found[nfound++];
-
-				memset(cd, 0, sizeof(*cd));
-				cd->weight = nb;
-				for (j = 0; j < nb; j++) {
-					cd->bits[j] = bits[j];
-					cd->before[j] = (uint8_t)
-					  ((v->msg[bits[j] >> 3] >>
-					    (7 - (bits[j] & 7))) & 1);
+			if (ok && nb && !syn) {
+				if (nfound == fcap) {
+					int nc = fcap ? fcap * 2 : 16;
+					dr_candidate *nl = realloc(found,
+					        (size_t)nc * sizeof(*nl));
+					if (!nl) { rc = -1; goto done; }
+					found = nl;
+					fcap = nc;
 				}
-				cd->data_prior = dmodel_delta(&m, data, fixed, n);
-				cd->log_likelihood = cd->data_prior;
+				{
+					dr_candidate *cd = &found[nfound++];
+
+					memset(cd, 0, sizeof(*cd));
+					cd->weight = nb;
+					for (j = 0; j < nb; j++) {
+						cd->bits[j] = bits[j];
+						cd->before[j] = (uint8_t)
+						  ((v->msg[bits[j] >> 3] >>
+						    (7 - (bits[j] & 7))) & 1);
+					}
+					cd->data_prior = dmodel_delta(&m, data,
+					                              fixed, n);
+					cd->log_likelihood = cd->data_prior;
+				}
 			}
+
+			if (!leave)
+				break;
+			i = leave - 1;
+			while (i >= 0 && idx[i] == nout - (leave - i))
+				i--;
+			if (i < 0)
+				break;
+			idx[i]++;
+			for (++i; i < leave; i++)
+				idx[i] = idx[i - 1] + 1;
 		}
 	}
 

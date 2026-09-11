@@ -1,0 +1,322 @@
+<title>Flux transition widths</title>
+<style>
+:root{
+  --bg:#12141a; --panel:#191c24; --line:#2a2f3c; --fg:#dfe3ec; --dim:#8a93a6;
+  --grid:#232834;
+  --c2:#3b7dd8; --c3:#d4763a; --c4:#4aa88a; --bad:#b8536b;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+header{padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{font-size:14px;margin:0 0 4px;letter-spacing:.4px}
+h1 span{color:var(--c2)}
+.meta{color:var(--dim);font-size:12px}
+.meta b{color:var(--fg);font-weight:600}
+main{padding:14px 16px;display:flex;flex-direction:column;gap:14px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:5px}
+section>h2{margin:0;padding:8px 12px;font-size:11px;letter-spacing:1.1px;
+  text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--line)}
+.body{padding:10px 12px}
+.row{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:8px}
+input[type=range]{width:340px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--dim)}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:50%;
+  vertical-align:-1px;margin-right:5px}
+.legend .ring{box-shadow:0 0 0 2px var(--panel),0 0 0 3.5px var(--bad)}
+canvas{display:block;cursor:crosshair}
+#tip{position:fixed;pointer-events:none;background:#0e1016;border:1px solid var(--line);
+  border-radius:4px;padding:6px 8px;font-size:11px;line-height:1.5;display:none;z-index:9}
+#tip b{color:var(--c2)}
+table{border-collapse:collapse;font-size:12px;margin-top:6px}
+th,td{text-align:left;padding:2px 10px 2px 0;white-space:nowrap}
+th{color:var(--dim);font-weight:600}
+.note{color:var(--dim);font-size:11px;margin-top:6px}
+</style>
+
+<header>
+  <h1>Flux transition widths &mdash; <span id="who">-</span></h1>
+  <div class="meta" id="meta"></div>
+</header>
+
+<main>
+<section>
+  <h2>Measured width per transition</h2>
+  <div class="body">
+    <div class="row">
+      <label>zoom <input id="span" type="range" min="60" max="4000" value="700"></label>
+      <label>from <input id="from" type="range" min="0" max="100" value="0"></label>
+      <span class="legend">
+        <span><i style="background:var(--c2)"></i>decoder said 2T</span>
+        <span><i style="background:var(--c3)"></i>3T</span>
+        <span><i style="background:var(--c4)"></i>4T</span>
+        <span><i class="ring" style="background:var(--bad)"></i>timing fits a different bin</span>
+      </span>
+    </div>
+    <canvas id="scatter" height="330"></canvas>
+    <div class="note" id="hint"></div>
+  </div>
+</section>
+
+<section>
+  <h2>Where the reading has drifted &mdash; position residual</h2>
+  <div class="body">
+    <canvas id="resid" height="190"></canvas>
+    <div class="note">
+      Each point is how far the decoder's running position has drifted from
+      the measured one, in cell periods. Because the noise is on transition
+      <em>positions</em>, a single displaced reversal shows as one step that
+      comes straight back &mdash; a genuine mis-read shows as a step that stays.
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Timing model</h2>
+  <div class="body">
+    <table id="model"></table>
+    <div class="note">Bin centres are fitted to this track, not assumed:
+      a dump's bitrate is never exact and peak shift moves an interval
+      depending on its neighbours.</div>
+  </div>
+</section>
+</main>
+<div id="tip"></div>
+
+<script>
+"use strict";
+const D = /*__DR_DATA__*/null;
+const $ = s => document.querySelector(s);
+
+/* ---- rebuild the interval list from the cell arrays ---- */
+const C = D.cells, st = C.state, ticks = C.ticks;
+const period = 250000000 / (2 * D.bitrate);
+const IV = [];
+let prev = null;
+for (let i = 0; i < C.n; i++){
+  if (st[i] !== "1") continue;
+  if (prev !== null && ticks[i] > 0)
+    IV.push({cell: C.first + i, idx: i, gap: i - prev, t: ticks[i],
+             meas: ticks[i] / period, byte: Math.floor(i / D.stride)});
+  prev = i;
+}
+
+/* ---- fit meas ~ a + b*bin + c*prev + d*next, robustly ---- */
+function solve(A, n){
+  for (let i = 0; i < n; i++){
+    let p = i;
+    for (let j = i+1; j < n; j++) if (Math.abs(A[j][i]) > Math.abs(A[p][i])) p = j;
+    [A[i], A[p]] = [A[p], A[i]];
+    for (let j = i+1; j < n; j++){
+      const f = A[j][i]/A[i][i];
+      for (let k = i; k <= n; k++) A[j][k] -= f*A[i][k];
+    }
+  }
+  const x = new Array(n).fill(0);
+  for (let i = n-1; i >= 0; i--){
+    let s = A[i][n];
+    for (let j = i+1; j < n; j++) s -= A[i][j]*x[j];
+    x[i] = s/A[i][i];
+  }
+  return x;
+}
+const K = i => { const g = IV[i] ? IV[i].gap : 3; return (g>=2&&g<=4)?g:3; };
+let co = [0,1,0,0], sd = 0.15;
+for (let pass = 0; pass < 6; pass++){
+  const A = [[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0]];
+  let used = 0;
+  IV.forEach((v,i) => {
+    if (v.gap < 2 || v.gap > 4) return;
+    const x = [1, v.gap, K(i-1), K(i+1)];
+    if (Math.abs(v.meas - (co[0]+co[1]*x[1]+co[2]*x[2]+co[3]*x[3])) > Math.max(3.5*sd, 0.1)) return;
+    for (let a = 0; a < 4; a++){
+      for (let b = 0; b < 4; b++) A[a][b] += x[a]*x[b];
+      A[a][4] += x[a]*v.meas;
+    }
+    used++;
+  });
+  if (used < 40) break;
+  co = solve(A, 4);
+  let ss = 0, m = 0;
+  IV.forEach((v,i) => {
+    if (v.gap < 2 || v.gap > 4) return;
+    const x = [1, v.gap, K(i-1), K(i+1)];
+    const r = v.meas - (co[0]+co[1]*x[1]+co[2]*x[2]+co[3]*x[3]);
+    if (Math.abs(r) > Math.max(3.5*sd, 0.1)) return;
+    ss += r*r; m++;
+  });
+  sd = Math.sqrt(ss/Math.max(m,1));
+}
+const centre = k => co[0] + co[1]*k + co[2]*3 + co[3]*3;
+
+/* residual, best bin, and the running position drift */
+let rho = 0, rv = 0, rc = 0, pr = null;
+IV.forEach((v,i) => {
+  const x = [1, v.gap, K(i-1), K(i+1)];
+  v.pred = co[0]+co[1]*x[1]+co[2]*x[2]+co[3]*x[3];
+  v.r = (v.gap>=2&&v.gap<=4) ? v.meas - v.pred : 0;
+  v.z = v.r / sd;
+  let best = v.gap, bd = 1e9;
+  for (let k = 2; k <= 4; k++){
+    const dd = Math.abs(v.meas - (co[0]+co[1]*k+co[2]*x[2]+co[3]*x[3]));
+    if (dd < bd){ bd = dd; best = k; }
+  }
+  v.best = best;
+  v.bad = (v.gap < 2 || v.gap > 4 || best !== v.gap);
+  if (Math.abs(v.z) < 3.5){
+    rv += v.r*v.r;
+    if (pr !== null){ rho += pr*v.r; rc++; }
+    pr = v.r;
+  } else pr = null;
+});
+rho = rv > 0 ? rho/rv : -0.5;
+const sigPos = sd * Math.sqrt(Math.max(0.05, Math.min(0.75, -rho)) * 2);
+let drift = 0;
+IV.forEach(v => { drift += v.meas - v.gap; v.drift = drift; });
+
+/* ---- header ---- */
+$("#who").textContent = `track ${D.track} side ${D.side} sector ${D.id}`;
+$("#meta").innerHTML =
+  `CRC <b>${D.crc_valid ? "valid" : "INVALID"}</b> &middot; ` +
+  `${IV.length} transitions &middot; ${D.msg_len} byte message &middot; ` +
+  `cell period <b>${period.toFixed(1)}</b> ticks`;
+$("#model").innerHTML =
+  `<tr><th>fitted</th><td>cell = ${co[0].toFixed(3)} ${co[1]>=0?"+":""}${co[1].toFixed(3)}&times;bin ` +
+  `${co[2]>=0?"+":""}${co[2].toFixed(3)}&times;prev ${co[3]>=0?"+":""}${co[3].toFixed(3)}&times;next</td></tr>` +
+  `<tr><th>bin centres</th><td>2T = ${centre(2).toFixed(3)} &middot; 3T = ${centre(3).toFixed(3)} &middot; 4T = ${centre(4).toFixed(3)}</td></tr>` +
+  `<tr><th>interval &sigma;</th><td>${sd.toFixed(4)} cells</td></tr>` +
+  `<tr><th>lag-1 autocorrelation</th><td>${rho.toFixed(3)} &nbsp;<span style="color:var(--dim)">` +
+  `(&minus;0.5 is the signature of noise on transition positions)</span></td></tr>` +
+  `<tr><th>position &sigma;</th><td>${sigPos.toFixed(4)} cells</td></tr>`;
+
+/* ---- drawing ---- */
+const cv = $("#scatter"), cx = cv.getContext("2d");
+const rz = $("#resid"), rx = rz.getContext("2d");
+const PAD = {l: 54, r: 14, t: 14, b: 26};
+const COL = {2:"--c2", 3:"--c3", 4:"--c4"};
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function size(){
+  const w = Math.max(700, Math.min(2200, window.innerWidth - 60));
+  cv.width = w; cv.style.width = w + "px";
+  rz.width = w; rz.style.width = w + "px";
+}
+window.addEventListener("resize", () => { size(); draw(); });
+
+let view = {from: 0, span: 700};
+function pts(){
+  const a = Math.max(0, Math.min(IV.length - 1, view.from));
+  const b = Math.min(IV.length, a + view.span);
+  return [a, b];
+}
+
+function draw(){
+  const [a, b] = pts();
+  const n = b - a;
+  const W = cv.width - PAD.l - PAD.r, H = cv.height - PAD.t - PAD.b;
+  let lo = 1.2, hi = 4.8;
+  for (let i = a; i < b; i++){ lo = Math.min(lo, IV[i].meas); hi = Math.max(hi, IV[i].meas); }
+  lo -= 0.15; hi += 0.15;
+  const X = i => PAD.l + ((i - a) / Math.max(n - 1, 1)) * W;
+  const Y = v => PAD.t + (1 - (v - lo) / (hi - lo)) * H;
+
+  cx.fillStyle = css("--panel"); cx.fillRect(0, 0, cv.width, cv.height);
+
+  /* bin-centre reference lines, recessive, directly labelled */
+  cx.font = "11px ui-monospace,monospace";
+  for (let k = 2; k <= 4; k++){
+    const y = Y(centre(k));
+    cx.strokeStyle = css("--grid"); cx.lineWidth = 1;
+    cx.setLineDash([4, 4]);
+    cx.beginPath(); cx.moveTo(PAD.l, y); cx.lineTo(cv.width - PAD.r, y); cx.stroke();
+    cx.setLineDash([]);
+    cx.fillStyle = css(COL[k]); cx.textAlign = "right";
+    cx.fillText(k + "T", PAD.l - 8, y + 4);
+  }
+  cx.fillStyle = css("--dim"); cx.textAlign = "right";
+  cx.fillText(lo.toFixed(1), PAD.l - 8, Y(lo) + 4);
+  cx.fillText(hi.toFixed(1), PAD.l - 8, Y(hi) + 4);
+
+  /* points: 2px surface ring on the ones that do not fit their bin */
+  for (let i = a; i < b; i++){
+    const v = IV[i], x = X(i), y = Y(v.meas);
+    cx.beginPath();
+    cx.arc(x, y, v.bad ? 4 : 2.4, 0, 6.2832);
+    cx.fillStyle = v.bad ? css("--bad") : css(COL[v.gap] || "--dim");
+    cx.fill();
+    if (v.bad){
+      cx.lineWidth = 2; cx.strokeStyle = css("--panel"); cx.stroke();
+      cx.beginPath(); cx.arc(x, y, 6, 0, 6.2832);
+      cx.lineWidth = 1.5; cx.strokeStyle = css("--bad"); cx.stroke();
+    }
+  }
+  cx.strokeStyle = css("--line"); cx.lineWidth = 1;
+  cx.beginPath(); cx.moveTo(PAD.l, PAD.t); cx.lineTo(PAD.l, PAD.t + H);
+  cx.lineTo(cv.width - PAD.r, PAD.t + H); cx.stroke();
+  cx.fillStyle = css("--dim"); cx.textAlign = "left";
+  cx.fillText(`transition ${a}`, PAD.l, cv.height - 8);
+  cx.textAlign = "right";
+  cx.fillText(`transition ${b - 1}  (byte ${IV[b-1] ? IV[b-1].byte : "-"})`,
+              cv.width - PAD.r, cv.height - 8);
+
+  /* residual panel */
+  const H2 = rz.height - PAD.t - PAD.b;
+  let dlo = 0, dhi = 0;
+  for (let i = a; i < b; i++){ dlo = Math.min(dlo, IV[i].drift); dhi = Math.max(dhi, IV[i].drift); }
+  const pad = Math.max(0.4, (dhi - dlo) * 0.15);
+  dlo -= pad; dhi += pad;
+  const Y2 = v => PAD.t + (1 - (v - dlo) / (dhi - dlo)) * H2;
+  rx.fillStyle = css("--panel"); rx.fillRect(0, 0, rz.width, rz.height);
+  rx.strokeStyle = css("--grid"); rx.setLineDash([4,4]);
+  rx.beginPath(); rx.moveTo(PAD.l, Y2(0)); rx.lineTo(rz.width - PAD.r, Y2(0)); rx.stroke();
+  rx.setLineDash([]);
+  rx.strokeStyle = css("--c2"); rx.lineWidth = 2; rx.beginPath();
+  for (let i = a; i < b; i++){
+    const x = X(i), y = Y2(IV[i].drift);
+    i === a ? rx.moveTo(x, y) : rx.lineTo(x, y);
+  }
+  rx.stroke();
+  for (let i = a; i < b; i++){
+    if (!IV[i].bad) continue;
+    rx.beginPath(); rx.arc(X(i), Y2(IV[i].drift), 3.5, 0, 6.2832);
+    rx.fillStyle = css("--bad"); rx.fill();
+    rx.lineWidth = 2; rx.strokeStyle = css("--panel"); rx.stroke();
+  }
+  rx.fillStyle = css("--dim"); rx.textAlign = "right"; rx.font = "11px ui-monospace,monospace";
+  rx.fillText(dhi.toFixed(2), PAD.l - 8, Y2(dhi) + 4);
+  rx.fillText(dlo.toFixed(2), PAD.l - 8, Y2(dlo) + 4);
+  rx.fillText("0", PAD.l - 8, Y2(0) + 4);
+
+  $("#hint").textContent =
+    `showing transitions ${a}..${b-1} of ${IV.length}  ` +
+    `(message bytes ${IV[a] ? IV[a].byte : 0}..${IV[b-1] ? IV[b-1].byte : 0})  ` +
+    `- ${IV.slice(a,b).filter(v => v.bad).length} do not fit their bin`;
+}
+
+/* ---- hover ---- */
+const tip = $("#tip");
+cv.addEventListener("mousemove", e => {
+  const [a, b] = pts(), n = b - a;
+  const W = cv.width - PAD.l - PAD.r;
+  const r = cv.getBoundingClientRect();
+  const i = a + Math.round(((e.clientX - r.left - PAD.l) / W) * Math.max(n - 1, 1));
+  if (i < a || i >= b){ tip.style.display = "none"; return; }
+  const v = IV[i];
+  tip.innerHTML =
+    `<b>transition ${i}</b> &middot; cell ${v.cell} &middot; byte ${v.byte}<br>` +
+    `measured <b>${v.meas.toFixed(3)}T</b> (${v.t} ticks)<br>` +
+    `decoder said ${v.gap}T, timing fits <b>${v.best}T</b><br>` +
+    `residual ${v.r >= 0 ? "+" : ""}${v.r.toFixed(3)} cells (${v.z >= 0 ? "+" : ""}${v.z.toFixed(1)}&sigma;)<br>` +
+    `drift here ${v.drift >= 0 ? "+" : ""}${v.drift.toFixed(2)} cells`;
+  tip.style.display = "block";
+  tip.style.left = Math.min(e.clientX + 14, window.innerWidth - 240) + "px";
+  tip.style.top = (e.clientY + 14) + "px";
+});
+cv.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+
+$("#span").max = Math.max(120, IV.length);
+$("#from").max = Math.max(0, IV.length - 60);
+$("#span").oninput = () => { view.span = +$("#span").value; draw(); };
+$("#from").oninput = () => { view.from = +$("#from").value; draw(); };
+size(); draw();
+</script>

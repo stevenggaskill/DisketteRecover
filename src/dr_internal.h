@@ -112,7 +112,10 @@ typedef struct {
 typedef struct {
 	double a, b;        /* offset and gain                            */
 	double c, d;        /* pull from the previous / next interval     */
-	double sigma;       /* residual standard deviation, in cells      */
+	double sigma;       /* interval residual std, in cells            */
+	double rho;         /* lag-1 autocorrelation of those residuals   */
+	double sigma_pos;   /* std of the underlying transition-position  */
+	                    /* error, in cells                            */
 	int    n;           /* intervals the fit was built from           */
 	int    valid;
 } dr_timing;
@@ -137,6 +140,12 @@ dr_model *dr_model_build(dr_ctx *c);
 void      dr_model_free(dr_model *m);
 double    dr_model_logp(const dr_model *m, int p2, int p1, int cur);
 double    dr_model_score(const dr_model *m, const uint8_t *d, int n);
+
+/* The structural model of the data field, fitted once and cached on the
+ * view. NULL when nothing trustworthy fits. */
+void *dr_fit_get(dr_view *v);
+int   dr_fit_outliers(void *fit, const uint8_t *data, int n);
+void  dr_fit_release(void *fit);
 
 /* Re-rank an engine's results by how plausible their data is. */
 int dr_rescore_data(dr_ctx *c, dr_view *v, const dr_options *opt,

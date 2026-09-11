@@ -13,11 +13,19 @@
 /* ------------------------------------------------------------------ */
 static int g_verbose;
 
+/*
+ * libhxcfe narrates its own decoding, and on a flux dump that means a
+ * screenful of "Invalid rpm or tracklen" for every track whose index
+ * timing it does not like - none of which the caller can act on, and all
+ * of which it recovers from by falling back to 300 RPM. Real failures
+ * reach the caller through dr_last_error() instead, so this is silent
+ * unless -v asks for it.
+ */
 static int32_t dr_printf(int32_t MSGTYPE, const char *chaine, ...)
 {
 	va_list ap;
 
-	if (!g_verbose && MSGTYPE != MSG_ERROR)
+	if (!g_verbose)
 		return 0;
 	if (g_verbose < 2 && MSGTYPE == MSG_DEBUG)
 		return 0;
@@ -58,6 +66,8 @@ void dr_options_default(dr_options *o)
 	o->rebin_width    = 24;
 	o->max_outliers   = 24;
 	o->dropout_bias   = 1.6;
+	o->burst_gain     = 110.0;
+	o->burst_len      = 60.0;
 }
 
 /* ------------------------------------------------------------------ */

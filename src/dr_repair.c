@@ -451,16 +451,49 @@ int dr_apply(dr_ctx *c, dr_view *v, const dr_candidate *cand)
 	return patch_bits(c, v, cand->bits, cand->weight);
 }
 
-int dr_damage(dr_ctx *c, int sector_index, const int *bits, int nbits)
+int dr_damage(dr_ctx *c, int sector_index, const int *bits, int nbits,
+              int drop_only)
 {
 	dr_view *v;
-	int rc;
+	int keep[64], nkeep = 0, i, rc;
 
 	v = dr_view_open(c, sector_index, NULL);
 	if (!v)
 		return -1;
 
-	rc = patch_bits(c, v, bits, nbits);
+	for (i = 0; i < nbits && nkeep < (int)(sizeof(keep)/sizeof(keep[0])); i++) {
+		int b = bits[i];
+
+		if (b < 0 || b >= v->msg_bits)
+			continue;
+
+		/* A dropout can only take a reversal away, so the bit has to
+		 * read 1. Asking for one at a position that reads 0 means the
+		 * nearest reversal after it - "drop a reversal around here"
+		 * is what the caller meant. */
+		if (drop_only) {
+			int j, seen = 0;
+
+			for (j = b; j < v->msg_bits; j++) {
+				if (!msg_bit(v->msg, j))
+					continue;
+				for (seen = 0; seen < nkeep; seen++)
+					if (keep[seen] == j)
+						break;
+				if (seen == nkeep) {
+					b = j;
+					break;
+				}
+			}
+			if (j >= v->msg_bits)
+				continue;
+		}
+		keep[nkeep++] = b;
+	}
+
+	rc = nkeep ? patch_bits(c, v, keep, nkeep) : 0;
+	if (rc == 0)
+		rc = nkeep;
 	dr_view_free(v);
 	return rc;
 }
