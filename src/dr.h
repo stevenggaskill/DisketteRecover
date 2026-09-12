@@ -491,7 +491,9 @@ typedef struct {
 	long size;
 	int  bad;                /* sectors of it with a CRC error       */
 	int  parts, parts_ok;    /* archive members that still verify    */
-	char note[160];
+	int  found;              /* ...recovered via a second directory   */
+	char lost[160];          /* members nothing on the disk can supply*/
+	char note[400];
 } dr_fs_file;
 
 int         dr_fs_files(dr_fs *fs, dr_fs_file *out, int max);

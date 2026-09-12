@@ -1986,34 +1986,85 @@ out:
  * archive. Every local header carries its own name, sizes and CRC-32,
  * so they can be found by their signature and checked one at a time -
  * which is how a damaged archive still gives up most of its contents.
+ *
+ * And then the directory again, because it is worth something after
+ * all. An archiver that rewrites a file leaves the old directory
+ * behind in the middle of it, and a damaged archive can therefore have
+ * a *second* copy of its own catalogue sitting in a part of the disk
+ * the mark never reached. That copy does not say where anything is any
+ * more - the offsets are from the old layout - but it still says what
+ * the archive contained, how long each member is packed, and what its
+ * contents must check to. Given a length and a CRC-32, the data can be
+ * hunted for: try to inflate that many bytes from every offset and see
+ * which one comes out right. Thirty-two bits make a false positive
+ * impossible in a file this size.
+ *
+ * On SLAT that finds a member whose own local header had been
+ * overwritten - and finds it twice over, because the archive stored the
+ * same animation under two names.
  */
-static void zip_survey(const uint8_t *b, long len, int *parts, int *ok)
+
+typedef struct {
+	char          name[64];
+	unsigned long crc;
+	long          csz, usz;
+	int           meth;
+	int           got;
+} zsurv;
+
+/* Does `csz` bytes at `off` inflate to the recorded length and CRC? */
+static int stream_matches(const uint8_t *b, long len, long off,
+                          long csz, long usz, unsigned long crc)
 {
-	long i;
+	if (off < 0 || off + csz > len)
+		return 0;
+	return inflate_check(b + off, csz, crc, usz) == 1;
+}
+
+static void zip_survey(const uint8_t *b, long len, int *parts, int *ok,
+                       int *found, char *lost, size_t lostsz)
+{
+	zsurv *have = NULL, *want = NULL;
+	int nhave = 0, nwant = 0, i, j;
+	long p;
 
 	*parts = *ok = 0;
-	for (i = 0; i + 30 <= len; i++) {
+	if (found)
+		*found = 0;
+	if (lost && lostsz)
+		lost[0] = 0;
+
+	have = calloc(MAXENT, sizeof(*have));
+	want = calloc(MAXENT, sizeof(*want));
+	if (!have || !want) {
+		free(have);
+		free(want);
+		return;
+	}
+
+	/* ---- what the local headers say ---- */
+	for (p = 0; p + 30 <= len && nhave < MAXENT; p++) {
 		long csz, usz, body;
 		unsigned long crc;
-		int nl, el, meth, good = 0;
+		int nl, el, meth, good = 0, m;
 
-		if (!(b[i] == 'P' && b[i+1] == 'K' &&
-		      b[i+2] == 3 && b[i+3] == 4))
+		if (!(b[p] == 'P' && b[p+1] == 'K' &&
+		      b[p+2] == 3 && b[p+3] == 4))
 			continue;
-		meth = u16le(b + i + 8);
-		crc  = (unsigned long)b[i+14] | ((unsigned long)b[i+15] << 8) |
-		       ((unsigned long)b[i+16] << 16) |
-		       ((unsigned long)b[i+17] << 24);
-		csz  = (long)b[i+18] | ((long)b[i+19] << 8) |
-		       ((long)b[i+20] << 16) | ((long)b[i+21] << 24);
-		usz  = (long)b[i+22] | ((long)b[i+23] << 8) |
-		       ((long)b[i+24] << 16) | ((long)b[i+25] << 24);
-		nl   = u16le(b + i + 26);
-		el   = u16le(b + i + 28);
+		meth = u16le(b + p + 8);
+		crc  = (unsigned long)b[p+14] | ((unsigned long)b[p+15] << 8) |
+		       ((unsigned long)b[p+16] << 16) |
+		       ((unsigned long)b[p+17] << 24);
+		csz  = (long)b[p+18] | ((long)b[p+19] << 8) |
+		       ((long)b[p+20] << 16) | ((long)b[p+21] << 24);
+		usz  = (long)b[p+22] | ((long)b[p+23] << 8) |
+		       ((long)b[p+24] << 16) | ((long)b[p+25] << 24);
+		nl   = u16le(b + p + 26);
+		el   = u16le(b + p + 28);
 		if ((meth != 0 && meth != 8) || nl < 1 || nl > 255 ||
 		    el > 4096 || csz < 1)
 			continue;
-		body = i + 30 + nl + el;
+		body = p + 30 + nl + el;
 		if (body + csz > len)
 			continue;
 		if (meth == 0) {
@@ -2021,7 +2072,7 @@ static void zip_survey(const uint8_t *b, long len, int *parts, int *ok)
 			c = crc32(c, b + body, (uInt)csz);
 			good = (csz == usz && c == crc);
 		} else {
-			good = (inflate_check(b + body, csz, crc, usz) == 1);
+			good = stream_matches(b, len, body, csz, usz, crc);
 		}
 		/* A signature inside compressed data is not an entry: take
 		 * it only if it checks out, or if its body ends exactly
@@ -2029,10 +2080,93 @@ static void zip_survey(const uint8_t *b, long len, int *parts, int *ok)
 		if (!good && !(body + csz + 4 <= len &&
 		               b[body+csz] == 'P' && b[body+csz+1] == 'K'))
 			continue;
+		m = nl < 63 ? nl : 63;
+		memcpy(have[nhave].name, b + p + 30, (size_t)m);
+		have[nhave].name[m] = 0;
+		have[nhave].crc = crc;
+		have[nhave].csz = csz;
+		have[nhave].usz = usz;
+		have[nhave].got = good;
+		nhave++;
 		(*parts)++;
 		*ok += good;
-		i = body + csz - 1;
+		p = body + csz - 1;
 	}
+
+	/* ---- what any surviving copy of the directory says ---- */
+	for (p = 0; p + 46 <= len && nwant < MAXENT; p++) {
+		long csz, usz;
+		unsigned long crc;
+		int nl, el, cl, meth, m;
+
+		if (!(b[p] == 'P' && b[p+1] == 'K' &&
+		      b[p+2] == 1 && b[p+3] == 2))
+			continue;
+		meth = u16le(b + p + 10);
+		crc  = (unsigned long)b[p+16] | ((unsigned long)b[p+17] << 8) |
+		       ((unsigned long)b[p+18] << 16) |
+		       ((unsigned long)b[p+19] << 24);
+		csz  = (long)b[p+20] | ((long)b[p+21] << 8) |
+		       ((long)b[p+22] << 16) | ((long)b[p+23] << 24);
+		usz  = (long)b[p+24] | ((long)b[p+25] << 8) |
+		       ((long)b[p+26] << 16) | ((long)b[p+27] << 24);
+		nl   = u16le(b + p + 28);
+		el   = u16le(b + p + 30);
+		cl   = u16le(b + p + 32);
+		if ((meth != 0 && meth != 8) || nl < 1 || nl > 255 ||
+		    csz < 1 || csz > len)
+			continue;
+		m = nl < 63 ? nl : 63;
+		memcpy(want[nwant].name, b + p + 46, (size_t)m);
+		want[nwant].name[m] = 0;
+		want[nwant].crc = crc;
+		want[nwant].csz = csz;
+		want[nwant].usz = usz;
+		want[nwant].meth = meth;
+		nwant++;
+		p += 46 + nl + el + cl - 1;
+	}
+
+	/* ---- anything the directory names but the headers lost ---- */
+	for (i = 0; i < nwant; i++) {
+		int already = 0;
+
+		for (j = 0; j < nhave; j++)
+			if (have[j].got && have[j].crc == want[i].crc &&
+			    have[j].csz == want[i].csz) {
+				already = 1;
+				break;
+			}
+		if (already)
+			continue;
+
+		/* Hunt for it. Bounded: this only runs for members the
+		 * headers could not account for, and most offsets are
+		 * rejected by inflate within a byte or two. */
+		if (want[i].meth == 8 && len <= 8L * 1024 * 1024) {
+			long off;
+
+			for (off = 0; off + want[i].csz <= len; off++) {
+				if (!stream_matches(b, len, off, want[i].csz,
+				                    want[i].usz, want[i].crc))
+					continue;
+				(*parts)++;
+				(*ok)++;
+				if (found)
+					(*found)++;
+				want[i].got = 1;
+				break;
+			}
+		}
+		if (!want[i].got && lost && lostsz) {
+			size_t n = strlen(lost);
+			if (n + strlen(want[i].name) + 3 < lostsz)
+				snprintf(lost + n, lostsz - n, "%s%s",
+				         n ? ", " : "", want[i].name);
+		}
+	}
+	free(have);
+	free(want);
 }
 #endif
 
@@ -2080,15 +2214,26 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 			if (b) {
 				if (flen > 30 && b[0] == 'P' && b[1] == 'K')
 					zip_survey(b, flen, &o->parts,
-					           &o->parts_ok);
+					           &o->parts_ok, &o->found,
+					           o->lost, sizeof(o->lost));
 				free(b);
 			}
 		}
 #endif
-		if (o->parts)
-			snprintf(o->note, sizeof(o->note),
-			         "%d of %d archive member(s) still extract",
-			         o->parts_ok, o->parts);
+		if (o->parts) {
+			int k = snprintf(o->note, sizeof(o->note),
+			                 "%d of %d archive member(s) still "
+			                 "extract", o->parts_ok, o->parts);
+			if (o->found && k > 0 && k < (int)sizeof(o->note))
+				k += snprintf(o->note + k,
+				              sizeof(o->note) - k,
+				              " (%d of them found through a "
+				              "second copy of the archive's "
+				              "own directory)", o->found);
+			if (o->lost[0] && k > 0 && k < (int)sizeof(o->note))
+				snprintf(o->note + k, sizeof(o->note) - k,
+				         "; lost: %s", o->lost);
+		}
 		else if (!bad)
 			snprintf(o->note, sizeof(o->note), "intact");
 		n++;

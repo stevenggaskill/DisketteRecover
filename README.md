@@ -472,9 +472,45 @@ the files on this disk
   TRAVEL~1.ZIP      87514 byte(s)  damaged - 6 of 9 archive member(s) still extract
 ```
 
-Eleven bad sectors on that disk, all of them in the one archive, and two
-thirds of it comes out anyway. A reader that trusted the central
+Eleven bad sectors on that disk, all of them in the one archive, and
+most of it comes out anyway. A reader that trusted the central
 directory would have reported the whole thing as empty.
+
+**And then the directory again, because it is worth something after
+all.** An archiver that rewrites a file leaves the old central directory
+behind in the middle of it, so a damaged archive often carries a
+*second* copy of its own catalogue in a part of the disk the mark never
+reached. That copy no longer says where anything is - the offsets are
+from the old layout - but it still says what the archive contained, how
+long each member is packed, and what its contents must check to. Given a
+length and a CRC-32, the data can simply be hunted for: try to inflate
+that many bytes from every offset and see which comes out right. Thirty
+two bits make a false positive impossible in a file this size.
+
+```
+TRAVEL~1.ZIP  87514 byte(s)  damaged - 8 of 11 archive member(s) still extract
+(2 of them found through a second copy of the archive's own directory);
+lost: TransportImg.gif, TravelPalReadme.html, AutoRentImg.gif
+```
+
+On SLAT that finds a member whose own local header had been overwritten
+- and finds it twice over, because the archive had stored the same
+animation under two names, `RotatingGlobeAnimation.gif` and
+`RotGlobeAnim.gif`, with identical packed bytes and identical CRC-32.
+The stale directory is the only thing on the disk that knows the second
+name exists.
+
+It also settles what the damage actually cost. Of those eleven bad
+sectors, **eight lie inside no archive member at all** - they are in the
+38 KB of the file that the current layout does not use, left over from
+the earlier version. Of the three that do land in a member, one
+(`CityDialogImg.gif`) still inflates and matches its CRC-32, so that
+sector's data was right all along and only its stored CRC was chewed;
+one is the globe, recovered; and one, `TransportImg.gif`, is genuinely
+gone. Eleven unreadable sectors, one lost file. The other two names in
+that "lost" list fail with no bad sector anywhere near them: they are
+stale headers from the old layout pointing at data that was overwritten
+long before this disk was ever read.
 
 **A copy from elsewhere.** `--from-file COPY` takes the same file from
 another disk, an archive, a download. It will not be laid out the same
@@ -725,14 +761,17 @@ two are.
 They did pay for themselves, though - see the note on the block fit
 below, which they are the reason for.
 
-Totals, now over twelve disks: 60 bad sectors, of which **32 hold no
-file's data at all** - free space, or, on one whole disk, unformatted
-noise past the last track. Of the 28 that do carry a file, **8 are
-recovered**: four by the search, and four exactly, from a second copy of
-the same bytes - three from the same archive stored twice on the disk,
-one from the same stream stored twice inside one document. Six of the
-twelve disks lost nothing whatsoever. The running tally, and what each disk turned
-out to be suffering from, is in [docs/disks.md](docs/disks.md).
+Totals, now over twelve disks: 60 bad sectors, of which **40 hold no
+file's data at all** - free space, unformatted noise past the last
+track, or parts of a file the file itself no longer uses. Of the 20 that
+do carry live data, **9 are recovered**: four by the search, and five
+exactly, from a second copy of the same bytes - three from the same
+archive stored twice on the disk, one from the same stream stored twice
+inside one document, and one from a member the archive had stored under
+two names, found through the stale copy of its own directory. Six of the
+twelve disks lost nothing whatsoever. The running tally, and what each
+disk turned out to be suffering from, is in
+[docs/disks.md](docs/disks.md).
 
 That number went *down* as the tool got better, and the reason is the
 whole point of the section below. Five of the readings it used to apply

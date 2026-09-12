@@ -543,6 +543,43 @@ open(sys.argv[2],'wb').write(bytes(d))
 	     sed -n 's/.*\([0-9][0-9]*\) of \([0-9][0-9]*\) archive member.*/\1 of \2/p')
 	check "...and an undamaged one comes out whole" "$iv" "1 of 1"
 
+	echo "== a second copy of the archive's own directory"
+	# An archiver that rewrites a file leaves the old central directory
+	# behind inside it. When a mark destroys a member's local header,
+	# that leftover still says what the member was and what it must
+	# check to - and given a length and a CRC-32 the data can be hunted
+	# for. This is SLAT's case, where it found a member back.
+	python3 - "$out" <<'PYEOF'
+import os, random, struct, sys, zipfile
+out = sys.argv[1]
+random.seed(23)
+words = [bytes(random.choice(b'abcdefghijklmnopqrstuvwxyz')
+               for _ in range(random.randint(3, 9))) for _ in range(200)]
+path = os.path.join(out, 'hidden.zip')
+with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
+    for i in range(3):
+        z.writestr('part%d.txt' % i,
+                   b' '.join(random.choice(words) for _ in range(1500)))
+d = bytearray(open(path, 'rb').read())
+# wreck the second member's local header signature, nothing else
+n = 0
+for i in range(len(d) - 4):
+    if d[i:i+4] == b'PK\x03\x04':
+        n += 1
+        if n == 2:
+            d[i:i+4] = b'\x00\x00\x00\x00'
+            break
+open(path, 'wb').write(bytes(d))
+PYEOF
+	python3 "$here/tools/mkfat.py" "$out/hid.img" "HIDDEN.ZIP=$out/hidden.zip"
+	"$dr" convert "$out/hid.img" --out "$out/hid.hfe" >/dev/null 2>&1
+	sv=$("$dr" scan "$out/hid.hfe" --fs 2>/dev/null |
+	     sed -n 's/.*\([0-9][0-9]*\) of \([0-9][0-9]*\) archive member.*/\1 of \2/p')
+	check "all three members are accounted for" "$sv" "3 of 3"
+	fd=$("$dr" scan "$out/hid.hfe" --fs 2>/dev/null |
+	     sed -n 's/.*(\([0-9][0-9]*\) of them found through a second copy.*/\1/p')
+	check "one of them only through the directory copy" "$fd" "1"
+
 	echo "== a Macintosh disk is not a PC disk"
 	python3 "$here/tools/mkhfs.py" "$out/hfs.img" 100
 	"$dr" convert "$out/hfs.img" --out "$out/hfs.hfe" >/dev/null 2>&1

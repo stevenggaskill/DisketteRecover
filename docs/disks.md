@@ -20,11 +20,11 @@ failure was misleading.
 | Sand     | 2916 | 4 | 4 | **3** | sector 10 on tracks 24-27, inside two ZIP archives - and the same entries are archived *twice on the same disk*, so three of them are recovered exactly and proved by the archive's CRC-32 |
 | Ron      | 2944 | 22 | **0** | - | every one is on track 80, past the last formatted track: unformatted noise decoded as 16 KB FM sectors. **Not a damaged disk at all** |
 | Scott    | 2881 | 1 | 1 | **1** | a menu string table inside a Word temp file; the repair turns `Move( fro?t )` into `Move( front )` and `Gut Info` into `Get Info` |
-| SLAT     | 2916 | 11 | 11 | 0 | every one inside `TRAVEL~1.ZIP`, a Palm "TravelPal" package, including its central directory. 6 of its 9 members still extract; `TESTPL~1.XLS` is intact |
+| SLAT     | 2916 | 11 | 3 | **1** | every bad sector is inside `TRAVEL~1.ZIP`, a Palm "TravelPal" package - but eight of the eleven land in 38 KB of the file that no member occupies, left over from an earlier version of the archive. 8 of 11 members extract, one of them recovered through the *stale* copy of the archive's own directory that the same leftover contains. Exactly one file, `TransportImg.gif`, is lost to the disk damage; `TESTPL~1.XLS` is intact |
 | SLAW     | 2880 | 2 | **0** | - | both in **free space**; all 8 documents intact |
 | Teres    | 2880 | 4 | 3 | 0 | one in free space; three in Quicken's `QDATA.QDB`/`.QSD`/`.QEL`, which carry no checksum and have no second copy. The other 7 files are intact |
 | DisComp  | 2881 | 0 | - | - | **a Macintosh HFS disk** (volume "Gradebook"), not a PC disk - which is why nothing could read it as one. No CRC errors at all |
-| **total** | **29417** | **60** | **28** | **8** | |
+| **total** | **29417** | **60** | **20** | **9** | |
 
 Six of the twelve disks - Disk 1, GasAcc, Scott, Ron, SLAW and DisComp
 - lost nothing at all. That is not visible from the CRC; it is visible
@@ -55,6 +55,7 @@ the outside of the disk has already eaten.
 | Sand | `25/1 s10` | `faxcover.adt`, archived twice | inflates, CRC-32 `3C4E1290` |
 | Sand | `26/1 s10` | `faxcover.tpl`, archived twice | inflates, CRC-32 `C486A5AA` |
 | Zeus | `9/0 s9` | the same stream, stored twice inside the same `.ppt` | the twin matches for 8581 bytes either side of the damage, and with its 512 in place the preview metafile's 727 records tile exactly |
+| SLAT | `RotatingGlobeAnimation.gif` | the archive stored the same animation twice, under two names | the stale copy of the archive's own central directory is the only thing that knows the second name; its packed bytes inflate to CRC-32 `E16CA998` |
 | Disk 2, LGTC0, Scott | 4 sectors | the search, applied on a clear margin | libhxcfe re-decode reads them clean |
 
 After those three, `CONTAC~1.ZIP` verifies **101 of 101** entries -
@@ -146,8 +147,10 @@ Ranked by how often they turned up, not by how interesting they are:
    target that was never on the disk. Measured on these disks, this is
    not an edge case: it is what happens whenever the mark runs off the
    end, which is most of the time.
-6. **Nothing at all** - 32 of the 60 bad sectors here hold no file's
-   data. Six disks of the twelve were whole the whole time.
+6. **Nothing at all** - 40 of the 60 bad sectors here hold no file's
+   data: free space, unformatted noise past the last track, or - on
+   SLAT - parts of a file that the file itself no longer uses. Six disks
+   of the twelve were whole the whole time.
 
 ## The CRC can be wrong without the flux noticing
 
