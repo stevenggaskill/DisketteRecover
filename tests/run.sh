@@ -700,6 +700,36 @@ PYEOF
 	     sed -n 's/.*deleted, and \([0-9]*\) of its .* have been given.*/taken/p')
 	check "an overwritten deleted file says so" "$tk" "taken"
 
+	echo "== a file made of fixed-size records"
+	# A database file is very often an array of fixed-size records each
+	# opening with the same marker. Nothing declares it; it is simply
+	# visible, and it says where the marker must fall inside a damaged
+	# sector - nine constraints where the CRC offers one.
+	python3 - "$here/tools/mkfat.py" "$out" <<'PYEOF'
+import random, struct, subprocess, sys
+mkfat, out = sys.argv[1], sys.argv[2]
+random.seed(31)
+recs = []
+for i in range(1200):
+    recs.append(b'\xcd\xab' + bytes(10) + b'\x37\x0a\x80\x09' +
+                bytes(random.randrange(256) for _ in range(40)))
+open(out + '/recs.dat', 'wb').write(b''.join(recs))
+subprocess.check_call(['python3', mkfat, out + '/rec.img',
+                       'RECS.DAT=' + out + '/recs.dat'])
+PYEOF
+	"$dr" convert "$out/rec.img" --out "$out/rec.hfe" >/dev/null 2>&1
+	# LBA 30 is well inside the file (it starts at cluster 2 = LBA 14)
+	"$dr" damage "$out/rec.hfe" --track 1 --side 1 --id 4 --drop-only \
+	      --bits 803,1701,2743 --out "$out/rec_bad.hfe" >/dev/null 2>&1
+	check "one bad sector" "$(badcount "$out/rec_bad.hfe")" "1"
+	fr=$("$dr" repair "$out/rec_bad.hfe" --fs 2>/dev/null |
+	     sed -n 's/.*records of \([0-9]*\) bytes.*/\1/p' | head -1)
+	check "the record size is measured from the file" "$fr" "56"
+	sv=$("$dr" repair "$out/rec_bad.hfe" --fs 2>/dev/null |
+	     sed -n 's/^ *\([0-9][0-9]*\)  SURVIVES.*/survives/p' | head -1)
+	check "a reading that keeps the record starts survives" "$sv" \
+	      "survives"
+
 	echo "== a Macintosh disk is not a PC disk"
 	python3 "$here/tools/mkhfs.py" "$out/hfs.img" 100
 	"$dr" convert "$out/hfs.img" --out "$out/hfs.hfe" >/dev/null 2>&1

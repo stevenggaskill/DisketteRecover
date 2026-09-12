@@ -22,7 +22,7 @@ failure was misleading.
 | Scott    | 2881 | 1 | 1 | **1** | a menu string table inside a Word temp file; the repair turns `Move( fro?t )` into `Move( front )` and `Gut Info` into `Get Info` |
 | SLAT     | 2916 | 11 | 3 | **1** | every bad sector is inside `TRAVEL~1.ZIP`, a Palm "TravelPal" package - but eight of the eleven land in 38 KB of the file that no member occupies, left over from an earlier version of the archive. 8 of 11 members extract, one of them recovered through the *stale* copy of the archive's own directory that the same leftover contains. Exactly one file, `TransportImg.gif`, is lost to the disk damage; `TESTPL~1.XLS` is intact |
 | SLAW     | 2880 | 2 | **0** | - | both in **free space**; all 8 documents intact |
-| Teres    | 2880 | 4 | 3 | 0 | one in free space; three in Quicken's `QDATA.QDB`/`.QSD`/`.QEL`, which carry no checksum and have no second copy. The other 7 files are intact |
+| Teres    | 2880 | 4 | 3 | 0 | one in free space; three in Quicken's `QDATA.QDB`/`.QSD`/`.QEL`. Uncompressed and structured - the QDB's 56-byte record framing locates the damage to the last 124 bytes of its sector and refutes all 561 re-readings that satisfy the CRC. The other 7 files are intact |
 | DisComp  | 2881 | 0 | - | - | **a Macintosh HFS disk** (volume "Gradebook"), not a PC disk - which is why nothing could read it as one. No CRC errors at all |
 | ALXPPT   | 2944 | 20 | 10 | 0 | one mark down sector 12, tracks 32-45. The damaged FAT sector was restored from its twin; 7 of the rest are in free space. Its root directory also still holds four **deleted** entries, and three of those - `RPN.PRC`, `TEALLOCK.PRC` and RPN's scripts database - come back whole, names and all. The live filesystem is confused independently of the damage: `RESUME.TXT`'s recorded start cluster is three clusters past where its text actually begins |
 | **total** | **32361** | **80** | **30** | **10** | |
@@ -230,6 +230,47 @@ rather than guessed:
 Twenty bytes and five bytes. In an uncompressed file that would be a
 small loss; inside a compressed stream it is the end of it from that
 point on. The backups either side of each - four of the six - are whole.
+
+## Teres's Quicken files, and what the records say
+
+Teres's three remaining sectors are in `QDATA.QDB`, `QDATA.QSD` and
+`QDATA.QEL`. Unlike Disk 2's QuickBooks backups these are **not**
+compressed - 3.47, 1.88 and 0.18 bits per byte - so there is structure
+to work with, and the QDB has a great deal of it: 4,821 records of 56
+bytes, every one carrying the same marker.
+
+Measured from the clean parts of the file, that framing says exactly
+where the record starts must fall inside the damaged sector, and it
+locates the damage precisely:
+
+```
+1138228 (+ 52): cdab000000000000  OK
+1138284 (+108): cdab000000000000  OK
+...
+1138564 (+388): c480ffffffffffff  <-- broken
+1138620 (+444): 2000ffffffffffff  <-- broken
+1138676 (+500): 2000ffffffffffff  <-- broken
+```
+
+Six of the nine records in that sector are intact; the damage is the
+last 124 bytes. And it is a referee no checksum could be: restoring
+three two-byte markers is far beyond any weight-3 bit search, so all 256
+CRC-valid readings are refuted, and so are all **561** found by a
+40-million-assignment re-binning of the flux. The closest any of them
+comes is 7 of 9.
+
+The other two files have no such framing to offer - `QDATA.QEL` is 98.6%
+zeros and `QDATA.QSD` is a report definition padded with `41`s - so for
+those the account is what is left in doubt:
+
+```
+69/1 s9   502 of 512 data bytes settled to 99%; 10 remain open
+70/1 s9   505 of 512 settled; 7 open - but the stored CRC is in doubt too
+71/1 s9   489 of 512 settled; 23 open - likewise
+```
+
+Seven of Teres's ten files are untouched, including `QDATA.QMD` and both
+QuickBooks company files.
 
 ## What the deleted entries hold, disk by disk
 

@@ -1055,9 +1055,11 @@ static void print_referee(dr_ctx *c, dr_view *v, dr_repair_result *r,
 	dr_fs *fs = fs_of(c);
 	dr_fs_loc loc;
 	int i, tested = 0, kept = 0, shown = 0;
-	char note[256];
+	char note[256], bestnote[256];
+	double bestscore = -1.0;
 
 	note[0] = 0;
+	bestnote[0] = 0;
 	if (!fs || dr_fs_locate(fs, c, idx, &loc) != 0)
 		return;
 	if (loc.area == DR_AREA_FREE || loc.area == DR_AREA_OUTSIDE) {
@@ -1091,6 +1093,11 @@ static void print_referee(dr_ctx *c, dr_view *v, dr_repair_result *r,
 			}
 			if (!note[0])
 				snprintf(note, sizeof(note), "%s", vd.how);
+			if (vd.score > bestscore) {
+				bestscore = vd.score;
+				snprintf(bestnote, sizeof(bestnote), "%s",
+				         vd.how);
+			}
 		} else if (!tested) {
 			printf("            %s\n", vd.how);
 			free(msg);
@@ -1100,14 +1107,17 @@ static void print_referee(dr_ctx *c, dr_view *v, dr_repair_result *r,
 	}
 	if (!tested)
 		return;
-	if (!kept)
+	if (!kept) {
 		printf("            %d reading(s) satisfied the sector's "
 		       "16-bit CRC; not one of them\n"
 		       "            survives the check the file itself "
 		       "carries. The true reading is\n"
 		       "            not in this pool - the damage is deeper "
 		       "than the search can reach.\n", tested);
-	else if (kept == tested)
+		if (bestnote[0] && bestscore > 0.0)
+			printf("            The closest any of them came: "
+			       "%s\n", bestnote);
+	} else if (kept == tested)
 		printf("            all %d of them do; this check cannot "
 		       "separate them.\n", tested);
 	else

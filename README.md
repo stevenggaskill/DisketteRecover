@@ -613,6 +613,33 @@ filesystem: HFS (Macintosh), volume 'Gradebook', 2 file(s) and folder(s),
             2874 allocation block(s) of 512 byte(s)
 ```
 
+**And a file made of fixed-size records declares its own shape, without
+declaring it.** A database file - Btrieve, dBase, Quicken, QuickBooks -
+is very often an array of fixed-size records each opening with the same
+marker. Nothing in the format says so; it is simply visible in the bytes
+that read cleanly, as one 2-byte value occurring thousands of times at a
+constant stride. Teres's `QDATA.QDB` is 4,821 records of 56 bytes.
+
+Measured from the intact parts of the file, that says exactly where the
+marker must fall inside the damaged sector - nine independent
+sixteen-bit constraints where the sector CRC offers one:
+
+```
+The closest any of them came: records of 56 bytes, each carrying 37 0A
+at the same offset: 7 of 9 in this sector land where the layout says
+```
+
+Two details cost some time and are worth recording. The phase is *not*
+global - a record file is paged, and each page starts its records
+afresh; the markers in that QDB sit at offset 28 within one page and 12
+within another, so the phase has to be taken from the last marker before
+the sector rather than from the file. And the marker is not simply the
+commonest byte pair, which on a database file is `00 00`: what picks it
+out is how *cleanly* its occurrences sit on one stride. 91% of the gaps
+between `AB CD`s are exactly 56, where the runner-up - a pair whose
+modal gap of 69 is pure coincidence, and which an earlier version of
+this happily took instead - manages 66%.
+
 ### 4d-bis. How much of the sector is actually settled
 
 "256 CRC-valid readings, the top one twice as likely as the next" is

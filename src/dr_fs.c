@@ -1203,6 +1203,8 @@ out:
 
 static int palm_ok(const uint8_t *b, long len, char *name, size_t namesz,
                    char *how, size_t howsz);
+static int framing_check(const uint8_t *b, long len, long at, long span,
+                         char *how, size_t howsz, double *score);
 
 /* ---------------------------------------------------------------- */
 /* The referees: checks that live above the sector CRC               */
@@ -1521,6 +1523,7 @@ int dr_fs_score(dr_fs *fs, const dr_fs_loc *loc, const uint8_t *payload,
 		long flen = 0;
 		uint8_t *buf = assemble(fs, loc, payload, len, &flen);
 		int v = -1;
+		double part = -1.0;
 
 		if (buf) {
 			v = zip_check(buf, flen, loc->file_offset, len,
@@ -1534,13 +1537,17 @@ int dr_fs_score(dr_fs *fs, const dr_fs_loc *loc, const uint8_t *payload,
 			if (v < 0)
 				v = palm_ok(buf, flen, NULL, 0, out->how,
 				            sizeof(out->how));
+			if (v < 0)
+				v = framing_check(buf, flen, loc->file_offset,
+				                  len, out->how,
+				                  sizeof(out->how), &part);
 			free(buf);
 		}
 		if (v >= 0) {
 			out->checked = 1;
 			out->proven = (v == 1);
 			out->refuted = (v == 0);
-			out->score = v ? 1.0 : 0.0;
+			out->score = v ? 1.0 : (part >= 0.0 ? part : 0.0);
 			return 0;
 		}
 #endif
@@ -2142,6 +2149,211 @@ static int cfb_describe(const uint8_t *b, long len, char *how, size_t howsz)
 	         "compound document, %d stream(s) - %s%s", n, names,
 	         n > 4 ? ", ..." : "");
 	return 1;
+}
+
+
+/* ---------------------------------------------------------------- */
+/* Files made of fixed-size records                                  */
+/* ---------------------------------------------------------------- */
+/*
+ * A database file - Btrieve, dBase, Quicken, QuickBooks - is very often
+ * an array of fixed-size records each opening with the same marker.
+ * Teres's QDATA.QDB is 4,821 records of 56 bytes, every one of them
+ * beginning AB CD.
+ *
+ * Nothing in the file declares that. It is simply visible: one 2-byte
+ * value occurring thousands of times at a constant stride. Once it has
+ * been measured from the parts of the file that read cleanly, it says
+ * where the marker must appear inside the damaged sector - and a
+ * reading that does not put it there is wrong, whatever the sector's
+ * checksum says. In a 512-byte sector that is nine independent
+ * constraints of sixteen bits each where the CRC offers one.
+ */
+typedef struct {
+	int  marker;             /* the 2-byte value                     */
+	long stride;
+	long phase;              /* marker offsets are == phase mod stride*/
+	long seen;               /* how many were counted                */
+	long expected;           /* how many the stride predicts         */
+} framing;
+
+/* Try one candidate marker: are its occurrences evenly spaced? */
+static int framing_try(const uint8_t *b, long len, int value, long count,
+                       framing *out)
+{
+	long *off = malloc(sizeof(long) * (size_t)count);
+	long i, n = 0, modal = 0, modal_n = 0, k, agree = 0;
+	uint32_t *gaps;
+	int rc = -1;
+
+	if (!off)
+		return -1;
+	for (i = 0; i + 1 < len && n < count; i++)
+		if ((b[i] | (b[i+1] << 8)) == value)
+			off[n++] = i;
+	if (n < 32) {
+		free(off);
+		return -1;
+	}
+
+	gaps = calloc(1024, sizeof(*gaps));
+	if (!gaps) {
+		free(off);
+		return -1;
+	}
+	for (k = 1; k < n; k++) {
+		long g = off[k] - off[k-1];
+		if (g >= 8 && g < 1024)
+			gaps[g]++;
+	}
+	for (k = 8; k < 1024; k++)
+		if ((long)gaps[k] > modal_n) {
+			modal_n = gaps[k];
+			modal = k;
+		}
+	free(gaps);
+
+	/* The stride has to explain most of the gaps, and the markers
+	 * have to share one phase, or this is a coincidence rather than a
+	 * record layout. */
+	/*
+	 * Only the stride is asked for, not a phase. A record file is
+	 * usually paged, and each page starts its records afresh - the
+	 * markers in Teres's QDB sit at offset 28 within one page and 12
+	 * within another. The stride holds everywhere; the phase has to
+	 * be taken locally, from the last marker before the sector in
+	 * question.
+	 */
+	/*
+	 * Only the stride is asked for, not a phase. A record file is
+	 * usually paged and each page starts its records afresh - the
+	 * markers in Teres's QDB sit at offset 28 within one page and 12
+	 * within another. The stride holds everywhere; the phase has to
+	 * be taken locally, from the last marker before the sector.
+	 */
+	if (modal >= 8 && modal_n * 10 >= (n - 1) * 6) {
+		out->marker = value;
+		out->stride = modal;
+		out->phase = -1;
+		out->seen = modal_n;
+		out->expected = n - 1;
+		rc = 0;
+	}
+	(void)agree;
+	free(off);
+	return rc;
+}
+
+static int find_framing(const uint8_t *b, long len, framing *out)
+{
+	uint32_t *count;
+	int best[24], nbest = 0, i, j, rc = -1;
+
+	if (len < 4096)
+		return -1;
+	count = calloc(65536, sizeof(*count));
+	if (!count)
+		return -1;
+	for (i = 0; i + 1 < len; i++)
+		count[b[i] | (b[i+1] << 8)]++;
+
+	/*
+	 * Not simply the commonest pair - on a database file that is
+	 * 00 00, which is filler, not structure. A marker has to be
+	 * common enough to be a record start and rare enough not to be
+	 * the background: somewhere between 32 occurrences and one per
+	 * sixteen bytes of file.
+	 */
+	for (i = 0; i < 65536; i++) {
+		long c = count[i];
+
+		if (c < 32 || c * 16 > len)
+			continue;
+		for (j = 0; j < nbest; j++)
+			if (c > (long)count[best[j]])
+				break;
+		if (nbest < (int)(sizeof(best)/sizeof(best[0])))
+			nbest++;
+		{
+			int k;
+			for (k = nbest - 1; k > j; k--)
+				best[k] = best[k-1];
+			if (j < nbest)
+				best[j] = i;
+		}
+	}
+	/*
+	 * And not the first candidate that qualifies, either. Plenty of
+	 * byte pairs inside a record occur at the record stride as well -
+	 * and one of them, on this file, has a modal gap of 69 that is
+	 * pure coincidence and would have been taken first. What
+	 * identifies the real marker is how *cleanly* its occurrences sit
+	 * on the stride: 91% of the gaps between AB CDs are exactly 56,
+	 * where the runner-up manages 66%.
+	 */
+	{
+		framing cur;
+		double best_frac = 0.0;
+
+		for (i = 0; i < nbest; i++) {
+			double frac;
+
+			if (framing_try(b, len, best[i], count[best[i]],
+			                &cur) != 0)
+				continue;
+			if (cur.expected <= 0)
+				continue;
+			frac = (double)cur.seen / (double)cur.expected;
+			if (frac > best_frac) {
+				best_frac = frac;
+				*out = cur;
+				rc = 0;
+			}
+		}
+	}
+	free(count);
+	return rc;
+}
+
+/* Does this reading put the marker where the record layout says it
+ * must be? Returns 1 yes, 0 no, -1 no opinion. */
+static int framing_check(const uint8_t *b, long len, long at, long span,
+                         char *how, size_t howsz, double *score)
+{
+	framing f;
+	long o, anchor = -1, want = 0, got = 0;
+
+	if (find_framing(b, len, &f) != 0)
+		return -1;
+
+	/* The phase comes from the last record start before the sector -
+	 * close enough that no page boundary can have intervened. */
+	for (o = at - 2; o >= 0 && o > at - 4 * f.stride; o--)
+		if ((b[o] | (b[o+1] << 8)) == f.marker) {
+			anchor = o;
+			break;
+		}
+	if (anchor < 0)
+		return -1;
+
+	for (o = anchor + f.stride; o + 1 < len && o < at + span;
+	     o += f.stride) {
+		if (o < at)
+			continue;
+		want++;
+		if ((b[o] | (b[o+1] << 8)) == f.marker)
+			got++;
+	}
+	if (want < 2)
+		return -1;
+	if (score)
+		*score = (double)got / (double)want;
+	snprintf(how, howsz,
+	         "records of %ld bytes, each carrying %02X %02X at the same "
+	         "offset: %ld of %ld in this sector land where the layout "
+	         "says",
+	         f.stride, f.marker & 0xFF, (f.marker >> 8) & 0xFF, got, want);
+	return got == want;
 }
 
 /* ---------------------------------------------------------------- */
