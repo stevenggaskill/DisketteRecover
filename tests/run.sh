@@ -52,6 +52,20 @@ w=$("$dr" repair "$out/b2.hfe" --mode bits --json 2>/dev/null |
     sed -n 's/.*"searched_weight":\([0-9]*\).*/\1/p')
 check "bit-flip engine finds it at weight 2" "$w" "2"
 
+echo "== how much of a sector the surviving readings agree on"
+# "256 CRC-valid readings" is not the same as "256 different sectors":
+# each differs from the decoder's own in a couple of bits, so weighted
+# by likelihood almost every byte is settled.
+"$dr" repair "$out/b2.hfe" --mode bits >"$out/cons.txt" 2>/dev/null
+st=$(sed -n 's/^consensus : weighted by likelihood, \([0-9]*\) of \([0-9]*\) data byte.*/\1 \2/p' \
+     "$out/cons.txt")
+set -- $st
+if [ "${1:-0}" -ge 500 ] && [ "${2:-0}" = "512" ]; then
+	ok "the readings settle almost every byte ($1 of $2)"
+else
+	bad "the readings settle almost every byte ($st)"
+fi
+
 echo "== the data model, on a sector of filler with bits dropped"
 # 512 bytes of 0xF6 is what MS-DOS FORMAT leaves behind, and it is what
 # both bad sectors of a real disk turned out to be. Dropping a few

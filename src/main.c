@@ -1196,6 +1196,83 @@ static int write_variants(args *a, int idx, dr_view *v,
 	return wrote;
 }
 
+
+/* How much of the sector is actually settled.
+ *
+ * "256 CRC-valid readings, the top one twice as likely as the next" is
+ * true and almost useless. Those readings are not 256 different
+ * sectors: each differs from the decoder's own in two or three bits,
+ * and where they agree they agree completely. Weighting them by
+ * likelihood and asking, byte by byte, how much of the mass sits on one
+ * value turns an unusable margin into the statement a person wants -
+ * this sector is known except for these twenty-four bytes.
+ *
+ * It is not a repair and it is not applied. It is a measure of what is
+ * left in doubt, and when the stored CRC is itself damaged it measures
+ * nothing at all, because then every reading in the set is agreeing
+ * about a checksum that was never on the disk. */
+static void print_consensus(dr_view *v, dr_repair_result *r)
+{
+	double *mass;
+	int i, k, open = 0, len = v->data_len;
+	int first[8], nfirst = 0;
+
+	if (r->count < 2 || len <= 0 || len > 4096)
+		return;
+	mass = calloc((size_t)len * 256, sizeof(double));
+	if (!mass)
+		return;
+
+	for (i = 0; i < r->count; i++) {
+		uint8_t *m = dr_candidate_message(v, &r->list[i]);
+		double w = r->list[i].rel_likelihood;
+
+		if (!m)
+			continue;
+		if (w <= 0.0)
+			w = 1e-300;
+		for (k = 0; k < len; k++)
+			mass[(size_t)k * 256 + m[v->data_offset + k]] += w;
+		free(m);
+	}
+
+	for (k = 0; k < len; k++) {
+		double tot = 0.0, best = 0.0;
+		int b;
+
+		for (b = 0; b < 256; b++) {
+			double x = mass[(size_t)k * 256 + b];
+			tot += x;
+			if (x > best)
+				best = x;
+		}
+		if (tot > 0.0 && best / tot < 0.99) {
+			open++;
+			if (nfirst < (int)(sizeof(first)/sizeof(first[0])))
+				first[nfirst++] = k;
+		}
+	}
+	free(mass);
+
+	printf("consensus : weighted by likelihood, %d of %d data byte(s) are "
+	       "settled to 99%%\n", len - open, len);
+	if (open) {
+		printf("            across the %d reading(s); %d remain open, "
+		       "at byte", r->count, open);
+		for (i = 0; i < nfirst; i++)
+			printf("%s %d", i ? "," : "", first[i]);
+		printf("%s\n", open > nfirst ? ", ..." : "");
+	} else {
+		printf("            across all %d reading(s) - they differ "
+		       "only in which bits they flip,\n            not in "
+		       "what the sector says\n", r->count);
+	}
+	if (v->crc_suspect)
+		printf("            ...but every one of them matches a stored "
+		       "CRC that is itself in\n            doubt, so this is "
+		       "agreement about a checksum, not about the disk\n");
+}
+
 /* Run the engine cascade for one sector and report in one line.
  * Returns 1 if the sector was repaired and verified. */
 static int repair_one(dr_ctx *c, int idx, args *a, int apply)
@@ -2056,6 +2133,8 @@ int main(int argc, char **argv)
 				print_candidates(v, &r, 16);
 			}
 
+			if (!a.json)
+				print_consensus(v, &r);
 			if (!a.json && (a.fs || a.variants))
 				print_referee(c, v, &r, idx, 5);
 

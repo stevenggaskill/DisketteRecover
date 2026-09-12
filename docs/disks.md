@@ -189,6 +189,48 @@ sector, inside its `code#1` resource. The structure is unaffected, so it
 will still install; whether it runs is another matter, and a `.prc`
 carries no checksum to settle it.
 
+## The QuickBooks backups, and why they stay broken
+
+Disk 2's three remaining sectors are in `FHP2_97.QBB` and `FHP5_97.QBB`,
+and the disk carries **six** monthly backups of the same company file -
+`FHP.QBB`, `FHP12_96`, `FHP2_97`, `FHP5_97`, `FHP7_97`, `FHP8_97`. Six
+copies of one accounting database, four of them undamaged. It looks like
+the sister-archive case on Sand all over again.
+
+It is not, and the reason is worth recording. The QBB body is
+compressed: 7.90 bits per byte, all 256 values present. Compression
+destroys correspondence - the same ledger entry in February and in
+August comes out as different bytes in different places - so what the
+backups share is only where the compressor happened to re-synchronise.
+Across the whole pair, `FHP2_97` and `FHP8_97` share a 4,416-byte run
+and `FHP12_96` a 1,482-byte one, but nothing anywhere near the damage.
+Anchoring each damaged sector's clean neighbours against all five
+siblings finds **no alignment at all**:
+
+```
+FHP8_97.QBB does not line up here - the best match agrees for only
+0 byte(s) before and 0 after
+```
+
+Nor is there a checksum to referee with. The container is three records
+marked `45 86`, ending at byte 82, and they do carry one real invariant
+- a 32-bit field that equals the file length minus 82, which would catch
+a damaged header. All three damaged sectors are in the body.
+
+So the honest answer is what is left in doubt, and that is now measured
+rather than guessed:
+
+```
+43/1 s17   492 of 512 data bytes settled to 99%; 20 remain open
+49/1 s17   507 of 512 data bytes settled to 99%;  5 remain open
+41/1 s17   512 of 512 - but every reading matches a stored CRC that is
+           itself in doubt, so this is agreement about a checksum
+```
+
+Twenty bytes and five bytes. In an uncompressed file that would be a
+small loss; inside a compressed stream it is the end of it from that
+point on. The backups either side of each - four of the six - are whole.
+
 ## What the deleted entries hold, disk by disk
 
 Run over all thirteen, `extract --deleted` finds rather more than the

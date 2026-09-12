@@ -613,6 +613,30 @@ filesystem: HFS (Macintosh), volume 'Gradebook', 2 file(s) and folder(s),
             2874 allocation block(s) of 512 byte(s)
 ```
 
+### 4d-bis. How much of the sector is actually settled
+
+"256 CRC-valid readings, the top one twice as likely as the next" is
+true and almost useless. Those readings are not 256 different sectors:
+each one differs from the decoder's own in two or three bits, and
+everywhere else they agree completely. Weighting them by likelihood and
+asking, byte by byte, how much of the mass sits on a single value turns
+an unusable margin into the statement a person actually wants:
+
+```
+consensus : weighted by likelihood, 507 of 512 data byte(s) are settled to 99%
+            across the 256 reading(s); 5 remain open, at byte 388, 409, 414, 422, 444
+```
+
+That is not a repair and nothing is applied on the strength of it. It is
+a measure of what is left in doubt - and it is honest about when it
+means nothing:
+
+```
+consensus : weighted by likelihood, 512 of 512 data byte(s) are settled to 99%
+            ...but every one of them matches a stored CRC that is itself in
+            doubt, so this is agreement about a checksum, not about the disk
+```
+
 ### 4e. Five images, and letting a person look
 
 When several readings survive, `--variants 5 --out disk.hfe` writes
