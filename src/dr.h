@@ -256,6 +256,9 @@ typedef struct {
  * Both are measured rather than guessed: see "A disturbance that is
  * spread out" in README.md.
  */
+/* Whole-disk variants the tool will write in one run. */
+#define DR_VARIANTS_MAX   16
+
 #define DR_SMOOTH_SPREAD  16.0
 #define DR_WIDTH_SPREAD   20000
 
@@ -411,7 +414,8 @@ typedef struct dr_fs dr_fs;
 
 typedef struct {
 	int   present;
-	char  kind[16];          /* "FAT12" / "FAT16"                    */
+	int   guessed;           /* layout rebuilt - no readable boot    */
+	char  kind[64];          /* "FAT12" / "FAT16"                    */
 	char  oem[12];
 	int   bps, spc, reserved, nfats, root_entries;
 	long  total_sectors;
@@ -513,6 +517,7 @@ typedef struct {
 	int  reused;             /* deleted: clusters a live file took   */
 	int  bad;                /* sectors of it with a CRC error       */
 	int  parts, parts_ok;    /* archive members that still verify    */
+	int  layout;             /* archive entries its directory confirms*/
 	int  found;              /* ...recovered via a second directory   */
 	char lost[160];          /* members nothing on the disk can supply*/
 	char cross[72];          /* another file claiming the same space  */

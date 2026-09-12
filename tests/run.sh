@@ -594,6 +594,89 @@ PYEOF2
 		ok "the trimmed GIF keeps its header and gains a trailer"
 	else bad "the trimmed GIF keeps its header and gains a trailer"; fi
 
+	# A boot sector too damaged to parse costs the whole disk: it holds
+	# the map. The layout is rebuilt from the geometry the dump reports
+	# and checked against where it says the root directory is.
+	echo "== a disk whose boot sector cannot be read"
+	"$dr" damage "$out/fs.hfe" --track 0 --side 0 --id 1 \
+	      --bits 120,121,122,123 --out "$out/noboot.hfe" >/dev/null 2>&1
+	nb=$("$dr" scan "$out/noboot.hfe" --fs 2>/dev/null |
+	     grep -c "ARCHIVE.ZIP" || true)
+	if [ "${nb:-0}" -ge 1 ]; then
+		ok "the filesystem is still read without a boot sector"
+	else bad "the filesystem is still read without a boot sector"; fi
+	kd=$("$dr" scan "$out/noboot.hfe" --fs 2>/dev/null |
+	     grep -c "layout rebuilt" || true)
+	if [ "${kd:-0}" -ge 1 ]; then ok "and it says the layout was rebuilt"
+	else bad "and it says the layout was rebuilt"; fi
+
+	# Uncompressed audio is its own referee: a loudspeaker cone has
+	# mass, so a wrong 512 bytes - which is very nearly white noise -
+	# makes the waveform far rougher than the music either side of it.
+	echo "== a damaged sector inside uncompressed audio"
+	python3 - "$out" <<'PYEOF3'
+import math, os, struct, sys
+out = sys.argv[1]
+n = 120000                                   # frames, 16-bit stereo
+b = bytearray()
+for i in range(n):
+    # two slow tones - smooth, and nothing like white noise
+    v = int(9000 * math.sin(i / 63.0) + 6000 * math.sin(i / 311.0))
+    b += struct.pack("<hh", v, v)
+hdr = (b"RIFF" + struct.pack("<I", 36 + len(b)) + b"WAVEfmt " +
+       struct.pack("<IHHIIHH", 16, 1, 2, 44100, 44100 * 4, 4, 16) +
+       b"data" + struct.pack("<I", len(b)))
+open(os.path.join(out, "tone.wav"), "wb").write(hdr + bytes(b))
+PYEOF3
+	python3 "$here/tools/mkfat.py" "$out/wav.img" "TONE.WAV=$out/tone.wav"
+	"$dr" convert "$out/wav.img" --out "$out/wav.hfe" >/dev/null 2>&1
+	"$dr" damage "$out/wav.hfe" --track 1 --side 1 --id 4 --drop-only \
+	      --bits 803,1701 --out "$out/wav_bad.hfe" >/dev/null 2>&1
+	check "one bad sector" "$(badcount "$out/wav_bad.hfe")" "1"
+	wv=$("$dr" repair "$out/wav_bad.hfe" --fs 2>/dev/null |
+	     grep -c "PCM, 44100 Hz" || true)
+	if [ "${wv:-0}" -ge 1 ]; then ok "the waveform is used as a referee"
+	else bad "the waveform is used as a referee"; fi
+
+	# Two flipped bits barely move a waveform, so the referee should
+	# say so rather than cry wolf: an opinion, not a refutation.
+	wk=$("$dr" repair "$out/wav_bad.hfe" --fs 2>/dev/null |
+	     grep -c "as smooth as its neighbours" || true)
+	if [ "${wk:-0}" -ge 1 ]; then
+		ok "a two-bit change is not called a refutation"
+	else bad "a two-bit change is not called a refutation"; fi
+
+	# A whole sector of the wrong audio is a different matter. Slip the
+	# cells and the sector reads as something else entirely.
+	"$dr" damage "$out/wav.hfe" --track 1 --side 1 --id 5 \
+	      --slip 40:6 --out "$out/wav_slip.hfe" >/dev/null 2>&1
+	wr=$("$dr" repair "$out/wav_slip.hfe" --fs 2>/dev/null |
+	     grep -c "rougher than the audio either side" || true)
+	if [ "${wr:-0}" -ge 1 ]; then
+		ok "and it refutes readings a loudspeaker could not make"
+	else bad "and it refutes readings a loudspeaker could not make"; fi
+
+	# The counts belong in the name, and the guesses beside it.
+	echo "== whole-disk guesses, and the counts in the filename"
+	# wav_slip.hfe is the right shape for this: plenty of readings
+	# satisfy the sector's CRC and none of them settles it, which is
+	# exactly when a person needs images to look at.
+	"$dr" repair "$out/wav_slip.hfe" --all --auto --variants 3 \
+	      --out "$out/g_{fixed}of{bad}.hfe" >/dev/null 2>&1
+	if ls "$out"/g_*of*.hfe >/dev/null 2>&1; then
+		ok "the output name carries the counts ($(cd "$out" && ls g_*of*.hfe | head -1))"
+	else bad "the output name carries the counts"; fi
+	nv=$(ls "$out"/g_*of*_a[0-9].hfe 2>/dev/null | wc -l || true)
+	if [ "${nv:-0}" -ge 2 ]; then
+		ok "one image per whole-disk guess ($nv)"
+		allclean=1
+		for g in "$out"/g_*of*_a[0-9].hfe; do
+			[ "$(badcount "$g")" = "0" ] || allclean=0
+		done
+		if [ "$allclean" = "1" ]; then ok "every guess reads clean"
+		else bad "every guess reads clean"; fi
+	else bad "one image per whole-disk guess (got ${nv:-0})"; fi
+
 	python3 "$here/tools/mkfat.py" "$out/cfb.img" "DECK.PPT=$out/deck.ppt"
 	"$dr" convert "$out/cfb.img" --out "$out/cfb.hfe" >/dev/null 2>&1
 	"$dr" convert "$out/cfb.hfe" --out "$out/cfb_ref.img" \

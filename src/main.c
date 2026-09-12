@@ -118,7 +118,15 @@ static const char *usage_text =
 "                    erased - their data is often still there\n"
 "  --variants N      write one image per reading: FILE_a1.hfe,\n"
 "                    FILE_a2.hfe ... Open them in a disk browser and\n"
-"                    see which one's files still make sense.\n"
+"                    see which one's files still make sense. With\n"
+"                    --all these are whole-disk guesses: image k takes\n"
+"                    the k-th reading of every sector that would not\n"
+"                    settle, so each one is a coherent account of the\n"
+"                    disk rather than a mixture of ranks\n"
+"  --out with --all  may carry {fixed} and {bad}, e.g.\n"
+"                    --out \"Disk_Sand_{fixed}of{bad}.hfe\" writes\n"
+"                    Disk_Sand_3of4.hfe - so a directory of repaired\n"
+"                    images says how much of each one came back\n"
 "\n"
 "damage options:\n"
 "  --bits a,b,c      message bit indices to flip\n"
@@ -1311,7 +1319,123 @@ static void print_consensus(dr_view *v, dr_repair_result *r)
 
 /* Run the engine cascade for one sector and report in one line.
  * Returns 1 if the sector was repaired and verified. */
-static int repair_one(dr_ctx *c, int idx, args *a, int apply)
+/* Does the file above this sector say the reading cannot be right? */
+static int refuted_by_file(dr_ctx *c, dr_view *v, const dr_candidate *cand,
+                           int idx)
+{
+	dr_fs *fs = fs_of(c);
+	dr_fs_loc loc;
+	dr_fs_verdict vd;
+	uint8_t *msg;
+	int no = 0;
+
+	if (!fs || dr_fs_locate(fs, c, idx, &loc) != 0)
+		return 0;
+	if (loc.area != DR_AREA_FILE)
+		return 0;
+	msg = dr_candidate_message(v, cand);
+	if (!msg)
+		return 0;
+	if (dr_fs_score(fs, &loc, msg + v->data_offset, v->data_len,
+	                &vd) == 0 && vd.checked && vd.refuted)
+		no = 1;
+	free(msg);
+	return no;
+}
+
+/*
+ * Put the referee in front of the ranking.
+ *
+ * The likelihood ranking knows about flux and priors; it knows nothing
+ * about what the bytes are *for*. Where the sector sits under a file
+ * whose format carries a check of its own - an archive member's CRC-32,
+ * a compound document's twin stream, a record framing - that check is
+ * worth more than the ordering, because it is evidence rather than
+ * preference. A reading it proves belongs first and a reading it
+ * refutes belongs last, however the priors felt about them.
+ *
+ * Ties keep their original order, so where the referee has no opinion
+ * (or no referee exists) this changes nothing at all.
+ */
+static void order_by_referee(dr_ctx *c, dr_view *v, dr_repair_result *r,
+                             int idx)
+{
+	dr_fs *fs = fs_of(c);
+	dr_fs_loc loc;
+	dr_candidate *sorted;
+	double *key;
+	int i, j, n = r->count, any = 0;
+
+	if (!fs || n < 2 || dr_fs_locate(fs, c, idx, &loc) != 0)
+		return;
+	if (loc.area == DR_AREA_FREE || loc.area == DR_AREA_OUTSIDE)
+		return;
+	key = malloc((size_t)n * sizeof(*key));
+	sorted = malloc((size_t)n * sizeof(*sorted));
+	if (!key || !sorted) {
+		free(key);
+		free(sorted);
+		return;
+	}
+	for (i = 0; i < n; i++) {
+		uint8_t *msg = dr_candidate_message(v, &r->list[i]);
+		dr_fs_verdict vd;
+
+		key[i] = 1.0;
+		if (!msg)
+			continue;
+		if (dr_fs_score(fs, &loc, msg + v->data_offset, v->data_len,
+		                &vd) == 0 && vd.checked) {
+			key[i] = vd.proven ? 3.0 : vd.refuted ? 0.0
+			                                      : 1.0 + vd.score;
+			any = 1;
+		}
+		free(msg);
+	}
+	if (any) {
+		int m = 0;
+
+		/* Selection sort, descending, taking every reading that
+		 * shares the best remaining key in its original order - so
+		 * it is stable, which is the whole point: the likelihood
+		 * ranking still decides everything the referee cannot. A
+		 * list of at most a few hundred does not need better. */
+		while (m < n) {
+			double best = -1.0;
+
+			for (i = 0; i < n; i++)
+				if (key[i] > best)
+					best = key[i];
+			if (best < 0.0)
+				break;
+			for (i = 0; i < n; i++)
+				if (key[i] == best) {
+					sorted[m++] = r->list[i];
+					key[i] = -1.0;
+				}
+		}
+		for (j = 0; j < m; j++)
+			r->list[j] = sorted[j];
+	}
+	free(key);
+	free(sorted);
+}
+
+/*
+ * A sector that came out of `--all` still unrepaired, together with the
+ * readings the search liked best. Whole-disk variants are built from
+ * these: variant k takes every such sector's k-th reading at once, so
+ * each image is one coherent guess at the disk rather than a mixture.
+ */
+typedef struct {
+	int      track, side, id;
+	int      len;
+	int      nguess;
+	uint8_t *guess[DR_VARIANTS_MAX];
+} openspot;
+
+static int repair_one(dr_ctx *c, int idx, args *a, int apply,
+                      openspot *spot)
 {
 	dr_view *v;
 	dr_repair_result r;
@@ -1437,6 +1561,17 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 			printf("  -> not applied (~%.1f of the stored CRC's "
 			       "16 bits are themselves in doubt)",
 			       v->crc_expected_errors);
+		} else if (apply && (unique || margin >= 100.0) &&
+		           refuted_by_file(c, v, &r.list[0], idx)) {
+			/*
+			 * A commanding margin among readings that all match
+			 * a 16-bit CRC still loses to a check the file
+			 * itself carries. If the format above this sector
+			 * says this reading cannot be right, it is not
+			 * right, however far ahead of the rest it came.
+			 */
+			printf("  -> not applied (the file above it refutes "
+			       "this reading)");
 		} else if (apply && (unique || margin >= 100.0)) {
 			if (dr_apply(c, v, &r.list[0]) == 0 &&
 			    dr_verify(c, idx) == 1) {
@@ -1451,15 +1586,176 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 		printf("\n");
 	}
 
+	/* Nothing was written into this sector, so remember what the
+	 * search would have written, for the variants. */
+	if (!rc && spot && a->variants > 0 && r.count > 0 &&
+	    v->data_len > 0) {
+		int k;
+
+		order_by_referee(c, v, &r, idx);
+
+		spot->track = sl[idx].track;
+		spot->side = sl[idx].side;
+		spot->id = sl[idx].sector_id;
+		spot->len = v->data_len;
+		for (k = 0; k < r.count && k < a->variants; k++) {
+			uint8_t *msg = dr_candidate_message(v, &r.list[k]);
+
+			if (!msg)
+				break;
+			spot->guess[k] = malloc((size_t)v->data_len);
+			if (!spot->guess[k]) {
+				free(msg);
+				break;
+			}
+			memcpy(spot->guess[k], msg + v->data_offset,
+			       (size_t)v->data_len);
+			free(msg);
+			spot->nguess++;
+		}
+	}
+
 	dr_repair_free(&r);
 	dr_view_free(v);
 	return rc;
 }
 
+/*
+ * Put the counts in the name.
+ *
+ * A directory of repaired images is a pile of disks that all look
+ * alike, and the one thing a person wants to know before opening one -
+ * how much of it came back - is exactly what the filename does not say.
+ * So `--out` may carry {fixed} and {bad}, e.g.
+ *
+ *     --out "Disk_Sand_{fixed}of{bad}.hfe"   ->  Disk_Sand_3of4.hfe
+ *
+ * Explicit rather than automatic: a name is the user's to choose, and a
+ * tool that silently renames its output is a tool you cannot script.
+ */
+static void name_with_counts(char *dst, size_t dstsz, const char *pat,
+                             int fixed, int bad)
+{
+	size_t o = 0;
+	const char *p;
+
+	for (p = pat; *p && o + 32 < dstsz; p++) {
+		if (!strncmp(p, "{fixed}", 7)) {
+			o += (size_t)snprintf(dst + o, dstsz - o, "%d", fixed);
+			p += 6;
+		} else if (!strncmp(p, "{bad}", 5)) {
+			o += (size_t)snprintf(dst + o, dstsz - o, "%d", bad);
+			p += 4;
+		} else {
+			dst[o++] = *p;
+		}
+	}
+	dst[o] = 0;
+}
+
+/*
+ * One image per guess at the whole disk.
+ *
+ * When some sectors will not settle, there is no single answer to
+ * write - but there is a short list of coherent ones. Variant k takes
+ * the k-th reading of *every* unsettled sector at once, so each image
+ * is one self-consistent account of the disk rather than a mixture of
+ * ranks. Open them in a disk browser and the one whose files still make
+ * sense is the answer; that judgement is a person's to make, and this
+ * is what makes it possible to make it.
+ *
+ * Each variant is built from the base image (the one carrying the
+ * repairs that were applied), not from the one before it, so a variant
+ * never inherits another variant's guesses.
+ */
+static int write_disk_variants(args *a, const char *base,
+                               openspot *spots, int nspots, int n)
+{
+	const char *dot;
+	char stem[1200], ext[64];
+	int k, wrote = 0;
+
+	dot = strrchr(base, '.');
+	if (dot && strlen(dot) < sizeof(ext)) {
+		snprintf(stem, sizeof(stem), "%.*s", (int)(dot - base), base);
+		snprintf(ext, sizeof(ext), "%s", dot);
+	} else {
+		snprintf(stem, sizeof(stem), "%s", base);
+		snprintf(ext, sizeof(ext), ".hfe");
+	}
+
+	for (k = 0; k < n; k++) {
+		dr_ctx *cc = dr_open_ex(base, 0, a->sets, a->nsets);
+		char path[1400];
+		int set = 0, i, m, deep = 0;
+
+		if (!cc || dr_scan(cc) < 0) {
+			if (cc)
+				dr_close(cc);
+			break;
+		}
+		for (i = 0; i < nspots; i++) {
+			const dr_sector *sl;
+			int use, idx = -1, j;
+
+			if (!spots[i].nguess)
+				continue;
+			use = k < spots[i].nguess ? k : spots[i].nguess - 1;
+			if (k < spots[i].nguess)
+				deep++;
+			sl = dr_sectors(cc, &m);
+			for (j = 0; j < m; j++)
+				if (sl[j].track == spots[i].track &&
+				    sl[j].side == spots[i].side &&
+				    sl[j].sector_id == spots[i].id) {
+					idx = j;
+					break;
+				}
+			if (idx < 0)
+				continue;
+			{
+				dr_view *vv = dr_view_open(cc, idx, &a->opt);
+
+				if (vv && dr_set_data(cc, vv,
+				                      spots[i].guess[use],
+				                      spots[i].len) == 0)
+					set++;
+				if (vv)
+					dr_view_free(vv);
+			}
+		}
+		/* Past the point where any sector still has a reading of
+		 * its own to offer, the images stop differing. */
+		if (k > 0 && !deep) {
+			dr_close(cc);
+			break;
+		}
+		snprintf(path, sizeof(path), "%s_a%d%s", stem, k + 1, ext);
+		if (dr_export(cc, path, a->format) == 0) {
+			printf("  %s  (%d sector(s) set to reading #%d)\n",
+			       path, set, k + 1);
+			wrote++;
+		}
+		dr_close(cc);
+	}
+	return wrote;
+}
+
+static void free_spots(openspot *spots, int n)
+{
+	int i, k;
+
+	for (i = 0; spots && i < n; i++)
+		for (k = 0; k < spots[i].nguess; k++)
+			free(spots[i].guess[k]);
+	free(spots);
+}
+
 static int cmd_repair_all(dr_ctx *c, args *a)
 {
 	struct { int track, side, id; } *todo = NULL;
-	int n, i, ntodo = 0, fixed = 0, apply;
+	openspot *spots = NULL;
+	int n, i, ntodo = 0, fixed = 0, apply, nspots = 0;
 	const dr_sector *sl = dr_sectors(c, &n);
 
 	apply = (a->apply >= 0 || a->autoapply);
@@ -1503,7 +1799,17 @@ static int cmd_repair_all(dr_ctx *c, args *a)
 		if (idx < 0)
 			continue;
 
-		fixed += repair_one(c, idx, a, apply);
+		if (a->variants > 0 && !spots) {
+			spots = calloc((size_t)ntodo, sizeof(*spots));
+			if (!spots) {
+				free(todo);
+				return 1;
+			}
+		}
+		fixed += repair_one(c, idx, a, apply,
+		                    spots ? &spots[nspots] : NULL);
+		if (spots && spots[nspots].nguess)
+			nspots++;
 		fflush(stdout);
 	}
 
@@ -1515,13 +1821,29 @@ static int cmd_repair_all(dr_ctx *c, args *a)
 		g_fs_tried = 0;
 	}
 
-	if (a->out && fixed) {
-		if (dr_export(c, a->out, a->format) < 0) {
+	if (a->out && (fixed || nspots)) {
+		char path[1200];
+
+		name_with_counts(path, sizeof(path), a->out, fixed, ntodo);
+		if (dr_export(c, path, a->format) < 0) {
 			fprintf(stderr, "%s\n", dr_last_error(c));
+			free_spots(spots, nspots);
 			return 1;
 		}
-		printf("wrote %s (%s)\n", a->out, a->format);
+		printf("wrote %s (%s)\n", path, a->format);
+
+		if (nspots) {
+			printf("\n%d sector(s) did not settle. One image per "
+			       "guess at the whole disk,\nlikeliest first - "
+			       "open them in a disk browser and see which "
+			       "one's\nfiles still make sense:\n\n", nspots);
+			write_disk_variants(a, path, spots, nspots,
+			                    a->variants);
+		}
+	} else if (nspots && a->variants > 0) {
+		fprintf(stderr, "--variants needs --out\n");
 	}
+	free_spots(spots, nspots);
 	return 0;
 }
 

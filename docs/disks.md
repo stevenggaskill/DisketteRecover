@@ -25,12 +25,25 @@ failure was misleading.
 | Teres    | 2880 | 4 | 3 | 0 | one in free space; three in Quicken's `QDATA.QDB`/`.QSD`/`.QEL`. Uncompressed and structured - the QDB's 56-byte record framing locates the damage to the last 124 bytes of its sector and refutes all 561 re-readings that satisfy the CRC. The other 7 files are intact |
 | DisComp  | 2881 | 0 | - | - | **a Macintosh HFS disk** (volume "Gradebook"), not a PC disk - which is why nothing could read it as one. No CRC errors at all |
 | ALXPPT   | 2944 | 20 | 10 | 0 | one mark down sector 12, tracks 32-45. The damaged FAT sector was restored from its twin; 7 of the rest are in free space. Its root directory also still holds four **deleted** entries, and three of those - `RPN.PRC`, `TEALLOCK.PRC` and RPN's scripts database - come back whole, names and all. The live filesystem is confused independently of the damage: `RESUME.TXT`'s recorded start cluster is three clusters past where its text actually begins |
-| **total** | **32361** | **80** | **30** | **10** | |
+| 3COME    | 2882 |  6 | **0** | - | a 3Com EtherLink III driver disk. Every bad sector is on tracks 72-79 and every one is in **free space**; 3 of the 6 repaired anyway. Nothing lost |
+| UUDVD    | 2916 |  1 | **0** | - | the one bad sector is the **boot sector**, so nothing could read this disk at all. The layout was rebuilt from the geometry the dump reports - and then both FATs turn out to be format filler: this disk was duplicated by writing the directory and the data and never filling in the FAT. Read straight on from the start and its single file, `UUDVD05B.ZIP`, comes out whole; all six members verify by their own CRC-32 |
+| nVid32b  | 2898 |  8 | **0** | - | an nVidia IDE/RAID driver disk. All 8 are **sector 6** on tracks 69-77, both sides - one radial mark - and all in **free space**. Nothing lost |
+| SB16_InD2| 2882 |  6 | 6 | **1** | Sound Blaster 16 install disk 2. All 6 are **sector 15** on tracks 67-79: four in `_INST32I.EX_`, two in `S_16_44.WAV`. The WAV is uncompressed PCM, so the waveform is its own referee - and it refutes every CRC-valid reading of both, the closest being 13x and 176x rougher than the audio either side |
+| SB32_ID  | 2882 |  1 | **0** | - | an AWE32 install disk. One bad sector, in **free space**, repaired. Nothing lost |
+| **total** | **47820** | **102** | **36** | **11** | |
 
-Six of the thirteen disks - Disk 1, GasAcc, Scott, Ron, SLAW and
-DisComp - lost nothing at all, and LGTC0 joins them once the outside
-copy of its driver is applied. That is not visible from the CRC; it is visible
-from the filesystem.
+Ten of the eighteen disks - Disk 1, GasAcc, Scott, Ron, SLAW, DisComp,
+3COME, UUDVD, nVid32b and SB32_ID - lost nothing at all, and LGTC0
+joins them once the outside copy of its driver is applied. That is not
+visible from the CRC; it is visible from the filesystem.
+
+The five driver and install disks also show what damage to a floppy
+actually looks like. On nVid32b every bad sector is sector 6, on tracks
+69 to 77, on both sides; on SB16 every one is sector 15, on tracks 67 to
+79. That is not eight independent failures and six more: it is one mark
+at one angular position, crossing every track it passes under. The
+damage is radial, which is the same observation that the flux search's
+smoothness prior rests on, a millimetre further out.
 
 And the count above still flatters the damage. `scan --fs` now surveys
 each file rather than each sector, because a bad sector inside an
@@ -58,6 +71,7 @@ the outside of the disk has already eaten.
 | Sand | `26/1 s10` | `faxcover.tpl`, archived twice | inflates, CRC-32 `C486A5AA` |
 | LGTC0 | `9/0 s12`, `10/0 s12` | the same build of the file, from outside the disk | anchored on the sector's clean neighbours: 65,536 bytes of agreement before and 17,958 / 61,494 after, and the repaired file then matches the known-good copy byte for byte |
 | Zeus | `9/0 s9` | the same stream, stored twice inside the same `.ppt` | the twin matches for 8581 bytes either side of the damage, and with its 512 in place the preview metafile's 727 records tile exactly |
+| UUDVD | *the whole disk* | the layout rebuilt from the dump's own geometry, then the file read straight on from its start - both FATs are blank | the archive's central directory agrees with all six of its local headers, and all six members pass their CRC-32 |
 | SLAT | `RotatingGlobeAnimation.gif` | the archive stored the same animation twice, under two names | the stale copy of the archive's own central directory is the only thing that knows the second name; its packed bytes inflate to CRC-32 `E16CA998` |
 | Disk 2, LGTC0, Scott | 4 sectors | the search, applied on a clear margin | libhxcfe re-decode reads them clean |
 

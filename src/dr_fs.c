@@ -392,6 +392,122 @@ static int hfs_allocated(const dr_fs *fs, long lba)
 	return (fs->img[off] >> (7 - (blk & 7))) & 1;
 }
 
+/*
+ * Does this look like the first sector of a root directory?
+ *
+ * A root directory is 32-byte entries, and the ones in use start with a
+ * printable 8.3 name, carry an attribute byte with no reserved bits
+ * set, and point at a plausible cluster. An empty root directory is all
+ * zeros, which is also a valid answer - but it is also what an unused
+ * part of the disk looks like, so it only counts when nothing else
+ * matched. Format filler (0xF6) and file data both fail this easily,
+ * which is what makes the test worth making.
+ */
+static int looks_like_root(const uint8_t *b)
+{
+	int e, live = 0, blank = 0;
+
+	for (e = 0; e < SECSZ / 32; e++) {
+		const uint8_t *d = b + e * 32;
+		int i, ok = 1;
+
+		if (!d[0]) { blank++; continue; }
+		if (d[0] == 0xE5) { blank++; continue; }
+		if (d[11] & 0xC0)                   /* reserved attr bits */
+			continue;
+		for (i = 0; i < 11; i++)
+			if (d[i] < 0x20 || d[i] == 0x7F) { ok = 0; break; }
+		if (ok)
+			live++;
+	}
+	if (live)
+		return live;
+	return blank == SECSZ / 32 ? -1 : 0;   /* -1 = empty but legal */
+}
+
+/*
+ * Rebuild the layout when the boot sector cannot be read.
+ *
+ * Every standard PC floppy format has one layout, and the dump reports
+ * the geometry it actually found, so the candidate list is short. Each
+ * candidate is checked by looking where it says the root directory is:
+ * a wrong guess points into a FAT or into file data and fails at once.
+ */
+static int guess_layout(dr_ctx *c, dr_fs *fs)
+{
+	static const struct {
+		int spt, heads, tracks, spc, root, fatsz;
+	} known[] = {
+		{ 18, 2, 80, 1, 224, 9 },        /* 1.44 MB   */
+		{  9, 2, 80, 2, 112, 3 },        /* 720 KB    */
+		{ 15, 2, 80, 1, 224, 7 },        /* 1.2 MB    */
+		{  9, 2, 40, 2, 112, 2 },        /* 360 KB    */
+		{  8, 2, 40, 2, 112, 1 },        /* 320 KB    */
+		{ 36, 2, 80, 2, 240, 9 },        /* 2.88 MB   */
+	};
+	dr_fs_info *in = &fs->info;
+	int spt = 0, heads = 1, n = 0, k;
+	const dr_sector *sl = dr_sectors(c, &n);
+	size_t g;
+
+	for (k = 0; k < n; k++) {
+		if (sl[k].sector_size != SECSZ)
+			continue;
+		if (sl[k].sector_id > spt)
+			spt = sl[k].sector_id;
+		if (sl[k].side + 1 > heads)
+			heads = sl[k].side + 1;
+	}
+	if (spt < 1 || spt > 64)
+		return -1;
+
+	for (g = 0; g < sizeof(known) / sizeof(known[0]); g++) {
+		long root_lba;
+		uint8_t probe[SECSZ];
+		int lba, trk, side, id, score;
+
+		if (known[g].spt != spt || known[g].heads != heads)
+			continue;
+
+		memset(in, 0, sizeof(*in));
+		in->bps = SECSZ;
+		in->spc = known[g].spc;
+		in->reserved = 1;
+		in->nfats = 2;
+		in->root_entries = known[g].root;
+		in->fat_sectors = known[g].fatsz;
+		in->spt = spt;
+		in->heads = heads;
+		in->total_sectors = (long)spt * heads * known[g].tracks;
+		root_lba = 1 + 2L * known[g].fatsz;
+
+		lba = (int)root_lba;
+		trk = lba / (spt * heads);
+		side = (lba / spt) % heads;
+		id = lba % spt + 1;
+		if (read_one(c, trk, side, id, probe) != 0)
+			continue;
+		score = looks_like_root(probe);
+		if (score <= 0)
+			continue;
+
+		in->root_lba = root_lba;
+		in->data_lba = root_lba +
+		               (((long)in->root_entries * 32 + SECSZ - 1)
+		                / SECSZ);
+		in->clusters = (int)((in->total_sectors - in->data_lba) /
+		                     in->spc);
+		snprintf(in->kind, sizeof(in->kind), "%s (layout rebuilt - "
+		         "the boot sector could not be read)",
+		         in->clusters < 4085 ? "FAT12" : "FAT16");
+		in->guessed = 1;
+		snprintf(in->oem, sizeof(in->oem), "%s", "?");
+		return 0;
+	}
+	memset(in, 0, sizeof(*in));
+	return -1;
+}
+
 dr_fs *dr_fs_open(dr_ctx *c)
 {
 	dr_fs *fs;
@@ -430,6 +546,24 @@ dr_fs *dr_fs_open(dr_ctx *c)
 		memset(in, 0, sizeof(*in));
 		if (hfs_open(c, fs) == 0)
 			return fs;
+		/*
+		 * The boot sector is the one sector whose loss costs the
+		 * whole disk: it holds the map, so without it nothing else
+		 * can be found, and every file behind it is reported
+		 * missing when in fact none of it has been touched.
+		 *
+		 * It is also the most guessable sector on a floppy. A PC
+		 * floppy came from a handful of formats and each one has
+		 * exactly one layout, so the geometry the dump itself
+		 * reports - how many sectors per track were actually read -
+		 * picks the BPB out of that list. Then the guess is put to
+		 * the disk: the layout is only accepted if the root
+		 * directory it points at really looks like a root
+		 * directory. A wrong guess lands in the middle of a FAT or
+		 * a file and fails that at once.
+		 */
+		if (guess_layout(c, fs) == 0)
+			goto laid_out;
 		dr_fs_free(fs);
 		return NULL;
 	}
@@ -440,6 +574,8 @@ dr_fs *dr_fs_open(dr_ctx *c)
 	in->clusters = (int)((in->total_sectors - in->data_lba) / in->spc);
 	snprintf(in->kind, sizeof(in->kind), "%s",
 	         in->clusters < 4085 ? "FAT12" : "FAT16");
+
+laid_out:
 
 	need = in->total_sectors;
 	if (need > MAX_LBA)
@@ -1235,6 +1371,19 @@ static uint8_t *assemble(dr_fs *fs, const dr_fs_loc *loc,
 	if (!cl)
 		return NULL;
 	n = chain(fs, fs->files[f].start, cl, in->clusters + 2);
+	/* The FAT does not always describe the file it names - it can be
+	 * damaged, and on a disk duplicated directory-and-data-only it was
+	 * never written at all. Read straight on from the start, the same
+	 * guess dr_fs_read() makes, so the referees below see the whole
+	 * file rather than its first cluster. */
+	if ((long)n * in->spc * SECSZ < size) {
+		n = (int)((size + (long)in->spc * SECSZ - 1) /
+		          ((long)in->spc * SECSZ));
+		if (n > in->clusters)
+			n = in->clusters;
+		for (k = 0; k < n; k++)
+			cl[k] = fs->files[f].start + k;
+	}
 
 	buf = calloc((size_t)size + SECSZ, 1);
 	if (!buf) {
@@ -1452,6 +1601,187 @@ static long gif_close(uint8_t *buf, long n, long full,
 		         "and closed off - %ld of %ld byte(s), and it opens",
 		         last + 2, full);
 	return last + 2;
+}
+
+/*
+ * Sound is smooth too.
+ *
+ * The same argument that shapes the flux search applies a level up, to
+ * what the sector actually holds. Uncompressed PCM is a physical
+ * quantity sampled 44,100 times a second: a loudspeaker cone has mass,
+ * so between one sample and the next it can only move so far. Music is
+ * not smooth everywhere - a snare hit is a step - but it is never
+ * *white*, and a wrong 512 bytes of audio is almost exactly white.
+ *
+ * So a reading can be judged by how rough it makes the waveform. The
+ * measure is the mean squared second difference over the repaired
+ * region - curvature, which is what a speaker cannot produce without
+ * bound - against the same measure over the clean audio either side of
+ * it. That reference is the point: it is the file's own idea of how
+ * lively it is, so a quiet passage is judged against quiet and a loud
+ * one against loud, and no threshold has to be invented for "music".
+ *
+ * Returns 0 to refute, -2 for an opinion short of proof, -1 for no
+ * opinion, with 0..1 in *score. Never 1: smoothness is evidence, not
+ * proof - a wrong reading can be smooth by luck, and no amount of
+ * smoothness brings back the samples that were there. It ranks; it
+ * does not decide.
+ */
+static int wav_check(const uint8_t *b, long len, long at, long span,
+                     char *how, size_t howsz, double *score)
+{
+	long p, dstart = -1, dlen = 0;
+	int chans = 0, bits = 0, fmt = 0;
+	long rate = 0;
+	double rough = 0.0, ref = 0.0;
+	long nr = 0, nf = 0, i;
+	long lo, hi, wlo, whi;
+	int step;
+
+	if (len < 44 || memcmp(b, "RIFF", 4) || memcmp(b + 8, "WAVE", 4))
+		return -1;
+	for (p = 12; p + 8 <= len; ) {
+		long csz = (long)b[p+4] | ((long)b[p+5] << 8) |
+		           ((long)b[p+6] << 16) | ((long)b[p+7] << 24);
+
+		if (csz < 0 || p + 8 + csz > len + 8)
+			break;
+		if (!memcmp(b + p, "fmt ", 4) && csz >= 16) {
+			fmt   = u16le(b + p + 8);
+			chans = u16le(b + p + 10);
+			rate  = (long)b[p+12] | ((long)b[p+13] << 8) |
+			        ((long)b[p+14] << 16) | ((long)b[p+15] << 24);
+			bits  = u16le(b + p + 22);
+		} else if (!memcmp(b + p, "data", 4)) {
+			dstart = p + 8;
+			dlen = csz;
+			break;
+		}
+		p += 8 + csz + (csz & 1);
+	}
+	if (dstart < 0 || fmt != 1 || chans < 1 || chans > 2 ||
+	    (bits != 8 && bits != 16))
+		return -1;
+	if (dlen > len - dstart)
+		dlen = len - dstart;
+	if (at < dstart || at >= dstart + dlen)
+		return -1;
+
+	/* Work in frames, one channel, so the interleave does not read as
+	 * a sawtooth. Channel 0 is enough to judge by. */
+	step = chans * bits / 8;
+	lo = (at - dstart) / step;
+	hi = (at + span - dstart + step - 1) / step;
+	if (hi > dlen / step)
+		hi = dlen / step;
+	wlo = lo - 4096;
+	whi = hi + 4096;
+	if (wlo < 1)
+		wlo = 1;
+	if (whi > dlen / step - 1)
+		whi = dlen / step - 1;
+	if (hi - lo < 4 || whi - wlo < 64)
+		return -1;
+
+	#define SAMP(k) (bits == 16 \
+	    ? (double)(int16_t)(b[dstart + (k) * step] | \
+	                        (b[dstart + (k) * step + 1] << 8)) \
+	    : ((double)b[dstart + (k) * step] - 128.0) * 256.0)
+
+	for (i = wlo; i < whi; i++) {
+		double d2 = SAMP(i + 1) - 2.0 * SAMP(i) + SAMP(i - 1);
+
+		if (i >= lo - 1 && i <= hi) {
+			rough += d2 * d2;
+			nr++;
+		} else {
+			ref += d2 * d2;
+			nf++;
+		}
+	}
+	#undef SAMP
+
+	if (nr < 4 || nf < 64)
+		return -1;
+	rough /= (double)nr;
+	ref /= (double)nf;
+	if (ref < 1.0)
+		ref = 1.0;
+
+	*score = ref / (ref + rough);
+	if (rough > 8.0 * ref) {
+		snprintf(how, howsz,
+		         "%d-bit PCM, %ld Hz: this reading is %.0fx rougher "
+		         "than the audio either side of it - a loudspeaker "
+		         "cannot move like that", bits, rate, rough / ref);
+		return 0;
+	}
+	snprintf(how, howsz,
+	         "%d-bit PCM, %ld Hz: the waveform stays %s across the "
+	         "repair (%.2fx the roughness of the audio either side)",
+	         bits, rate,
+	         rough < 2.0 * ref ? "as smooth as its neighbours"
+	                           : "plausible",
+	         rough / ref);
+	return -2;                       /* an opinion, but not proof */
+}
+
+/*
+ * Does this archive hang together as a whole?
+ *
+ * A ZIP ends with a directory of everything in it, and every entry in
+ * that directory names the offset of its own local header. So the file
+ * can be checked without decompressing a single byte: find the end
+ * record, walk the directory, and look at each offset it gives for the
+ * local header it promises, with the same name.
+ *
+ * That is worth having on its own. It says the file is the right length
+ * and in the right order, which is exactly the question when the bytes
+ * were gathered by guesswork - a file read straight on through the data
+ * area because the FAT could not say where it goes. Half a dozen
+ * offsets landing on their own signatures by luck is not a thing that
+ * happens. And it holds for archives this tool cannot decompress:
+ * UUDVD's is PKWARE implode, which nothing here can read, and its
+ * layout still checks out end to end.
+ *
+ * Returns the number of entries confirmed, or -1.
+ */
+static int zip_layout_ok(const uint8_t *b, long len)
+{
+	long eocd = -1, p, cd;
+	int want, seen = 0, i;
+
+	for (p = len - 22; p >= 0 && p > len - 66000; p--)
+		if (b[p] == 'P' && b[p+1] == 'K' && b[p+2] == 5 &&
+		    b[p+3] == 6) { eocd = p; break; }
+	if (eocd < 0)
+		return -1;
+	want = u16le(b + eocd + 10);
+	cd   = (long)b[eocd+16] | ((long)b[eocd+17] << 8) |
+	       ((long)b[eocd+18] << 16) | ((long)b[eocd+19] << 24);
+	if (want < 1 || want > 4096 || cd < 0 || cd + 46 > len)
+		return -1;
+
+	for (i = 0, p = cd; i < want && p + 46 <= len; i++) {
+		long lh;
+		int nl, el, cm;
+
+		if (!(b[p] == 'P' && b[p+1] == 'K' && b[p+2] == 1 &&
+		      b[p+3] == 2))
+			break;
+		nl = u16le(b + p + 28);
+		el = u16le(b + p + 30);
+		cm = u16le(b + p + 32);
+		lh = (long)b[p+42] | ((long)b[p+43] << 8) |
+		     ((long)b[p+44] << 16) | ((long)b[p+45] << 24);
+		if (lh >= 0 && lh + 30 + nl <= len &&
+		    b[lh] == 'P' && b[lh+1] == 'K' && b[lh+2] == 3 &&
+		    b[lh+3] == 4 && u16le(b + lh + 26) == nl &&
+		    memcmp(b + lh + 30, b + p + 46, (size_t)nl) == 0)
+			seen++;
+		p += 46 + nl + el + cm;
+	}
+	return seen == want ? seen : -1;
 }
 
 /* Walk a ZIP's central directory and judge every entry the sector
@@ -1695,7 +2025,22 @@ int dr_fs_score(dr_fs *fs, const dr_fs_loc *loc, const uint8_t *payload,
 				v = framing_check(buf, flen, loc->file_offset,
 				                  len, out->how,
 				                  sizeof(out->how), &part);
+			if (v < 0)
+				v = wav_check(buf, flen, loc->file_offset,
+				              len, out->how,
+				              sizeof(out->how), &part);
 			free(buf);
+		}
+		/*
+		 * -2 is a referee that can rank but cannot prove: it has an
+		 * opinion about which readings are plausible and no power to
+		 * settle the matter. Saying so is the honest report; calling
+		 * it proof would let a lucky guess be applied.
+		 */
+		if (v == -2) {
+			out->checked = 1;
+			out->score = part >= 0.0 ? part : 0.5;
+			return 0;
 		}
 		if (v >= 0) {
 			out->checked = 1;
@@ -2842,12 +3187,14 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 			l.file_offset = -1;
 			b = assemble(fs, &l, NULL, 0, &flen);
 			if (b) {
-				if (flen > 30 && b[0] == 'P' && b[1] == 'K')
+				if (flen > 30 && b[0] == 'P' && b[1] == 'K') {
 					zip_survey(b, flen, fs->img,
 					           fs->nlba * SECSZ, firstbad,
 					           &o->parts, &o->parts_ok,
 					           &o->found, o->lost,
 					           sizeof(o->lost));
+					o->layout = zip_layout_ok(b, flen);
+				}
 				free(b);
 			}
 		}
@@ -2920,12 +3267,41 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 			         "its clusters are also claimed by %s - the "
 			         "FAT has them cross-linked, so at most one "
 			         "of the two is whole", o->cross);
+		} else if (o->chain_bytes < o->size &&
+		           ((o->parts && o->parts_ok == o->parts) ||
+		            o->layout > 0)) {
+			/*
+			 * The FAT could not say where this file goes, so it
+			 * was read straight on from where the directory says
+			 * it starts. That is a guess - and here it is a
+			 * guess the file itself confirms, which is worth far
+			 * more than the complaint about the chain.
+			 */
+			if (o->parts && o->parts_ok == o->parts)
+				snprintf(o->note, sizeof(o->note),
+				         "the FAT stops describing it after "
+				         "%ld of %ld byte(s), so it was read "
+				         "straight on from its start - and "
+				         "all %d archive member(s) verify, so "
+				         "that is right", o->chain_bytes,
+				         o->size, o->parts);
+			else
+				snprintf(o->note, sizeof(o->note),
+				         "the FAT stops describing it after "
+				         "%ld of %ld byte(s), so it was read "
+				         "straight on from its start - and "
+				         "the archive's directory then agrees "
+				         "with all %d of its local headers, "
+				         "so that is right", o->chain_bytes,
+				         o->size, o->layout);
 		} else if (o->chain_bytes < o->size) {
 			snprintf(o->note, sizeof(o->note),
 			         "its cluster chain gives out after %ld of "
 			         "%ld byte(s) - the FAT entry that should "
-			         "continue it is wrong", o->chain_bytes,
-			         o->size);
+			         "continue it is wrong%s", o->chain_bytes,
+			         o->size,
+			         o->parts ? "; read straight on from its "
+			                    "start instead" : "");
 		} else if (o->parts) {
 			int k = snprintf(o->note, sizeof(o->note),
 			                 "%d of %d archive member(s) still "
@@ -3172,9 +3548,19 @@ uint8_t *dr_fs_read(dr_fs *fs, int index, long *len)
 	 * When the links are gone, read the clusters consecutively from
 	 * that start: a file written to a freshly formatted floppy is
 	 * almost always contiguous, and it is the only guess available.
+	 *
+	 * A live file can be in the same position. Some disks were
+	 * duplicated by writing the directory and the data and never
+	 * filling in the FAT at all - UUDVD is one, both of its FATs are
+	 * still format filler - and a damaged FAT sector has the same
+	 * effect over the clusters it covers. The directory entry is
+	 * intact either way, and it holds the two things that matter:
+	 * where the file starts and how long it is. Reading straight on
+	 * from there recovers the file whenever it was written
+	 * contiguously, and says so rather than pretending the chain was
+	 * followed.
 	 */
-	if (fs->files[index].deleted &&
-	    (long)n * in->spc * SECSZ < size) {
+	if ((long)n * in->spc * SECSZ < size) {
 		n = (int)((size + (long)in->spc * SECSZ - 1) /
 		          ((long)in->spc * SECSZ));
 		for (k = 0; k < n; k++)

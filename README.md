@@ -744,7 +744,79 @@ readable text. The ones with nothing left before the damage - here a GIF
 whose own palette is longer than the bytes that survived - are reported
 as such rather than written as a file that will not open.
 
-### 4d-bis. How much of the sector is actually settled
+### 4d-ii. Sound is smooth too
+
+The smoothness argument that shapes the flux search applies a level up,
+to what the sector actually holds. Uncompressed PCM is a physical
+quantity sampled 44,100 times a second, and a loudspeaker cone has mass:
+between one sample and the next it can only move so far. Music is not
+smooth everywhere - a snare hit is a step - but it is never *white*, and
+a wrong 512 bytes of audio is almost exactly white.
+
+So a reading can be judged by how rough it makes the waveform: the mean
+squared second difference over the repaired region, against the same
+measure over the clean audio either side of it. That reference is the
+point. It is the file's own idea of how lively it is, so a quiet passage
+is judged against quiet and a loud one against loud, and no threshold
+has to be invented for "music".
+
+On Sound Blaster install disk 2, two bad sectors land in `S_16_44.WAV`:
+
+```
+referee   : 40 reading(s) satisfied the sector's 16-bit CRC; not one of them
+            survives the check the file itself carries.
+            The closest any of them came: 16-bit PCM, 44100 Hz: this reading
+            is 176x rougher than the audio either side of it - a loudspeaker
+            cannot move like that
+```
+
+It ranks; it never proves. A wrong reading can be smooth by luck, and no
+amount of smoothness brings back the samples that were there - so it
+returns "an opinion short of proof" rather than a verdict, and the tool
+reports it that way.
+
+What a referee *can* do outright is stop a repair. A reading a thousand
+times likelier than the next, matching the sector's sixteen bits, is
+still wrong if the file above it says so; `--auto` no longer applies one
+that its file refutes.
+
+### 4d-iii. A disk whose boot sector is gone
+
+The boot sector is the one sector whose loss costs the whole disk: it
+holds the map, so without it nothing else can be found and every file
+behind it is reported missing when none of it has been touched.
+
+It is also the most guessable sector on a floppy. A PC floppy came from
+a handful of formats and each one has exactly one layout, so the
+geometry the dump itself reports - how many sectors per track were
+actually read, and how many sides - picks the BPB out of that list. The
+guess is then put to the disk: it is accepted only if the root directory
+it points at really looks like one. A wrong guess lands in the middle of
+a FAT or a file and fails at once.
+
+That is how `UUDVD` gets read at all, and it turns up something the
+damage had been hiding: both of its FATs are still format filler. The
+disk was duplicated by writing the directory and the data and never
+filling in the FAT, so no operating system would ever have mounted it
+either. A damaged FAT sector leaves a file in the same position.
+
+The directory entry survives both cases, and it holds the two things
+that matter - where the file starts and how long it is - so the file is
+read straight on from there. That is a guess, and the formats that can
+confirm it are asked to. A ZIP can, without decompressing a byte: its
+directory sits at the end and names the offset of every local header.
+
+```
+UUDVD05B.ZIP  112656 byte(s)  the FAT stops describing it after 1024 of 112656
+                              byte(s), so it was read straight on from its
+                              start - and the archive's directory then agrees
+                              with all 6 of its local headers, so that is right
+```
+
+All six members then pass their own CRC-32. Half a dozen offsets landing
+on their own signatures by luck is not a thing that happens.
+
+### 4d-iv. How much of the sector is actually settled
 
 "256 CRC-valid readings, the top one twice as likely as the next" is
 true and almost useless. Those readings are not 256 different sectors:
@@ -781,6 +853,26 @@ itself and labels the variants; where it does not - QuickBooks backups,
 PowerPoint 97, a Windows VxD - a person with the files in front of them
 is still the better referee, and five files to click through settles in
 seconds what a likelihood ratio only ever estimates.
+
+With `--all` the variants are whole-disk guesses rather than one
+sector's: image k takes the k-th reading of *every* sector that would
+not settle, at once, so each image is one self-consistent account of the
+disk rather than a mixture of ranks. Within each sector the readings are
+put in the referee's order first, so where a format can speak the guess
+it prefers is guess number one and a reading it refutes is last. The
+images stop being written as soon as they stop differing.
+
+The counts can go in the name, too: with `--all`, `--out` may carry
+`{fixed}` and `{bad}`, so
+
+```sh
+disketterecover repair "Disk Sand/track00.0.raw" --all --auto --variants 5 \
+    --out "Disk_Sand_{fixed}of{bad}.hfe"
+```
+
+writes `Disk_Sand_3of4.hfe` and its guesses beside it. A directory of
+repaired images then says how much of each one came back without being
+opened.
 
 ### 5. Cycle through the most likely corrections
 
@@ -1341,7 +1433,15 @@ filesystem options (scan and repair):
                     erased - their data is often still there
   --variants N      write one image per reading: FILE_a1.hfe,
                     FILE_a2.hfe ... Open them in a disk browser and
-                    see which one's files still make sense.
+                    see which one's files still make sense. With
+                    --all these are whole-disk guesses: image k takes
+                    the k-th reading of every sector that would not
+                    settle, so each one is a coherent account of the
+                    disk rather than a mixture of ranks
+  --out with --all  may carry {fixed} and {bad}, e.g.
+                    --out "Disk_Sand_{fixed}of{bad}.hfe" writes
+                    Disk_Sand_3of4.hfe - so a directory of repaired
+                    images says how much of each one came back
 
 damage options:
   --bits a,b,c      message bit indices to flip
