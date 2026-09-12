@@ -467,6 +467,35 @@ const uint8_t *dr_fs_mirror(dr_fs *fs, const dr_fs_loc *loc);
 int         dr_fs_detail(dr_fs *fs, const dr_fs_loc *loc,
                          char *buf, int n);
 
+/* A copy of the same file from somewhere else entirely - another disk,
+ * an archive, a download. It will not be laid out identically: builds
+ * differ, and even the same file can sit at a different offset. So the
+ * sector's known-good neighbours are used as an anchor: find where they
+ * occur in the candidate, and require a long run of agreement on both
+ * sides before believing the bytes in between. The sector's own CRC
+ * then says whether it is right.
+ *
+ * Returns 1 when the sector's stored CRC confirms the bytes, 0 when an
+ * alignment was found but the CRC does not agree, -1 when the candidate
+ * does not line up at all. */
+int         dr_fs_from_file(dr_fs *fs, const dr_fs_loc *loc,
+                            const char *path, uint8_t *out, int len,
+                            char *how, int howsz);
+
+/* Per-file damage report: which of the disk's files a bad sector
+ * touched, and - where the format carries checksums of its own - how
+ * much of each one still comes out. The point of the exercise is not
+ * how many sectors read, it is which files the owner still has. */
+typedef struct {
+	char name[72];
+	long size;
+	int  bad;                /* sectors of it with a CRC error       */
+	int  parts, parts_ok;    /* archive members that still verify    */
+	char note[160];
+} dr_fs_file;
+
+int         dr_fs_files(dr_fs *fs, dr_fs_file *out, int max);
+
 int         dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc,
                          uint8_t *out, int len, char *how, int howsz);
 

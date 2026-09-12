@@ -20,10 +20,30 @@ failure was misleading.
 | Sand     | 2916 | 4 | 4 | **3** | sector 10 on tracks 24-27, inside two ZIP archives - and the same entries are archived *twice on the same disk*, so three of them are recovered exactly and proved by the archive's CRC-32 |
 | Ron      | 2944 | 22 | **0** | - | every one is on track 80, past the last formatted track: unformatted noise decoded as 16 KB FM sectors. **Not a damaged disk at all** |
 | Scott    | 2881 | 1 | 1 | **1** | a menu string table inside a Word temp file; the repair turns `Move( fro?t )` into `Move( front )` and `Gut Info` into `Get Info` |
-| **total** | **20740** | **43** | **14** | **8** | |
+| SLAT     | 2916 | 11 | 11 | 0 | every one inside `TRAVEL~1.ZIP`, a Palm "TravelPal" package, including its central directory. 6 of its 9 members still extract; `TESTPL~1.XLS` is intact |
+| SLAW     | 2880 | 2 | **0** | - | both in **free space**; all 8 documents intact |
+| Teres    | 2880 | 4 | 3 | 0 | one in free space; three in Quicken's `QDATA.QDB`/`.QSD`/`.QEL`, which carry no checksum and have no second copy. The other 7 files are intact |
+| DisComp  | 2881 | 0 | - | - | **a Macintosh HFS disk** (volume "Gradebook"), not a PC disk - which is why nothing could read it as one. No CRC errors at all |
+| **total** | **29417** | **60** | **28** | **8** | |
 
-Three of the eight disks - Disk 1, GasAcc and Ron - lost nothing at all.
-That is not visible from the CRC; it is visible from the filesystem.
+Six of the twelve disks - Disk 1, GasAcc, Scott, Ron, SLAW and DisComp
+- lost nothing at all. That is not visible from the CRC; it is visible
+from the filesystem.
+
+And the count above still flatters the damage. `scan --fs` now surveys
+each file rather than each sector, because a bad sector inside an
+archive does not cost you the archive:
+
+```
+the files on this disk
+  TESTPL~1.XLS      53760 byte(s)  no bad sector - intact
+  TRAVEL~1.ZIP      87514 byte(s)  damaged - 6 of 9 archive member(s) still extract
+```
+
+Eleven bad sectors on SLAT, and two thirds of what is in them comes out
+anyway - because a ZIP's members are checked one at a time, by their own
+local headers, rather than through a central directory that a mark near
+the outside of the disk has already eaten.
 
 ## Where the recovered bytes came from
 
@@ -126,8 +146,8 @@ Ranked by how often they turned up, not by how interesting they are:
    target that was never on the disk. Measured on these disks, this is
    not an edge case: it is what happens whenever the mark runs off the
    end, which is most of the time.
-6. **Nothing at all** - 29 of the 43 bad sectors here hold no file's
-   data. Three disks of the eight were whole the whole time.
+6. **Nothing at all** - 32 of the 60 bad sectors here hold no file's
+   data. Six disks of the twelve were whole the whole time.
 
 ## The CRC can be wrong without the flux noticing
 

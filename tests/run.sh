@@ -505,6 +505,62 @@ PYEOF
 	check "the storage above it is named too" \
 	      "$st" "DUALSTORAGE/SummaryInformation"
 
+	echo "== a copy of the same file from somewhere else"
+	# The workflow when a file also exists off the disk: anchor on the
+	# damaged sector's known-good neighbours, and apply only if the
+	# bytes reproduce the sector's own CRC.
+	cp "$out/a.zip" "$out/pristine.zip"
+	fr=$("$dr" repair "$out/fs_bad.hfe" --from-file "$out/pristine.zip" \
+	     2>/dev/null | sed -n 's/.*\(lines up at offset\).*/lines up/p')
+	check "the outside copy lines up" "$fr" "lines up"
+	pr=$("$dr" repair "$out/fs_bad.hfe" --from-file "$out/pristine.zip" \
+	     2>/dev/null | sed -n 's/.*\(proven, not ranked\).*/proven/p')
+	check "and its bytes reproduce the stored CRC" "$pr" "proven"
+	"$dr" repair "$out/fs_bad.hfe" --from-file "$out/pristine.zip" \
+	      --out "$out/ff.img" --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/fs_ref.img" "$out/ff.img"; then
+		ok "recovered exactly from the outside copy"
+	else
+		bad "recovered exactly from the outside copy"
+	fi
+	# a different file must be refused, not forced into place
+	python3 -c "
+import sys
+d = bytearray(open(sys.argv[1],'rb').read())
+for i in range(0, len(d), 3):
+    d[i] ^= 0x5A
+open(sys.argv[2],'wb').write(bytes(d))
+" "$out/a.zip" "$out/wrong.zip"
+	wr=$("$dr" repair "$out/fs_bad.hfe" --from-file "$out/wrong.zip" \
+	     2>/dev/null | sed -n 's/.*\(does not line up here\).*/refused/p')
+	check "a different file is refused" "$wr" "refused"
+
+	echo "== what the owner still has"
+	sv=$("$dr" scan "$out/fs_bad.hfe" --fs 2>/dev/null |
+	     sed -n 's/.*\([0-9][0-9]*\) of \([0-9][0-9]*\) archive member.*/\1 of \2/p')
+	check "the archive is surveyed member by member" "$sv" "0 of 1"
+	iv=$("$dr" scan "$out/fs.hfe" --fs 2>/dev/null |
+	     sed -n 's/.*\([0-9][0-9]*\) of \([0-9][0-9]*\) archive member.*/\1 of \2/p')
+	check "...and an undamaged one comes out whole" "$iv" "1 of 1"
+
+	echo "== a Macintosh disk is not a PC disk"
+	python3 "$here/tools/mkhfs.py" "$out/hfs.img" 100
+	"$dr" convert "$out/hfs.img" --out "$out/hfs.hfe" >/dev/null 2>&1
+	vol=$("$dr" scan "$out/hfs.hfe" --fs 2>/dev/null |
+	      sed -n "s/.*volume '\([^']*\)'.*/\1/p")
+	check "the HFS volume is recognised and named" "$vol" "TESTVOL"
+	# allocation block 50 is in use, block 500 is not
+	"$dr" damage "$out/hfs.hfe" --track 3 --side 0 --id 1 --drop-only \
+	      --bits 803,1701 --out "$out/hfs_u.hfe" >/dev/null 2>&1
+	u=$("$dr" scan "$out/hfs_u.hfe" --fs 2>/dev/null |
+	    sed -n 's/.*\(allocated to some file\).*/used/p')
+	check "a bad sector in a used block says so" "$u" "used"
+	"$dr" damage "$out/hfs.hfe" --track 28 --side 0 --id 1 --drop-only \
+	      --bits 803,1701 --out "$out/hfs_f.hfe" >/dev/null 2>&1
+	fr=$("$dr" scan "$out/hfs_f.hfe" --fs 2>/dev/null |
+	     sed -n 's/.*\(nothing is stored here\).*/free/p')
+	check "a bad sector in a free block loses nothing" "$fr" "free"
+
 	echo "== one image per reading, to be looked at"
 	"$dr" repair "$out/fs_bad.hfe" --variants 3 --out "$out/v.hfe" \
 	      >/dev/null 2>&1

@@ -85,6 +85,11 @@ static const char *usage_text =
 "                    archive entry stored twice - and re-stamp the CRC.\n"
 "                    Not a ranking: the archive's CRC-32 confirms it.\n"
 "                    (--from-mirror is the same switch.)\n"
+"  --from-file F     a copy of the same file from somewhere else -\n"
+"                    another disk, an archive, a download. Its bytes\n"
+"                    are anchored on the damaged sector's known-good\n"
+"                    neighbours, and applied only if they reproduce\n"
+"                    the sector's stored CRC.\n"
 "  --variants N      write one image per reading: FILE_a1.hfe,\n"
 "                    FILE_a2.hfe ... Open them in a disk browser and\n"
 "                    see which one's files still make sense.\n"
@@ -126,6 +131,7 @@ typedef struct {
 	int    fs;
 	int    variants;
 	int    frommirror;
+	const char *fromfile;
 	char *const *sets;
 	int    nsets;
 	dr_options opt;
@@ -188,6 +194,8 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--from-mirror") ||
 		         !strcmp(o, "--from-copy")) a->frommirror = 1;
 		else if (!strcmp(o, "--variants")) a->variants = atoi(NEXT());
+		else if (!strcmp(o, "--from-file")) { a->fromfile = NEXT();
+		                                     a->frommirror = 1; }
 		else if (!strcmp(o, "--out"))      a->out = NEXT();
 		else if (!strcmp(o, "--format"))   a->format = NEXT();
 		else if (!strcmp(o, "--bits"))     a->bits = NEXT();
@@ -1469,17 +1477,28 @@ int main(int argc, char **argv)
 				       "disk.\n");
 			} else {
 				const dr_fs_info *in = dr_fs_stat(fs);
-				printf("\nfilesystem: %s, %d sector(s)/track, "
-				       "%d head(s), %d FAT(s) of %d sector(s), "
-				       "%d file(s)\n", in->kind, in->spt,
-				       in->heads, in->nfats, in->fat_sectors,
-				       in->nfiles);
-				if (in->nfats > 1)
+
+				if (in->nfats) {
+					printf("\nfilesystem: %s, %d "
+					       "sector(s)/track, %d head(s), "
+					       "%d FAT(s) of %d sector(s), "
+					       "%d file(s)\n", in->kind,
+					       in->spt, in->heads, in->nfats,
+					       in->fat_sectors, in->nfiles);
 					printf("            the two FATs differ "
 					       "in %ld byte(s)%s\n",
 					       in->fat_mismatch,
 					       in->fat_mismatch ? "" :
 					       " - they agree exactly");
+				} else {
+					printf("\nfilesystem: %s (Macintosh), "
+					       "volume '%s', %d file(s) and "
+					       "folder(s),\n            %d "
+					       "allocation block(s) of %d "
+					       "byte(s)\n",
+					       in->kind, in->oem, in->nfiles,
+					       in->clusters, in->spc * 512);
+				}
 				sl = dr_sectors(c, &n);
 				for (i = 0; i < n; i++) {
 					dr_fs_loc loc;
@@ -1529,6 +1548,23 @@ int main(int argc, char **argv)
 					       sl[i].track, sl[i].side,
 					       sl[i].sector_id,
 					       area_name(loc.area), loc.note);
+				}
+				{
+					dr_fs_file ff[64];
+					int nf = dr_fs_files(fs, ff, 64), k;
+
+					if (nf)
+						printf("\nthe files on this "
+						       "disk\n");
+					for (k = 0; k < nf; k++)
+						printf("  %-14s %8ld byte(s)"
+						       "  %s%s%s\n",
+						       ff[k].name, ff[k].size,
+						       ff[k].bad
+						         ? "damaged"
+						         : "no bad sector",
+						       ff[k].note[0] ? " - " : "",
+						       ff[k].note);
 				}
 				if (shown) {
 					/* The number that matters is not how
@@ -1757,6 +1793,34 @@ int main(int argc, char **argv)
 				int proven = 0, ndiff = 0;
 
 				m = mirror_for(c, v, idx, &loc, &proven, &ndiff);
+				if (!m && a.fromfile && fs_of(c) &&
+				    dr_fs_locate(fs_of(c), c, idx, &loc) == 0 &&
+				    v->data_len == (int)sizeof(sis) &&
+				    dr_fs_from_file(fs_of(c), &loc, a.fromfile,
+				                    sis, v->data_len, how,
+				                    (int)sizeof(how)) == 0) {
+					uint8_t *msg = malloc((size_t)v->msg_len);
+
+					printf("\nfrom file  : %s\n", how);
+					if (msg) {
+						uint16_t k;
+						memcpy(msg, v->msg,
+						       (size_t)v->msg_len);
+						memcpy(msg + v->data_offset,
+						       sis, (size_t)v->data_len);
+						k = dr_crc16(msg, v->msg_len - 2);
+						free(msg);
+						proven = (k == v->stored_crc);
+					}
+					printf("             its bytes %s this "
+					       "sector's stored CRC\n",
+					       proven ? "reproduce"
+					              : "do NOT reproduce");
+					if (proven)
+						m = sis;
+				} else if (!m && a.fromfile) {
+					printf("\nfrom file  : %s\n", how);
+				}
 				if (!m && fs_of(c) &&
 				    dr_fs_locate(fs_of(c), c, idx, &loc) == 0 &&
 				    v->data_len == (int)sizeof(sis)) {

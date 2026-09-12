@@ -44,6 +44,13 @@ struct dr_fs {
 	int      *owner;        /* LBA -> sector index in the scan       */
 	long      nlba;
 
+	/* Macintosh HFS, when that is what this is. */
+	int   hfs;
+	long  hfs_albst;         /* first allocation block, in sectors   */
+	long  hfs_alblksiz;      /* allocation block size, in bytes      */
+	long  hfs_nalblks;
+	long  hfs_vbmst;
+
 	/* Root directory, flattened. */
 	struct dr_fs_file {
 		char  name[72];
@@ -251,6 +258,121 @@ static void count_fat_mismatch(dr_fs *fs)
 			fs->info.fat_mismatch++;
 }
 
+
+/* ---------------------------------------------------------------- */
+/* Macintosh HFS                                                     */
+/* ---------------------------------------------------------------- */
+/*
+ * Not every floppy in a box of floppies is a PC floppy. An HFS volume
+ * has no FAT and no 8.3 directory, so the FAT reader says "no
+ * filesystem" and the whole account above the sector goes quiet - on a
+ * disk that may be perfectly readable.
+ *
+ * The catalogue is a B-tree and naming the file a sector belongs to
+ * would mean walking it. The volume bitmap is one flat run of bits and
+ * answers the question that matters most: is anything allocated here at
+ * all? On these disks that single bit has settled more bad sectors than
+ * any search.
+ */
+static int be16(const uint8_t *p) { return (p[0] << 8) | p[1]; }
+static long be32(const uint8_t *p)
+{
+	return ((long)p[0] << 24) | ((long)p[1] << 16) |
+	       ((long)p[2] << 8) | p[3];
+}
+
+static int hfs_open(dr_ctx *c, dr_fs *fs)
+{
+	uint8_t mdb[SECSZ];
+	dr_fs_info *in = &fs->info;
+	long need;
+	int i;
+
+	/* The master directory block is the third sector of the volume. */
+	if (read_one(c, 0, 0, 3, mdb) != 0)
+		return -1;
+	if (be16(mdb) != 0x4244)
+		return -1;
+
+	fs->hfs = 1;
+	fs->hfs_vbmst    = be16(mdb + 0x0E);
+	fs->hfs_nalblks  = be16(mdb + 0x12);
+	fs->hfs_alblksiz = be32(mdb + 0x14);
+	fs->hfs_albst    = be16(mdb + 0x1C);
+	if (fs->hfs_alblksiz < SECSZ || (fs->hfs_alblksiz % SECSZ) ||
+	    fs->hfs_nalblks < 1)
+		return -1;
+
+	snprintf(in->kind, sizeof(in->kind), "HFS");
+	{
+		int n = mdb[0x24];
+		if (n > 27)
+			n = 27;
+		for (i = 0; i < n && i < (int)sizeof(in->oem) - 1; i++)
+			in->oem[i] = (char)mdb[0x25 + i];
+		in->oem[i] = 0;
+	}
+	in->bps   = SECSZ;
+	in->spc   = (int)(fs->hfs_alblksiz / SECSZ);
+	in->nfats = 0;
+	in->nfiles = (int)be32(mdb + 0x54) + (int)be32(mdb + 0x58);
+	in->total_sectors = fs->hfs_albst +
+	                    fs->hfs_nalblks * (fs->hfs_alblksiz / SECSZ);
+	in->data_lba = fs->hfs_albst;
+	in->root_lba = fs->hfs_vbmst;
+	in->clusters = (int)fs->hfs_nalblks;
+	/* HFS records no geometry: it is addressed by logical block, and
+	 * the drive is expected to know the rest. Take it from what the
+	 * scan actually found rather than assuming a 1.44 MB disk. */
+	{
+		int n = 0, k;
+		const dr_sector *sl = dr_sectors(c, &n);
+
+		in->spt = 0;
+		in->heads = 1;
+		for (k = 0; k < n; k++) {
+			if (sl[k].sector_size != SECSZ)
+				continue;
+			if (sl[k].sector_id > in->spt)
+				in->spt = sl[k].sector_id;
+			if (sl[k].side + 1 > in->heads)
+				in->heads = sl[k].side + 1;
+		}
+		if (in->spt < 1 || in->spt > 64)
+			return -1;
+	}
+
+	need = in->total_sectors;
+	if (need > MAX_LBA)
+		need = MAX_LBA;
+	fs->nlba  = need;
+	fs->img   = calloc((size_t)need, SECSZ);
+	fs->have  = calloc((size_t)need, 1);
+	fs->owner = malloc(sizeof(int) * (size_t)need);
+	if (!fs->img || !fs->have || !fs->owner)
+		return -1;
+	for (i = 0; i < need; i++)
+		fs->owner[i] = -1;
+	collect(c, fs, in->spt, in->heads);
+	in->present = 1;
+	return 0;
+}
+
+/* Is this allocation block spoken for? */
+static int hfs_allocated(const dr_fs *fs, long lba)
+{
+	long blk = (lba - fs->hfs_albst) / (fs->hfs_alblksiz / SECSZ);
+	long bit = fs->hfs_vbmst * SECSZ * 8 + blk;
+	long off = fs->hfs_vbmst * SECSZ + blk / 8;
+
+	if (blk < 0 || blk >= fs->hfs_nalblks)
+		return -1;
+	(void)bit;
+	if (off < 0 || off >= fs->nlba * SECSZ)
+		return -1;
+	return (fs->img[off] >> (7 - (blk & 7))) & 1;
+}
+
 dr_fs *dr_fs_open(dr_ctx *c)
 {
 	dr_fs *fs;
@@ -286,7 +408,10 @@ dr_fs *dr_fs_open(dr_ctx *c)
 	    in->root_entries < 16 || in->root_entries > 2048 ||
 	    in->spt < 1 || in->spt > 64 || in->heads < 1 || in->heads > 2 ||
 	    in->total_sectors < 16) {
-		free(fs);
+		memset(in, 0, sizeof(*in));
+		if (hfs_open(c, fs) == 0)
+			return fs;
+		dr_fs_free(fs);
 		return NULL;
 	}
 
@@ -385,6 +510,42 @@ int dr_fs_locate(dr_fs *fs, dr_ctx *c, int sector_index, dr_fs_loc *out)
 	if (lba < 0 || lba >= fs->nlba)
 		return -1;
 	out->lba = lba;
+
+	if (fs->hfs) {
+		int used;
+
+		if (lba < 3) {
+			out->area = DR_AREA_BOOT;
+			snprintf(out->note, sizeof(out->note),
+			         "HFS boot blocks / master directory block");
+			return 0;
+		}
+		if (lba < fs->hfs_albst) {
+			out->area = DR_AREA_ROOT;
+			snprintf(out->note, sizeof(out->note),
+			         "HFS volume bitmap");
+			return 0;
+		}
+		used = hfs_allocated(fs, lba);
+		if (used == 0) {
+			out->area = DR_AREA_FREE;
+			snprintf(out->note, sizeof(out->note),
+			         "allocation block %ld - the volume bitmap says "
+			         "nothing is stored here, so nothing was lost",
+			         (lba - fs->hfs_albst) /
+			         (fs->hfs_alblksiz / SECSZ));
+		} else {
+			out->area = DR_AREA_FILE;
+			out->cluster = (int)((lba - fs->hfs_albst) /
+			                     (fs->hfs_alblksiz / SECSZ));
+			snprintf(out->note, sizeof(out->note),
+			         "allocation block %d - allocated to some "
+			         "file; HFS catalogue lookup is not "
+			         "implemented, so which one is not known",
+			         out->cluster);
+		}
+		return 0;
+	}
 
 	if (lba >= in->total_sectors) {
 		out->area = DR_AREA_OUTSIDE;
@@ -1620,6 +1781,61 @@ int dr_fs_detail(dr_fs *fs, const dr_fs_loc *loc, char *buf, int n)
 			goto done;
 
 		c = cfb_open(file, flen);
+		if (!c) {
+			/*
+			 * Not a container we can walk into. Then the useful
+			 * thing to say is which file this *is*, precisely
+			 * enough to go and find another copy: a version
+			 * number and a copyright line pin a Windows driver
+			 * down to one build, and a copy of the wrong build
+			 * is no use at all.
+			 */
+			char ver[40], cop[72];
+			long i;
+
+			ver[0] = cop[0] = 0;
+			for (i = 0; i + 8 < flen && !(ver[0] && cop[0]); i++) {
+				if (!ver[0] && file[i] >= '0' && file[i] <= '9') {
+					int k = 0, dots = 0, digits = 0;
+					while (k < 20 && i + k < flen &&
+					       ((file[i+k] >= '0' && file[i+k] <= '9') ||
+					        file[i+k] == '.')) {
+						if (file[i+k] == '.')
+							dots++;
+						else
+							digits++;
+						k++;
+					}
+					if (dots == 2 && digits >= 5 &&
+					    (i == 0 || file[i-1] < '0' ||
+					     file[i-1] > '9')) {
+						memcpy(ver, file + i, (size_t)k);
+						ver[k] = 0;
+					}
+				}
+				if (!cop[0] && file[i] == 'C' &&
+				    i + 9 < flen &&
+				    !memcmp(file + i, "Copyright", 9)) {
+					int k = 0;
+					while (k < 70 && i + k < flen &&
+					       file[i+k] >= 0x20 && file[i+k] < 0x7F)
+						k++;
+					if (k >= 20) {
+						memcpy(cop, file + i, (size_t)k);
+						cop[k] = 0;
+					}
+				}
+			}
+			if (ver[0] || cop[0]) {
+				snprintf(buf, (size_t)n,
+				         "'%s' is %ld bytes%s%s%s%s - find that "
+				         "exact build and --from-file will use it",
+				         loc->file, loc->file_size,
+				         ver[0] ? ", version " : "", ver,
+				         cop[0] ? ", " : "", cop);
+				rc = 0;
+			}
+		}
 		if (c) {
 			long soff = -1;
 			int owner = cfb_owner(c, loc->file_offset, &soff);
@@ -1642,4 +1858,241 @@ done:
 #endif
 	free(file);
 	return rc;
+}
+
+/* ---------------------------------------------------------------- */
+/* A copy of the file from somewhere else                            */
+/* ---------------------------------------------------------------- */
+
+static const uint8_t *find_bytes(const uint8_t *hay, long hlen,
+                                 const uint8_t *ned, long nlen, long from)
+{
+	long i;
+
+	if (nlen <= 0 || hlen < nlen)
+		return NULL;
+	for (i = from; i + nlen <= hlen; i++)
+		if (hay[i] == ned[0] && !memcmp(hay + i, ned, (size_t)nlen))
+			return hay + i;
+	return NULL;
+}
+
+#define ANCHOR 48
+#define NEED   256
+
+int dr_fs_from_file(dr_fs *fs, const dr_fs_loc *loc, const char *path,
+                    uint8_t *out, int len, char *how, int howsz)
+{
+	uint8_t *mine = NULL, *cand = NULL;
+	FILE *f;
+	long mlen = 0, clen = 0, at;
+	int rc = -1;
+	long best_back = 0, best_fwd = 0, best_at = -1;
+
+	if (!fs || !loc || !path || !out || loc->area != DR_AREA_FILE)
+		return -1;
+	f = fopen(path, "rb");
+	if (!f) {
+		snprintf(how, (size_t)howsz, "cannot open %s", path);
+		return -1;
+	}
+	fseek(f, 0, SEEK_END);
+	clen = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (clen <= 0 || clen > 64L * 1024 * 1024) {
+		fclose(f);
+		return -1;
+	}
+	cand = malloc((size_t)clen);
+	if (!cand || fread(cand, 1, (size_t)clen, f) != (size_t)clen) {
+		fclose(f);
+		free(cand);
+		return -1;
+	}
+	fclose(f);
+
+	mine = assemble(fs, loc, NULL, 0, &mlen);
+	if (!mine)
+		goto out;
+	at = loc->file_offset;
+	if (at < ANCHOR || at + len > mlen)
+		goto out;
+
+	/*
+	 * Anchor on the bytes immediately before the damage. They came
+	 * from a different sector, one whose CRC passed, so they are
+	 * known good - and finding them in the candidate says where in it
+	 * this part of the file ended up.
+	 */
+	{
+		const uint8_t *p = cand;
+		long from = 0;
+
+		while ((p = find_bytes(cand, clen, mine + at - ANCHOR,
+		                       ANCHOR, from)) != NULL) {
+			long pos = (p - cand) + ANCHOR;
+			long back = 0, fwd = 0;
+
+			while (back < 65536 && at - 1 - back >= 0 &&
+			       pos - 1 - back >= 0 &&
+			       mine[at - 1 - back] == cand[pos - 1 - back])
+				back++;
+			while (fwd < 65536 && at + len + fwd < mlen &&
+			       pos + len + fwd < clen &&
+			       mine[at + len + fwd] == cand[pos + len + fwd])
+				fwd++;
+			if (back + fwd > best_back + best_fwd) {
+				best_back = back;
+				best_fwd = fwd;
+				best_at = pos;
+			}
+			from = (p - cand) + 1;
+		}
+	}
+
+	if (best_at < 0 || best_back < NEED || best_fwd < NEED) {
+		snprintf(how, (size_t)howsz,
+		         "%s does not line up here - the best match agrees for "
+		         "only %ld byte(s) before and %ld after, so it is a "
+		         "different build or a different file",
+		         path, best_back, best_fwd);
+		rc = -1;
+		goto out;
+	}
+	if (best_at + len > clen)
+		goto out;
+
+	memcpy(out, cand + best_at, (size_t)len);
+	snprintf(how, (size_t)howsz,
+	         "%s lines up at offset %ld and agrees for %ld byte(s) before "
+	         "the damage and %ld after", path, best_at, best_back, best_fwd);
+	rc = 0;
+out:
+	free(mine);
+	free(cand);
+	return rc;
+}
+
+/* ---------------------------------------------------------------- */
+/* What the owner still has                                          */
+/* ---------------------------------------------------------------- */
+
+#ifndef DR_NO_ZLIB
+/* Count the archive members that still come out.
+ *
+ * Deliberately not by way of the central directory: the directory is
+ * the last thing in the file, so a mark near the outside of the disk
+ * takes it out and a reader that depends on it reports an empty
+ * archive. Every local header carries its own name, sizes and CRC-32,
+ * so they can be found by their signature and checked one at a time -
+ * which is how a damaged archive still gives up most of its contents.
+ */
+static void zip_survey(const uint8_t *b, long len, int *parts, int *ok)
+{
+	long i;
+
+	*parts = *ok = 0;
+	for (i = 0; i + 30 <= len; i++) {
+		long csz, usz, body;
+		unsigned long crc;
+		int nl, el, meth, good = 0;
+
+		if (!(b[i] == 'P' && b[i+1] == 'K' &&
+		      b[i+2] == 3 && b[i+3] == 4))
+			continue;
+		meth = u16le(b + i + 8);
+		crc  = (unsigned long)b[i+14] | ((unsigned long)b[i+15] << 8) |
+		       ((unsigned long)b[i+16] << 16) |
+		       ((unsigned long)b[i+17] << 24);
+		csz  = (long)b[i+18] | ((long)b[i+19] << 8) |
+		       ((long)b[i+20] << 16) | ((long)b[i+21] << 24);
+		usz  = (long)b[i+22] | ((long)b[i+23] << 8) |
+		       ((long)b[i+24] << 16) | ((long)b[i+25] << 24);
+		nl   = u16le(b + i + 26);
+		el   = u16le(b + i + 28);
+		if ((meth != 0 && meth != 8) || nl < 1 || nl > 255 ||
+		    el > 4096 || csz < 1)
+			continue;
+		body = i + 30 + nl + el;
+		if (body + csz > len)
+			continue;
+		if (meth == 0) {
+			unsigned long c = crc32(0L, Z_NULL, 0);
+			c = crc32(c, b + body, (uInt)csz);
+			good = (csz == usz && c == crc);
+		} else {
+			good = (inflate_check(b + body, csz, crc, usz) == 1);
+		}
+		/* A signature inside compressed data is not an entry: take
+		 * it only if it checks out, or if its body ends exactly
+		 * where the next one begins. */
+		if (!good && !(body + csz + 4 <= len &&
+		               b[body+csz] == 'P' && b[body+csz+1] == 'K'))
+			continue;
+		(*parts)++;
+		*ok += good;
+		i = body + csz - 1;
+	}
+}
+#endif
+
+int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
+{
+	const dr_fs_info *in;
+	int f, n = 0, *cl;
+
+	if (!fs || !out)
+		return 0;
+	in = &fs->info;
+	cl = malloc(sizeof(int) * (size_t)(in->clusters + 2));
+	if (!cl)
+		return 0;
+
+	for (f = 0; f < fs->nfiles && n < max; f++) {
+		dr_fs_file *o = &out[n];
+		int nc = chain(fs, fs->files[f].start, cl, in->clusters + 2);
+		int k, bad = 0;
+
+		memset(o, 0, sizeof(*o));
+		snprintf(o->name, sizeof(o->name), "%s", fs->files[f].name);
+		o->size = fs->files[f].size;
+		for (k = 0; k < nc; k++) {
+			int j;
+			for (j = 0; j < in->spc; j++) {
+				long lba = in->data_lba +
+				           (long)(cl[k] - 2) * in->spc + j;
+				if (lba >= 0 && lba < fs->nlba &&
+				    fs->have[lba] == 2)
+					bad++;
+			}
+		}
+		o->bad = bad;
+#ifndef DR_NO_ZLIB
+		{
+			dr_fs_loc l;
+			long flen = 0;
+			uint8_t *b;
+
+			memset(&l, 0, sizeof(l));
+			snprintf(l.file, sizeof(l.file), "%s", o->name);
+			l.file_offset = -1;
+			b = assemble(fs, &l, NULL, 0, &flen);
+			if (b) {
+				if (flen > 30 && b[0] == 'P' && b[1] == 'K')
+					zip_survey(b, flen, &o->parts,
+					           &o->parts_ok);
+				free(b);
+			}
+		}
+#endif
+		if (o->parts)
+			snprintf(o->note, sizeof(o->note),
+			         "%d of %d archive member(s) still extract",
+			         o->parts_ok, o->parts);
+		else if (!bad)
+			snprintf(o->note, sizeof(o->note), "intact");
+		n++;
+	}
+	free(cl);
+	return n;
 }

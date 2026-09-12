@@ -460,6 +460,56 @@ The tool names which of the two copies was hit, because that is the
 difference between a lost presentation and a lost compatibility copy.
 On Zeus it is the compatibility copy: the deck itself opens fine.
 
+**And what the owner still has is not the same question as how many
+sectors read.** `scan --fs` surveys the disk file by file, and for an
+archive it checks each member separately - by its own local header,
+never through the central directory, because the directory is the last
+thing in the file and a mark near the outside of the disk eats it:
+
+```
+the files on this disk
+  TESTPL~1.XLS      53760 byte(s)  no bad sector - intact
+  TRAVEL~1.ZIP      87514 byte(s)  damaged - 6 of 9 archive member(s) still extract
+```
+
+Eleven bad sectors on that disk, all of them in the one archive, and two
+thirds of it comes out anyway. A reader that trusted the central
+directory would have reported the whole thing as empty.
+
+**A copy from elsewhere.** `--from-file COPY` takes the same file from
+another disk, an archive, a download. It will not be laid out the same
+way, so the damaged sector's known-good neighbours are the anchor: find
+where they occur in the candidate, demand a long run of agreement on
+both sides, and then let the sector's own CRC say whether the bytes
+between them are right. A copy that does not line up is refused rather
+than forced:
+
+```
+IFSMGR.VXD does not line up here - the best match agrees for only 0 byte(s)
+before and 0 after, so it is a different build or a different file
+```
+
+To make that less of a lottery, `--fs` says which build to go and find:
+
+```
+'IFSMGR.VXD' is 185910 bytes, version 4.90.3000,
+Copyright (C) Microsoft Corp. 1988-2000 - find that exact build and
+--from-file will use it
+```
+
+**And not every floppy is a PC floppy.** A Macintosh HFS volume has no
+FAT and no 8.3 directory, so the FAT reader saw nothing and the whole
+account above the sector went quiet - on a disk that turned out to have
+no errors at all. HFS's catalogue is a B-tree and is not walked, but its
+volume bitmap is one flat run of bits and answers the question that has
+settled more bad sectors here than any search: is anything stored in
+this block at all?
+
+```
+filesystem: HFS (Macintosh), volume 'Gradebook', 2 file(s) and folder(s),
+            2874 allocation block(s) of 512 byte(s)
+```
+
 ### 4e. Five images, and letting a person look
 
 When several readings survive, `--variants 5 --out disk.hfe` writes
@@ -675,13 +725,13 @@ two are.
 They did pay for themselves, though - see the note on the block fit
 below, which they are the reason for.
 
-Totals, now over eight disks: 43 bad sectors, of which **29 hold no
+Totals, now over twelve disks: 60 bad sectors, of which **32 hold no
 file's data at all** - free space, or, on one whole disk, unformatted
-noise past the last track. Of the 14 that do carry a file, **8 are
+noise past the last track. Of the 28 that do carry a file, **8 are
 recovered**: four by the search, and four exactly, from a second copy of
 the same bytes - three from the same archive stored twice on the disk,
-one from the same stream stored twice inside one document. Three of the eight disks
-lost nothing whatsoever. The running tally, and what each disk turned
+one from the same stream stored twice inside one document. Six of the
+twelve disks lost nothing whatsoever. The running tally, and what each disk turned
 out to be suffering from, is in [docs/disks.md](docs/disks.md).
 
 That number went *down* as the tool got better, and the reason is the
@@ -1101,8 +1151,10 @@ src/dr_repair.c   the GF(2) CRC bit-flip search and the patcher
 src/dr_rebin.c    the flux re-binning list decoder
 src/dr_revs.c     aligning and combining the dump's own revolutions
 src/dr_pattern.c  the data model: regularity, and the disk-wide byte model
-src/dr_fs.c       the filesystem above the sector: what each one is, the
-                  other copy of a FAT, and the file's own checksum
+src/dr_fs.c       the filesystem above the sector: FAT12/16 and HFS,
+                  what each bad sector is, the other copy of a FAT, a
+                  ZIP's own CRC-32, a compound document's twin streams,
+                  and what each file on the disk still amounts to
 src/dr_crc.c      CRC-16/CCITT and its per-bit linear masks
 src/dr_json.c     JSON for the CLI and the viewer
 src/dr_http.c     the built-in HTTP server
