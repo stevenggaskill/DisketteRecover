@@ -1240,8 +1240,19 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 
 		how[0] = 0;
 		m = mirror_for(c, v, idx, &loc, &proven, &ndiff);
-		if (!proven)
+		/*
+		 * The other FAT's bytes are taken when this sector's own
+		 * checksum confirms them - or when that checksum is itself
+		 * inside the damage, because then it confirms nothing and
+		 * the second copy is the only evidence there is. A FAT that
+		 * disagrees with its twin is a broken filesystem either
+		 * way; a FAT restored from a clean twin is at worst as old
+		 * as the twin.
+		 */
+		if (!proven && !(m && v->crc_suspect))
 			m = NULL;
+		else if (!proven && m)
+			proven = 3;
 		if (!m && fs && dr_fs_locate(fs, c, idx, &loc) == 0 &&
 		    v->data_len == (int)sizeof(sis) &&
 		    dr_fs_sister(fs, &loc, sis, v->data_len, how,
@@ -1257,9 +1268,12 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply)
 			printf(" %3d/%d s%-3d  %-8s  ",
 			       sl[idx].track, sl[idx].side, sl[idx].sector_id,
 			       "2nd copy");
-			printf("%s  -> APPLIED, proven not ranked\n",
+			printf("%s  -> APPLIED, %s\n",
 			       proven == 2 ? how
-			                   : "the other copy of this FAT");
+			                   : "the other copy of this FAT",
+			       proven == 3
+			         ? "the stored CRC here is itself damaged"
+			         : "proven not ranked");
 			dr_repair_free(&r);
 			dr_view_free(v);
 			return 1;
@@ -1790,16 +1804,18 @@ int main(int argc, char **argv)
 				const uint8_t *m;
 				uint8_t sis[512];
 				char how[256];
-				int proven = 0, ndiff = 0;
+				int proven = 0, ndiff = 0, ff = -1;
 
 				m = mirror_for(c, v, idx, &loc, &proven, &ndiff);
 				if (!m && a.fromfile && fs_of(c) &&
 				    dr_fs_locate(fs_of(c), c, idx, &loc) == 0 &&
 				    v->data_len == (int)sizeof(sis) &&
-				    dr_fs_from_file(fs_of(c), &loc, a.fromfile,
-				                    sis, v->data_len, how,
-				                    (int)sizeof(how)) == 0) {
+				    (ff = dr_fs_from_file(fs_of(c), &loc,
+				                          a.fromfile, sis,
+				                          v->data_len, how,
+				                          (int)sizeof(how))) >= 0) {
 					uint8_t *msg = malloc((size_t)v->msg_len);
+					int crcok = 0;
 
 					printf("\nfrom file  : %s\n", how);
 					if (msg) {
@@ -1810,14 +1826,41 @@ int main(int argc, char **argv)
 						       sis, (size_t)v->data_len);
 						k = dr_crc16(msg, v->msg_len - 2);
 						free(msg);
-						proven = (k == v->stored_crc);
+						crcok = (k == v->stored_crc);
 					}
-					printf("             its bytes %s this "
-					       "sector's stored CRC\n",
-					       proven ? "reproduce"
-					              : "do NOT reproduce");
-					if (proven)
+					if (crcok) {
+						printf("             its bytes "
+						       "reproduce this sector's "
+						       "stored CRC - proven\n");
 						m = sis;
+						proven = 1;
+					} else if (ff == 1) {
+						/* The agreement either side is
+						 * worth more than sixteen bits
+						 * that did not survive. */
+						printf("             its bytes "
+						       "do NOT reproduce the "
+						       "stored CRC, but the two "
+						       "copies are\n"
+						       "             identical "
+						       "for thousands of bytes "
+						       "either side of this "
+						       "sector.\n"
+						       "             The stored "
+						       "CRC is the thing that "
+						       "died here; taking the "
+						       "file.\n");
+						m = sis;
+						proven = 1;
+					} else {
+						printf("             its bytes "
+						       "do NOT reproduce this "
+						       "sector's stored CRC, and "
+						       "the\n             "
+						       "agreement either side is "
+						       "too short to override "
+						       "it\n");
+					}
 				} else if (!m && a.fromfile) {
 					printf("\nfrom file  : %s\n", how);
 				}

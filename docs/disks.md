@@ -16,7 +16,7 @@ failure was misleading.
 | Disk 2   | 2882 | 9 | 5 | **2** | 3 in FAT copy 2 - all recovered from FAT copy 1, one of them *proved* by the sector's own stored CRC; 1 in free space; 5 in QuickBooks backups, of which 2 repaired and 3 still ambiguous |
 | GasAcc   | 2916 | 1 | **0** | - | band collapse plus a 4-cell phase slip, on filler, in **free space**; see [the one wrong answer](../README.md#the-one-wrong-answer-and-what-it-cost-to-find-it) |
 | Zeus     | 2881 | 2 | 2 | **1** | both inside `ZEUSNO~1.PPT`. One is in the preview thumbnail, which a PowerPoint 97 file stores **twice** - recovered exactly from the other copy. The other is in the PowerPoint 95 compatibility copy of the deck, over a stretch where the flux bands have collapsed |
-| LGTC0    | 2880 | 2 | 2 | **1** | sector 12 on tracks 9-10, inside `IFSMGR.VXD` |
+| LGTC0    | 2880 | 2 | 2 | **2** | sector 12 on tracks 9-10, inside `IFSMGR.VXD`. **Fully recovered** from a copy of the same Windows Me build supplied from outside: the repaired file is byte-identical to it across all 185,910 bytes |
 | Sand     | 2916 | 4 | 4 | **3** | sector 10 on tracks 24-27, inside two ZIP archives - and the same entries are archived *twice on the same disk*, so three of them are recovered exactly and proved by the archive's CRC-32 |
 | Ron      | 2944 | 22 | **0** | - | every one is on track 80, past the last formatted track: unformatted noise decoded as 16 KB FM sectors. **Not a damaged disk at all** |
 | Scott    | 2881 | 1 | 1 | **1** | a menu string table inside a Word temp file; the repair turns `Move( fro?t )` into `Move( front )` and `Gut Info` into `Get Info` |
@@ -24,10 +24,12 @@ failure was misleading.
 | SLAW     | 2880 | 2 | **0** | - | both in **free space**; all 8 documents intact |
 | Teres    | 2880 | 4 | 3 | 0 | one in free space; three in Quicken's `QDATA.QDB`/`.QSD`/`.QEL`, which carry no checksum and have no second copy. The other 7 files are intact |
 | DisComp  | 2881 | 0 | - | - | **a Macintosh HFS disk** (volume "Gradebook"), not a PC disk - which is why nothing could read it as one. No CRC errors at all |
-| **total** | **29417** | **60** | **20** | **9** | |
+| ALXPPT   | 2944 | 20 | 10 | 0 | one mark down sector 12, tracks 32-45. The damaged FAT sector was restored from its twin; 7 of the rest are in free space. The live filesystem is also confused independently of the damage - `RESUME.TXT`'s recorded start cluster is three clusters past where its text actually begins |
+| **total** | **32361** | **80** | **30** | **10** | |
 
-Six of the twelve disks - Disk 1, GasAcc, Scott, Ron, SLAW and DisComp
-- lost nothing at all. That is not visible from the CRC; it is visible
+Six of the thirteen disks - Disk 1, GasAcc, Scott, Ron, SLAW and
+DisComp - lost nothing at all, and LGTC0 joins them once the outside
+copy of its driver is applied. That is not visible from the CRC; it is visible
 from the filesystem.
 
 And the count above still flatters the damage. `scan --fs` now surveys
@@ -54,6 +56,7 @@ the outside of the disk has already eaten.
 | Sand | `24/1 s10` | `slsdtai5.rep`, archived twice on this disk | inflates, CRC-32 `6C6F80FC` |
 | Sand | `25/1 s10` | `faxcover.adt`, archived twice | inflates, CRC-32 `3C4E1290` |
 | Sand | `26/1 s10` | `faxcover.tpl`, archived twice | inflates, CRC-32 `C486A5AA` |
+| LGTC0 | `9/0 s12`, `10/0 s12` | the same build of the file, from outside the disk | anchored on the sector's clean neighbours: 65,536 bytes of agreement before and 17,958 / 61,494 after, and the repaired file then matches the known-good copy byte for byte |
 | Zeus | `9/0 s9` | the same stream, stored twice inside the same `.ppt` | the twin matches for 8581 bytes either side of the damage, and with its 512 in place the preview metafile's 727 records tile exactly |
 | SLAT | `RotatingGlobeAnimation.gif` | the archive stored the same animation twice, under two names | the stale copy of the archive's own central directory is the only thing that knows the second name; its packed bytes inflate to CRC-32 `E16CA998` |
 | Disk 2, LGTC0, Scott | 4 sectors | the search, applied on a clear margin | libhxcfe re-decode reads them clean |
@@ -147,10 +150,49 @@ Ranked by how often they turned up, not by how interesting they are:
    target that was never on the disk. Measured on these disks, this is
    not an edge case: it is what happens whenever the mark runs off the
    end, which is most of the time.
-6. **Nothing at all** - 40 of the 60 bad sectors here hold no file's
+6. **Nothing at all** - 50 of the 80 bad sectors here hold no file's
    data: free space, unformatted noise past the last track, or - on
    SLAT - parts of a file that the file itself no longer uses. Six disks
-   of the twelve were whole the whole time.
+   of the thirteen were whole the whole time, and LGTC0 is whole now.
+
+## The repair that was wrong, and how we know
+
+LGTC0 is the first sector on any of these disks where an outside copy
+settled a repair the tool had already made. It did not survive.
+
+`9/0 s12` was repaired in an earlier pass: 166 CRC-valid readings at
+weight 3, the top one 102 times likelier than the next - "clear winner"
+by every measure the tool had. It was applied and libhxcfe's own decoder
+read the sector clean.
+
+The known-good build says the truth was four bytes, five bits:
+
+```
+  offset  as read  what was applied   truth
+  105517       CB                CB      8B
+  105545       82                82      86
+  105546       2C                2C      A8
+  105613       A4                A0      AC
+  105924       00                20      00
+```
+
+Two of the three bits it flipped were in bytes that really were damaged
+- and it flipped the wrong bit in each. The third it invented. It left
+two damaged bytes untouched. And the result satisfied the stored CRC,
+because the stored CRC was intact and a sixteen-bit checksum has 65,536
+values: at weight 3 over a 4,144-bit message there are billions of
+readings and millions of them match.
+
+The true reading is at weight 5. The search stops at the first weight
+that yields any CRC-valid candidate, and at weight 3 it always will. So
+the rule "take the lowest weight that satisfies the CRC" is only sound
+when the true error is at or below that weight, and nothing in the flux
+said it was not. The margin of 102x was a ratio between wrong answers.
+
+This is the same lesson as the rest of this file, with a witness: a
+sixteen-bit checksum cannot settle a 512-byte sector, and where a disk
+carries no stronger check, an outside copy is worth more than any amount
+of ranking.
 
 ## The CRC can be wrong without the flux noticing
 

@@ -513,7 +513,12 @@ stale headers from the old layout pointing at data that was overwritten
 long before this disk was ever read.
 
 **A copy from elsewhere.** `--from-file COPY` takes the same file from
-another disk, an archive, a download. It will not be laid out the same
+another disk, an archive, a download. On LGTC0 it recovered both damaged
+sectors of `IFSMGR.VXD` outright, and the repaired file is byte-identical
+to the known-good build across all 185,910 bytes - see
+[the repair that was wrong](docs/disks.md#the-repair-that-was-wrong-and-how-we-know),
+because one of those two sectors had already been "repaired" by the
+search, at a margin of 102x, and was wrong. It will not be laid out the same
 way, so the damaged sector's known-good neighbours are the anchor: find
 where they occur in the candidate, demand a long run of agreement on
 both sides, and then let the sector's own CRC say whether the bytes
@@ -532,6 +537,23 @@ To make that less of a lottery, `--fs` says which build to go and find:
 Copyright (C) Microsoft Corp. 1988-2000 - find that exact build and
 --from-file will use it
 ```
+
+**A deleted file is not gone.** Erasing a file on a FAT disk overwrites
+one byte of its name and frees its clusters; the length, the start and
+very often the data are all still there. That is the same kind of
+evidence as a stale archive directory, so `--fs` lists those entries too,
+and says whether anything has taken the clusters back:
+
+```
+  ?PN.PRC     36099 byte(s)  deleted; 36352 byte(s) of its chain still
+                             readable - its data may still be there
+  ?LEX.PPT   714240 byte(s)  deleted; 15872 byte(s) of its chain still
+                             readable - its clusters have been taken back
+```
+
+It also says when two live files claim the same clusters, or when a
+file's chain gives out before its recorded length - both of which mean
+the filesystem is wrong about something quite apart from any bad sector.
 
 **And not every floppy is a PC floppy.** A Macintosh HFS volume has no
 FAT and no 8.3 directory, so the FAT reader saw nothing and the whole
@@ -761,17 +783,25 @@ two are.
 They did pay for themselves, though - see the note on the block fit
 below, which they are the reason for.
 
-Totals, now over twelve disks: 60 bad sectors, of which **40 hold no
+Totals, now over thirteen disks: 80 bad sectors, of which **50 hold no
 file's data at all** - free space, unformatted noise past the last
-track, or parts of a file the file itself no longer uses. Of the 20 that
-do carry live data, **9 are recovered**: four by the search, and five
-exactly, from a second copy of the same bytes - three from the same
-archive stored twice on the disk, one from the same stream stored twice
-inside one document, and one from a member the archive had stored under
-two names, found through the stale copy of its own directory. Six of the
-twelve disks lost nothing whatsoever. The running tally, and what each
-disk turned out to be suffering from, is in
-[docs/disks.md](docs/disks.md).
+track, or parts of a file the file itself no longer uses. Of the 30 that
+do carry live data, **10 are recovered** - and only three of those by
+the search. The other seven came from a second copy of the same bytes:
+three from an archive stored twice on the disk, one from a stream stored
+twice inside one document, one from a member the archive had stored
+under two names (found through the stale copy of its own directory), and
+two from a copy of the file supplied from off the disk entirely. Six of
+the thirteen disks lost nothing whatsoever.
+
+The count of search repairs went *down* again this time, and not because
+the search got worse. An outside copy of LGTC0's `IFSMGR.VXD` arrived
+and settled a sector the search had already "repaired" at a margin of
+102x. It was wrong. See
+[the repair that was wrong](docs/disks.md#the-repair-that-was-wrong-and-how-we-know).
+
+The running tally, and what each disk turned out to be suffering from,
+is in [docs/disks.md](docs/disks.md).
 
 That number went *down* as the tool got better, and the reason is the
 whole point of the section below. Five of the readings it used to apply

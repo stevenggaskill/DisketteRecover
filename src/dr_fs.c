@@ -57,6 +57,7 @@ struct dr_fs {
 		int   start;
 		long  size;
 		int   attr;
+		int   deleted;
 	} *files;
 	int nfiles;
 };
@@ -227,11 +228,22 @@ static void read_root(dr_fs *fs)
 
 		if (e[0] == 0x00)
 			break;
-		if (e[0] == 0xE5 || e[11] == 0x0F)
-			continue;          /* deleted, or a long-name slot */
+		if (e[11] == 0x0F)
+			continue;          /* a long-name slot             */
 		if (e[11] & 0x08)
 			continue;          /* volume label                 */
+		/*
+		 * Deleted entries are kept. Erasing a file on a FAT disk
+		 * overwrites one byte of its name and frees its clusters;
+		 * everything else - the length, where it started, and very
+		 * often the data itself - is still sitting there. On a disk
+		 * whose live filesystem has been damaged, those entries are
+		 * the same kind of evidence a stale archive directory is.
+		 */
+		fs->files[fs->nfiles].deleted = (e[0] == 0xE5);
 		trim_name(e, fs->files[fs->nfiles].name);
+		if (e[0] == 0xE5)
+			fs->files[fs->nfiles].name[0] = '?';
 		fs->files[fs->nfiles].start = u16le(e + 26);
 		fs->files[fs->nfiles].size =
 		        (long)e[28] | ((long)e[29] << 8) |
@@ -596,9 +608,12 @@ int dr_fs_locate(dr_fs *fs, dr_ctx *c, int sector_index, dr_fs_loc *out)
 		out->area = DR_AREA_FREE;
 		if (cl) {
 			for (f = 0; f < fs->nfiles; f++) {
-				int n = chain(fs, fs->files[f].start, cl,
-				              in->clusters + 2);
-				int k;
+				int n, k;
+
+				if (fs->files[f].deleted)
+					continue;
+				n = chain(fs, fs->files[f].start, cl,
+				          in->clusters + 2);
 				for (k = 0; k < n; k++) {
 					if (cl[k] != out->cluster)
 						continue;
@@ -1184,7 +1199,8 @@ static uint8_t *assemble(dr_fs *fs, const dr_fs_loc *loc,
 	long size;
 
 	for (f = 0; f < fs->nfiles; f++)
-		if (strcmp(fs->files[f].name, loc->file) == 0)
+		if (!fs->files[f].deleted &&
+		    strcmp(fs->files[f].name, loc->file) == 0)
 			break;
 	if (f == fs->nfiles)
 		return NULL;
@@ -1428,7 +1444,11 @@ static double fat_health(dr_fs *fs, const uint8_t *payload,
 
 	cl = malloc(sizeof(int) * (size_t)(in->clusters + 2));
 	for (f = 0; cl && f < fs->nfiles; f++) {
-		long want = (fs->files[f].size + (long)in->spc * SECSZ - 1) /
+		long want;
+
+		if (fs->files[f].deleted)
+			continue;
+		want = (fs->files[f].size + (long)in->spc * SECSZ - 1) /
 		            ((long)in->spc * SECSZ);
 		int n = chain(fs, fs->files[f].start, cl, in->clusters + 2);
 		if (n == (int)want)
@@ -1632,7 +1652,8 @@ int dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc, uint8_t *out, int len,
 	if (!fs || !loc || loc->area != DR_AREA_FILE || !out)
 		return -1;
 	for (i = 0; i < fs->nfiles; i++)
-		if (strcmp(fs->files[i].name, loc->file) == 0) { self = i; break; }
+		if (!fs->files[i].deleted &&
+		    strcmp(fs->files[i].name, loc->file) == 0) { self = i; break; }
 	if (self < 0)
 		return -1;
 
@@ -1963,10 +1984,17 @@ int dr_fs_from_file(dr_fs *fs, const dr_fs_loc *loc, const char *path,
 		goto out;
 
 	memcpy(out, cand + best_at, (size_t)len);
+	/*
+	 * How much the agreement is worth. A few hundred bytes either
+	 * side says the file lines up; thousands say it is the same
+	 * build, byte for byte, and then the 512 in the middle are not a
+	 * guess even when the sector's own checksum disagrees - because
+	 * on these disks the checksum is the thing that usually died.
+	 */
+	rc = (best_back >= 4096 && best_fwd >= 4096) ? 1 : 0;
 	snprintf(how, (size_t)howsz,
 	         "%s lines up at offset %ld and agrees for %ld byte(s) before "
 	         "the damage and %ld after", path, best_at, best_back, best_fwd);
-	rc = 0;
 out:
 	free(mine);
 	free(cand);
@@ -2021,7 +2049,9 @@ static int stream_matches(const uint8_t *b, long len, long off,
 	return inflate_check(b + off, csz, crc, usz) == 1;
 }
 
-static void zip_survey(const uint8_t *b, long len, int *parts, int *ok,
+static void zip_survey(const uint8_t *b, long len,
+                       const uint8_t *disk, long disklen,
+                       int *parts, int *ok,
                        int *found, char *lost, size_t lostsz)
 {
 	zsurv *have = NULL, *want = NULL;
@@ -2150,12 +2180,34 @@ static void zip_survey(const uint8_t *b, long len, int *parts, int *ok,
 				if (!stream_matches(b, len, off, want[i].csz,
 				                    want[i].usz, want[i].crc))
 					continue;
+				want[i].got = 1;
+				break;
+			}
+			/*
+			 * And if it is not in the file, the rest of the
+			 * disk. A floppy that has been written to more than
+			 * once keeps older copies of its files in clusters
+			 * nothing has claimed since; the checksum does not
+			 * care which file the bytes are filed under.
+			 */
+			if (!want[i].got && disk && disklen > 0 &&
+			    disklen <= 8L * 1024 * 1024) {
+				for (off = 0; off + want[i].csz <= disklen;
+				     off++) {
+					if (!stream_matches(disk, disklen, off,
+					                    want[i].csz,
+					                    want[i].usz,
+					                    want[i].crc))
+						continue;
+					want[i].got = 1;
+					break;
+				}
+			}
+			if (want[i].got) {
 				(*parts)++;
 				(*ok)++;
 				if (found)
 					(*found)++;
-				want[i].got = 1;
-				break;
 			}
 		}
 		if (!want[i].got && lost && lostsz) {
@@ -2173,7 +2225,7 @@ static void zip_survey(const uint8_t *b, long len, int *parts, int *ok,
 int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 {
 	const dr_fs_info *in;
-	int f, n = 0, *cl;
+	int f, n = 0, *cl, *owner = NULL;
 
 	if (!fs || !out)
 		return 0;
@@ -2181,6 +2233,26 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 	cl = malloc(sizeof(int) * (size_t)(in->clusters + 2));
 	if (!cl)
 		return 0;
+
+	/* Which live file claims each cluster - two files claiming the
+	 * same one is a classic FAT fault and it means at least one of
+	 * them is not what it says it is. */
+	{
+		int g;
+
+		owner = calloc((size_t)in->clusters + 2, sizeof(int));
+		for (g = 0; owner && g < fs->nfiles; g++) {
+			int m, q;
+
+			if (fs->files[g].deleted)
+				continue;
+			m = chain(fs, fs->files[g].start, cl, in->clusters + 2);
+			for (q = 0; q < m; q++)
+				if (cl[q] >= 2 && cl[q] < in->clusters + 2 &&
+				    !owner[cl[q]])
+					owner[cl[q]] = g + 1;
+		}
+	}
 
 	for (f = 0; f < fs->nfiles && n < max; f++) {
 		dr_fs_file *o = &out[n];
@@ -2190,6 +2262,18 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 		memset(o, 0, sizeof(*o));
 		snprintf(o->name, sizeof(o->name), "%s", fs->files[f].name);
 		o->size = fs->files[f].size;
+		o->deleted = fs->files[f].deleted;
+		o->chain_bytes = (long)nc * in->spc * SECSZ;
+		if (owner && !o->deleted)
+			for (k = 0; k < nc; k++) {
+				int w = (cl[k] >= 2 && cl[k] < in->clusters + 2)
+				        ? owner[cl[k]] : 0;
+				if (w && w != f + 1) {
+					snprintf(o->cross, sizeof(o->cross),
+					         "%s", fs->files[w - 1].name);
+					break;
+				}
+			}
 		for (k = 0; k < nc; k++) {
 			int j;
 			for (j = 0; j < in->spc; j++) {
@@ -2202,7 +2286,7 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 		}
 		o->bad = bad;
 #ifndef DR_NO_ZLIB
-		{
+		if (!o->deleted) {
 			dr_fs_loc l;
 			long flen = 0;
 			uint8_t *b;
@@ -2213,14 +2297,33 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 			b = assemble(fs, &l, NULL, 0, &flen);
 			if (b) {
 				if (flen > 30 && b[0] == 'P' && b[1] == 'K')
-					zip_survey(b, flen, &o->parts,
+					zip_survey(b, flen, fs->img,
+					           fs->nlba * SECSZ, &o->parts,
 					           &o->parts_ok, &o->found,
 					           o->lost, sizeof(o->lost));
 				free(b);
 			}
 		}
 #endif
-		if (o->parts) {
+		if (o->deleted) {
+			snprintf(o->note, sizeof(o->note),
+			         "deleted; %ld byte(s) of its chain still "
+			         "readable%s", o->chain_bytes,
+			         o->chain_bytes >= o->size
+			           ? " - its data may still be there"
+			           : " - its clusters have been taken back");
+		} else if (o->cross[0]) {
+			snprintf(o->note, sizeof(o->note),
+			         "its clusters are also claimed by %s - the "
+			         "FAT has them cross-linked, so at most one "
+			         "of the two is whole", o->cross);
+		} else if (o->chain_bytes < o->size) {
+			snprintf(o->note, sizeof(o->note),
+			         "its cluster chain gives out after %ld of "
+			         "%ld byte(s) - the FAT entry that should "
+			         "continue it is wrong", o->chain_bytes,
+			         o->size);
+		} else if (o->parts) {
 			int k = snprintf(o->note, sizeof(o->note),
 			                 "%d of %d archive member(s) still "
 			                 "extract", o->parts_ok, o->parts);
@@ -2238,6 +2341,7 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 			snprintf(o->note, sizeof(o->note), "intact");
 		n++;
 	}
+	free(owner);
 	free(cl);
 	return n;
 }

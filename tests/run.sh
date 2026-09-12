@@ -580,6 +580,36 @@ PYEOF
 	     sed -n 's/.*(\([0-9][0-9]*\) of them found through a second copy.*/\1/p')
 	check "one of them only through the directory copy" "$fd" "1"
 
+	echo "== a deleted directory entry is still evidence"
+	# Erasing a file on a FAT disk overwrites one byte of its name and
+	# frees its clusters; the length, the start and very often the data
+	# are all still there. On a damaged disk that entry is the same
+	# kind of evidence a stale archive directory is.
+	python3 - "$here/tools/mkfat.py" "$out" <<'PYEOF'
+import subprocess, struct, sys
+mkfat, out = sys.argv[1], sys.argv[2]
+open(out + '/one.bin', 'wb').write(bytes((i * 7) & 0xFF for i in range(6000)))
+open(out + '/two.bin', 'wb').write(bytes((i * 11) & 0xFF for i in range(4000)))
+subprocess.check_call(['python3', mkfat, out + '/del.img',
+                       'KEPT.BIN=' + out + '/one.bin',
+                       'GONE.BIN=' + out + '/two.bin'])
+d = bytearray(open(out + '/del.img', 'rb').read())
+root = (1 + 2 * 3) * 512
+for i in range(112):                       # erase the second entry
+    e = d[root + i*32: root + i*32 + 11]
+    if bytes(e).startswith(b'GONE'):
+        d[root + i*32] = 0xE5
+        break
+open(out + '/del.img', 'wb').write(bytes(d))
+PYEOF
+	"$dr" convert "$out/del.img" --out "$out/del.hfe" >/dev/null 2>&1
+	dl=$("$dr" scan "$out/del.hfe" --fs 2>/dev/null |
+	     sed -n 's/^  \(?ONE.BIN\).*deleted.*/\1/p')
+	check "the deleted entry is still listed" "$dl" "?ONE.BIN"
+	st=$("$dr" scan "$out/del.hfe" --fs 2>/dev/null |
+	     sed -n 's/.*\(its data may still be there\).*/there/p')
+	check "...and its clusters have not been taken back" "$st" "there"
+
 	echo "== a Macintosh disk is not a PC disk"
 	python3 "$here/tools/mkhfs.py" "$out/hfs.img" 100
 	"$dr" convert "$out/hfs.img" --out "$out/hfs.hfe" >/dev/null 2>&1

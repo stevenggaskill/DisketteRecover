@@ -475,8 +475,10 @@ int         dr_fs_detail(dr_fs *fs, const dr_fs_loc *loc,
  * sides before believing the bytes in between. The sector's own CRC
  * then says whether it is right.
  *
- * Returns 1 when the sector's stored CRC confirms the bytes, 0 when an
- * alignment was found but the CRC does not agree, -1 when the candidate
+ * Returns 1 when the copy agrees for thousands of bytes either side -
+ * the same build, byte for byte, so the 512 in the middle are not a
+ * guess even if the sector's own checksum disagrees; 0 when it lines up
+ * well enough to be worth checking against that checksum; -1 when it
  * does not line up at all. */
 int         dr_fs_from_file(dr_fs *fs, const dr_fs_loc *loc,
                             const char *path, uint8_t *out, int len,
@@ -489,10 +491,13 @@ int         dr_fs_from_file(dr_fs *fs, const dr_fs_loc *loc,
 typedef struct {
 	char name[72];
 	long size;
+	int  deleted;            /* the directory entry was erased       */
+	long chain_bytes;        /* what its cluster chain actually spans*/
 	int  bad;                /* sectors of it with a CRC error       */
 	int  parts, parts_ok;    /* archive members that still verify    */
 	int  found;              /* ...recovered via a second directory   */
 	char lost[160];          /* members nothing on the disk can supply*/
+	char cross[72];          /* another file claiming the same space  */
 	char note[400];
 } dr_fs_file;
 
