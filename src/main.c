@@ -1681,9 +1681,19 @@ int main(int argc, char **argv)
 		}
 		mkdir(a.out, 0777);
 		nf = dr_fs_files(fs, ff, 128);
+		if (!nf) {
+			printf("nothing to write: this disk's filesystem "
+			       "(%s) is recognised but its\ndirectory is not "
+			       "read by this tool - only FAT12/16 "
+			       "directories are.\n", dr_fs_stat(fs)->kind);
+			if (g_fs)
+				dr_fs_free(g_fs);
+			dr_close(c);
+			return 0;
+		}
 		printf("writing to %s\n\n", a.out);
 		for (k = 0; k < nf; k++) {
-			char path[2400];
+			char path[2400], suffix[16];
 			long len = 0;
 			uint8_t *b;
 			FILE *f;
@@ -1695,8 +1705,25 @@ int main(int argc, char **argv)
 				free(b);
 				continue;
 			}
-			if (snprintf(path, sizeof(path), "%s/%s", a.out,
-			             ff[k].name) >= (int)sizeof(path)) {
+			/* Directories that have been churned hold the same
+			 * name many times over, at different lengths; each
+			 * one is a different moment in the disk's life and
+			 * none of them should quietly overwrite another. */
+			{
+				int dup = 0, j;
+
+				for (j = 0; j < k; j++)
+					if (!strcmp(ff[j].name, ff[k].name) &&
+					    !(ff[j].deleted && !a.deleted))
+						dup++;
+				if (dup)
+					snprintf(suffix, sizeof(suffix),
+					         ".%d", dup + 1);
+				else
+					suffix[0] = 0;
+			}
+			if (snprintf(path, sizeof(path), "%s/%s%s", a.out,
+			             ff[k].name, suffix) >= (int)sizeof(path)) {
 				fprintf(stderr, "path too long for %s\n",
 				        ff[k].name);
 				free(b);
@@ -1708,7 +1735,7 @@ int main(int argc, char **argv)
 				fclose(f);
 				wrote++;
 				printf("  %-16s %8ld byte(s)  %s%s\n",
-				       ff[k].name, len,
+				       path + strlen(a.out) + 1, len,
 				       ff[k].bad ? "CONTAINS DAMAGE - "
 				                 : "",
 				       ff[k].note[0] ? ff[k].note : "ok");

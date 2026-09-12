@@ -241,6 +241,12 @@ static void read_root(dr_fs *fs)
 		 * whose live filesystem has been damaged, those entries are
 		 * the same kind of evidence a stale archive directory is.
 		 */
+		/* A stale entry can record a length the volume never had
+		 * room for; that is not a file, it is a slot that was
+		 * reused and half-rewritten. */
+		if ((long)e[28] + ((long)e[29] << 8) + ((long)e[30] << 16) +
+		    ((long)e[31] << 24) > (long)fs->info.total_sectors * SECSZ)
+			continue;
 		fs->files[fs->nfiles].deleted = (e[0] == 0xE5);
 		trim_name(e, fs->files[fs->nfiles].name);
 		if (e[0] == 0xE5)
@@ -2105,6 +2111,39 @@ static void palm_restore_name(char *dosname, const char *inner)
 	dosname[0] = up[0];
 }
 
+
+/* Name a compound document by what is inside it - a Word document, a
+ * workbook, a deck - so that a file recovered from a deleted entry can
+ * be told apart from the file that has since been written over it. */
+static int cfb_describe(const uint8_t *b, long len, char *how, size_t howsz)
+{
+	cfb *c = cfb_open(b, len);
+	int i, n = 0;
+	char names[160];
+
+	if (!c)
+		return -1;
+	names[0] = 0;
+	for (i = 0; i < c->nents; i++) {
+		size_t at;
+
+		if (!c->ents[i].live || c->ents[i].type != 2)
+			continue;
+		n++;
+		at = strlen(names);
+		if (n <= 4 && at + strlen(c->ents[i].name) + 3 < sizeof(names))
+			snprintf(names + at, sizeof(names) - at, "%s%s",
+			         at ? ", " : "", c->ents[i].name);
+	}
+	cfb_free(c);
+	if (!n)
+		return -1;
+	snprintf(how, howsz,
+	         "compound document, %d stream(s) - %s%s", n, names,
+	         n > 4 ? ", ..." : "");
+	return 1;
+}
+
 /* ---------------------------------------------------------------- */
 /* What the owner still has                                          */
 /* ---------------------------------------------------------------- */
@@ -2423,21 +2462,55 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 					snprintf(o->note, sizeof(o->note),
 					         "%s", msg);
 					palm_restore_name(o->name, inner);
+				} else if (cfb_describe(b, flen, msg,
+				                        sizeof(msg)) == 1) {
+					snprintf(o->note, sizeof(o->note),
+					         "%s", msg);
 				}
 			}
 			free(b);
 		}
 
-		if (o->note[0]) {
+		if (o->deleted) {
+			/*
+			 * For a deleted file the question is not whether it
+			 * reads but whether anything has been written over
+			 * it. Its clusters are free as far as the FAT is
+			 * concerned, so what matters is how many of them a
+			 * live file has since claimed.
+			 */
+			long cluster = (long)in->spc * SECSZ;
+			int need = (int)((o->size + cluster - 1) / cluster);
+			int taken = 0, q;
+
+			if (need > in->clusters)
+				need = in->clusters;
+			for (q = 0; owner && q < need; q++) {
+				int c = fs->files[f].start + q;
+				if (c >= 2 && c < in->clusters + 2 && owner[c])
+					taken++;
+			}
+			o->reused = taken;
+			if (o->note[0]) {
+				size_t at = strlen(o->note);
+				snprintf(o->note + at, sizeof(o->note) - at,
+				         "; deleted, %s",
+				         taken ? "and partly overwritten"
+				               : "and nothing has overwritten "
+				                 "it");
+			} else if (!taken) {
+				snprintf(o->note, sizeof(o->note),
+				         "deleted, and no live file has taken "
+				         "its %d cluster(s) back", need);
+			} else {
+				snprintf(o->note, sizeof(o->note),
+				         "deleted, and %d of its %d cluster(s) "
+				         "have been given to other files",
+				         taken, need);
+			}
+		} else if (o->note[0]) {
 			/* a format-level verdict wins over the generic
 			 * bookkeeping below */
-		} else if (o->deleted) {
-			snprintf(o->note, sizeof(o->note),
-			         "deleted; %ld byte(s) of its chain still "
-			         "readable%s", o->chain_bytes,
-			         o->chain_bytes >= o->size
-			           ? " - its data may still be there"
-			           : " - its clusters have been taken back");
 		} else if (o->cross[0]) {
 			snprintf(o->note, sizeof(o->note),
 			         "its clusters are also claimed by %s - the "

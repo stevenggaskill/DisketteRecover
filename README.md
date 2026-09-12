@@ -571,6 +571,27 @@ about them than any sector checksum could:
 In all three the last record ends *exactly* on the last byte of the
 file, which is a few dozen constraints satisfied at once.
 
+Run across all thirteen disks, that finds a good deal more than three
+files. GasAcc - the disk whose live filesystem holds a single 2 KB file,
+and which was written up as having lost nothing - turns out to be
+carrying **five deleted Word documents, 693 KB in all, with not one
+cluster reused**. SLAW has a 683 KB PowerPoint deck in the same state.
+Every one of them parses as the compound document it claims to be.
+
+The question that decides whether a deleted file is worth anything is
+not whether it reads, it is whether something has been written over it,
+so that is what `--fs` reports:
+
+```
+  ?SDSBAP.DOC    427520 byte(s)  compound document, 3 stream(s) - CompObj,
+                                 WordDocument, SummaryInformation;
+                                 deleted, and nothing has overwritten it
+  ?LEX.PPT       714240 byte(s)  deleted, and 469 of its 1395 cluster(s)
+                                 have been given to other files
+```
+
+Both of those parse at the header. Only the first one is a file.
+
 Note the names. The directory could only offer `?PN.PRC` and
 `?EALLOCK.PRC`, because the byte DOS destroys when it erases an entry is
 the first letter of the name. The name *inside* each file puts it back,

@@ -607,7 +607,7 @@ PYEOF
 	     sed -n 's/^  \(?ONE.BIN\).*deleted.*/\1/p')
 	check "the deleted entry is still listed" "$dl" "?ONE.BIN"
 	st=$("$dr" scan "$out/del.hfe" --fs 2>/dev/null |
-	     sed -n 's/.*\(its data may still be there\).*/there/p')
+	     sed -n 's/.*\(no live file has taken its\).*/there/p')
 	check "...and its clusters have not been taken back" "$st" "there"
 
 	echo "== reading the files back off the disk"
@@ -659,6 +659,32 @@ PYEOF
 	else
 		ok "without --deleted the erased file is left alone"
 	fi
+
+	echo "== what became of a deleted file's clusters"
+	# The question for a deleted file is not whether it reads but
+	# whether anything has been written over it. Two erased entries:
+	# one whose clusters are still free, one whose clusters a live
+	# file has since taken.
+	python3 - "$here/tools/mkfat.py" "$out" <<'PYEOF'
+import struct, subprocess, sys
+mkfat, out = sys.argv[1], sys.argv[2]
+open(out + '/gone1.bin', 'wb').write(bytes((i * 5) & 0xFF for i in range(5000)))
+open(out + '/live.bin', 'wb').write(bytes((i * 9) & 0xFF for i in range(5000)))
+subprocess.check_call(['python3', mkfat, out + '/reuse.img',
+                       'GONE1.BIN=' + out + '/gone1.bin',
+                       'LIVE.BIN=' + out + '/live.bin'])
+d = bytearray(open(out + '/reuse.img', 'rb').read())
+root = (1 + 2 * 3) * 512
+# erase GONE1 and point LIVE at the same clusters
+struct.pack_into('<H', d, root + 32 + 26,
+                 struct.unpack_from('<H', d, root + 26)[0])
+d[root] = 0xE5
+open(out + '/reuse.img', 'wb').write(bytes(d))
+PYEOF
+	"$dr" convert "$out/reuse.img" --out "$out/reuse.hfe" >/dev/null 2>&1
+	tk=$("$dr" scan "$out/reuse.hfe" --fs 2>/dev/null |
+	     sed -n 's/.*deleted, and \([0-9]*\) of its .* have been given.*/taken/p')
+	check "an overwritten deleted file says so" "$tk" "taken"
 
 	echo "== a Macintosh disk is not a PC disk"
 	python3 "$here/tools/mkhfs.py" "$out/hfs.img" 100

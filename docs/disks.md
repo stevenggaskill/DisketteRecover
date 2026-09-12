@@ -189,6 +189,34 @@ sector, inside its `code#1` resource. The structure is unaffected, so it
 will still install; whether it runs is another matter, and a `.prc`
 carries no checksum to settle it.
 
+## What the deleted entries hold, disk by disk
+
+Run over all thirteen, `extract --deleted` finds rather more than the
+three PalmOS databases. What matters is not whether an entry reads but
+whether a live file has since taken its clusters:
+
+| disk | deleted, and untouched | what it is |
+|---|---|---|
+| GasAcc | `?RCL-IMI.DOC`, `?WFTMDSF.DOC`, `?YS-REQT.DOC`, `?RM-RQ11.DOC`, `?SDSBAP.DOC` | five Word documents, **693 KB**, all parsing, none overwritten. GasAcc's live filesystem holds one 2 KB file; everything else on the disk is this |
+| SLAW | `?LDCON97.PPT` | a 683 KB PowerPoint 4.0 deck (`PP40` stream), untouched |
+| Teres | `?ALTDI~1.PPT` | 13.8 KB, a compound document with a `Pictures` stream |
+| ALXPPT | `RPN.PRC`, `TEALLOCK.PRC`, `?PN.PDB` | the three PalmOS databases |
+
+And what is *not* recoverable, which the same report makes clear:
+
+| disk | entry | |
+|---|---|---|
+| ALXPPT | `?LEX.PPT` | 469 of its 1,395 clusters have been given to other files - it parses, but as the *workbook* that took them |
+| Ron, Zeus | `?WRD0002.TMP`, `?WRD0000.TMP` | every cluster reused |
+| Scott | 83 entries | a Word editing history - the same documents saved over and over, most of them partly overwritten by the next save |
+| Sand | 7 × `?ONTACTS.ZIP`, 22 bytes each | 22 bytes is an empty ZIP, just the end-of-directory record. Somebody tried to copy that archive seven times before it took |
+
+A deleted file's chain is gone from the FAT - only the first cluster is
+recorded - so the clusters are read consecutively from there. On a disk
+written once that is right, and the structural parse is the check on it;
+on a churned disk a file may have been fragmented, and then the middle
+is wrong even where the header reads.
+
 ## The repair that was wrong, and how we know
 
 LGTC0 is the first sector on any of these disks where an outside copy

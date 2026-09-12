@@ -493,6 +493,7 @@ typedef struct {
 	long size;
 	int  deleted;            /* the directory entry was erased       */
 	long chain_bytes;        /* what its cluster chain actually spans*/
+	int  reused;             /* deleted: clusters a live file took   */
 	int  bad;                /* sectors of it with a CRC error       */
 	int  parts, parts_ok;    /* archive members that still verify    */
 	int  found;              /* ...recovered via a second directory   */
