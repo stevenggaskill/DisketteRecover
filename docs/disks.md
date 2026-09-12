@@ -24,7 +24,7 @@ failure was misleading.
 | SLAW     | 2880 | 2 | **0** | - | both in **free space**; all 8 documents intact |
 | Teres    | 2880 | 4 | 3 | 0 | one in free space; three in Quicken's `QDATA.QDB`/`.QSD`/`.QEL`, which carry no checksum and have no second copy. The other 7 files are intact |
 | DisComp  | 2881 | 0 | - | - | **a Macintosh HFS disk** (volume "Gradebook"), not a PC disk - which is why nothing could read it as one. No CRC errors at all |
-| ALXPPT   | 2944 | 20 | 10 | 0 | one mark down sector 12, tracks 32-45. The damaged FAT sector was restored from its twin; 7 of the rest are in free space. The live filesystem is also confused independently of the damage - `RESUME.TXT`'s recorded start cluster is three clusters past where its text actually begins |
+| ALXPPT   | 2944 | 20 | 10 | 0 | one mark down sector 12, tracks 32-45. The damaged FAT sector was restored from its twin; 7 of the rest are in free space. Its root directory also still holds four **deleted** entries, and three of those - `RPN.PRC`, `TEALLOCK.PRC` and RPN's scripts database - come back whole, names and all. The live filesystem is confused independently of the damage: `RESUME.TXT`'s recorded start cluster is three clusters past where its text actually begins |
 | **total** | **32361** | **80** | **30** | **10** | |
 
 Six of the thirteen disks - Disk 1, GasAcc, Scott, Ron, SLAW and
@@ -154,6 +154,40 @@ Ranked by how often they turned up, not by how interesting they are:
    data: free space, unformatted noise past the last track, or - on
    SLAT - parts of a file that the file itself no longer uses. Six disks
    of the thirteen were whole the whole time, and LGTC0 is whole now.
+
+## What a deleted file still tells you
+
+Erasing a file on a FAT disk overwrites one byte - the first character of
+its name - and frees its clusters. Everything else stays: the length,
+where it started, and, until something else claims them, the clusters
+themselves. ALXPPT's root directory still holds four such entries, and
+three of them are PalmOS databases whose data is untouched.
+
+A `.prc` or `.pdb` describes itself, which makes the recovery checkable
+rather than hopeful:
+
+```
+RPN.PRC        36099 bytes  'RPN'             appl/Yrpn  12 resources
+RPN-scripts.PDB 2277 bytes  'Yrpn_R_WScripts' r000/Yrpn   8 records
+TEALLOCK.PRC   26056 bytes  'TealLock'        appl/TlLk  38 resources
+```
+
+In every one the offsets rise, land inside the file, and the last record
+ends *exactly* on the last byte - so the directory's recorded length and
+the contiguous run of clusters both check out, at once.
+
+And the name inside puts back the letter the directory lost, where the
+two agree on everything else: `?PN.PRC` is `RPN.PRC` and `?EALLOCK.PRC`
+is `TEALLOCK.PRC`, and are not guesses. The third file's internal name is
+`Yrpn_R_WScripts`, which does not agree with what is left of its DOS
+name, so it keeps its question mark. Its *creator* is `Yrpn`, the same as
+the application, which is how a person can tell it is RPN's scripts
+database - but that is an inference, and the tool does not make it.
+
+One of the three carries damage: 512 bytes of `RPN.PRC` fall in a bad
+sector, inside its `code#1` resource. The structure is unaffected, so it
+will still install; whether it runs is another matter, and a `.prc`
+carries no checksum to settle it.
 
 ## The repair that was wrong, and how we know
 

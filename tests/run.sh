@@ -610,6 +610,56 @@ PYEOF
 	     sed -n 's/.*\(its data may still be there\).*/there/p')
 	check "...and its clusters have not been taken back" "$st" "there"
 
+	echo "== reading the files back off the disk"
+	# A PalmOS database describes itself: a name, a record count, and a
+	# list of offsets that have to rise and land inside the file. That
+	# is a referee - and the name inside puts back the letter DOS
+	# destroys when it erases a directory entry.
+	python3 - "$here/tools/mkfat.py" "$out" <<'PYEOF'
+import struct, subprocess, sys
+mkfat, out = sys.argv[1], sys.argv[2]
+recs = [bytes(((i * 13 + j) & 0xFF) for j in range(700)) for i in range(6)]
+hdr = bytearray(78)
+hdr[0:8] = b'TealLock'
+struct.pack_into('>H', hdr, 32, 0x0001)            # a resource database
+struct.pack_into('>H', hdr, 34, 1)
+hdr[60:68] = b'applTlLk'
+struct.pack_into('>H', hdr, 76, len(recs))
+off = 78 + 10 * len(recs)
+body = b''
+for i, r in enumerate(recs):
+    hdr += struct.pack('>4sHI', b'code', i, off + len(body))
+    body += r
+open(out + '/teal.prc', 'wb').write(bytes(hdr) + body)
+subprocess.check_call(['python3', mkfat, out + '/palm.img',
+                       'TEALLOCK.PRC=' + out + '/teal.prc'])
+d = bytearray(open(out + '/palm.img', 'rb').read())
+root = (1 + 2 * 3) * 512
+d[root] = 0xE5                                     # erase the entry
+open(out + '/palm.img', 'wb').write(bytes(d))
+PYEOF
+	"$dr" convert "$out/palm.img" --out "$out/palm.hfe" >/dev/null 2>&1
+	pn=$("$dr" scan "$out/palm.hfe" --fs 2>/dev/null |
+	     sed -n "s/.*PalmOS resource database '\([^']*\)'.*/\1/p")
+	check "the database describes itself" "$pn" "TealLock"
+	rn=$("$dr" scan "$out/palm.hfe" --fs 2>/dev/null |
+	     sed -n 's/^  \(TEALLOCK.PRC\).*/\1/p')
+	check "the erased first letter is put back from inside the file" \
+	      "$rn" "TEALLOCK.PRC"
+	rm -rf "$out/ex"
+	"$dr" extract "$out/palm.hfe" --out "$out/ex" --deleted >/dev/null 2>&1
+	if cmp -s "$out/teal.prc" "$out/ex/TEALLOCK.PRC"; then
+		ok "extract writes the deleted file back out, byte for byte"
+	else
+		bad "extract writes the deleted file back out, byte for byte"
+	fi
+	"$dr" extract "$out/palm.hfe" --out "$out/ex2" >/dev/null 2>&1
+	if [ -f "$out/ex2/TEALLOCK.PRC" ]; then
+		bad "without --deleted the erased file is left alone"
+	else
+		ok "without --deleted the erased file is left alone"
+	fi
+
 	echo "== a Macintosh disk is not a PC disk"
 	python3 "$here/tools/mkhfs.py" "$out/hfs.img" 100
 	"$dr" convert "$out/hfs.img" --out "$out/hfs.hfe" >/dev/null 2>&1

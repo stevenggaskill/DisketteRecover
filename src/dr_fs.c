@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "dr_internal.h"
 
@@ -607,10 +608,18 @@ int dr_fs_locate(dr_fs *fs, dr_ctx *c, int sector_index, dr_fs_loc *out)
 
 		out->area = DR_AREA_FREE;
 		if (cl) {
+			/* Live files first, then deleted ones: a sector
+			 * inside a deleted file is not free space, it is
+			 * the last copy of something somebody threw away
+			 * and may well want back. */
+			int pass;
+
+			for (pass = 0; pass < 2 && out->area != DR_AREA_FILE;
+			     pass++)
 			for (f = 0; f < fs->nfiles; f++) {
 				int n, k;
 
-				if (fs->files[f].deleted)
+				if (fs->files[f].deleted != pass)
 					continue;
 				n = chain(fs, fs->files[f].start, cl,
 				          in->clusters + 2);
@@ -626,9 +635,11 @@ int dr_fs_locate(dr_fs *fs, dr_ctx *c, int sector_index, dr_fs_loc *out)
 					        ((lba - in->data_lba) % in->spc) * SECSZ;
 					snprintf(out->note, sizeof(out->note),
 					         "cluster %d - bytes %ld..%ld of "
-					         "%s (%ld bytes)",
+					         "%s%s (%ld bytes)",
 					         out->cluster, out->file_offset,
 					         out->file_offset + SECSZ,
+					         fs->files[f].deleted
+					           ? "the deleted file " : "",
 					         fs->files[f].name,
 					         fs->files[f].size);
 					break;
@@ -1184,6 +1195,9 @@ out:
 	return rc;
 }
 
+static int palm_ok(const uint8_t *b, long len, char *name, size_t namesz,
+                   char *how, size_t howsz);
+
 /* ---------------------------------------------------------------- */
 /* The referees: checks that live above the sector CRC               */
 /* ---------------------------------------------------------------- */
@@ -1511,6 +1525,9 @@ int dr_fs_score(dr_fs *fs, const dr_fs_loc *loc, const uint8_t *payload,
 			if (v < 0)
 				v = cfb_check(buf, flen, loc->file_offset,
 				              out->how, sizeof(out->how));
+			if (v < 0)
+				v = palm_ok(buf, flen, NULL, 0, out->how,
+				            sizeof(out->how));
 			free(buf);
 		}
 		if (v >= 0) {
@@ -2001,6 +2018,93 @@ out:
 	return rc;
 }
 
+
+/* ---------------------------------------------------------------- */
+/* PalmOS databases                                                  */
+/* ---------------------------------------------------------------- */
+/*
+ * A .prc or .pdb opens with a 78-byte header - a 32-byte name, a type
+ * and creator, a record count - and then a list of records, each
+ * declaring where in the file its data starts. Those offsets have to
+ * rise, and they have to land inside the file. That is a few dozen
+ * constraints where the sector CRC has sixteen, and it costs nothing.
+ *
+ * The header also carries the database's own name, which matters here
+ * for a second reason: erasing a file on a FAT disk destroys the first
+ * letter of its name and nothing else. The name inside the file puts
+ * that letter back.
+ */
+static int palm_ok(const uint8_t *b, long len, char *name, size_t namesz,
+                   char *how, size_t howsz)
+{
+	int attr, nrec, res, step, i;
+	long need, prev = -1;
+	char type[5], creator[5];
+
+	if (len < 78)
+		return -1;
+	for (i = 0; i < 31 && b[i]; i++)
+		if (b[i] < 0x20 || b[i] > 0x7E)
+			return -1;       /* not a name, so not one of these */
+	if (!b[0])
+		return -1;
+	attr = (b[32] << 8) | b[33];
+	nrec = (b[76] << 8) | b[77];
+	res  = attr & 0x0001;
+	step = res ? 10 : 8;
+	if (nrec < 1 || nrec > 4096)
+		return -1;
+	need = 78 + (long)nrec * step;
+	if (need > len)
+		return 0;
+	memcpy(type, b + 60, 4);    type[4] = 0;
+	memcpy(creator, b + 64, 4); creator[4] = 0;
+
+	for (i = 0; i < nrec; i++) {
+		const uint8_t *e = b + 78 + (long)i * step;
+		const uint8_t *o = res ? e + 6 : e;
+		long off = ((long)o[0] << 24) | ((long)o[1] << 16) |
+		           ((long)o[2] << 8) | o[3];
+
+		if (off < need || off > len || off < prev)
+			return 0;
+		prev = off;
+	}
+	if (name && namesz) {
+		int k;
+		for (k = 0; k < 31 && k < (int)namesz - 1 && b[k]; k++)
+			name[k] = (char)b[k];
+		name[k] = 0;
+	}
+	snprintf(how, howsz,
+	         "PalmOS %s '%.31s' (%s/%s): all %d %s offsets rise and land "
+	         "inside the file", res ? "resource database" : "database",
+	         b, type, creator, nrec, res ? "resource" : "record");
+	return 1;
+}
+
+/* Put back the letter the directory lost. Erasing a file overwrites the
+ * first byte of its 8.3 name with 0xE5 and nothing else, so if the name
+ * inside the file agrees with what is left, the missing letter is not a
+ * guess. */
+static void palm_restore_name(char *dosname, const char *inner)
+{
+	size_t i;
+	char up[32];
+
+	if (!dosname || dosname[0] != '?' || !inner || !inner[0])
+		return;
+	for (i = 0; i < sizeof(up) - 1 && inner[i]; i++)
+		up[i] = (char)toupper((unsigned char)inner[i]);
+	up[i] = 0;
+	for (i = 1; dosname[i] && dosname[i] != '.'; i++)
+		if (up[i] != dosname[i])
+			return;          /* the two do not agree - leave it */
+	if (!up[0] || up[0] == '.')
+		return;
+	dosname[0] = up[0];
+}
+
 /* ---------------------------------------------------------------- */
 /* What the owner still has                                          */
 /* ---------------------------------------------------------------- */
@@ -2305,7 +2409,29 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 			}
 		}
 #endif
-		if (o->deleted) {
+		/* Formats that describe themselves get looked at. */
+		{
+			long flen = 0;
+			uint8_t *b = dr_fs_read(fs, f, &flen);
+
+			if (b && flen > 78) {
+				char inner[32], msg[240];
+
+				inner[0] = 0;
+				if (palm_ok(b, flen, inner, sizeof(inner),
+				            msg, sizeof(msg)) == 1) {
+					snprintf(o->note, sizeof(o->note),
+					         "%s", msg);
+					palm_restore_name(o->name, inner);
+				}
+			}
+			free(b);
+		}
+
+		if (o->note[0]) {
+			/* a format-level verdict wins over the generic
+			 * bookkeeping below */
+		} else if (o->deleted) {
 			snprintf(o->note, sizeof(o->note),
 			         "deleted; %ld byte(s) of its chain still "
 			         "readable%s", o->chain_bytes,
@@ -2344,4 +2470,66 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 	free(owner);
 	free(cl);
 	return n;
+}
+
+uint8_t *dr_fs_read(dr_fs *fs, int index, long *len)
+{
+	const dr_fs_info *in;
+	uint8_t *b;
+	int *cl, n, k;
+	long size;
+
+	if (!fs || !len || index < 0 || index >= fs->nfiles)
+		return NULL;
+	in = &fs->info;
+	size = fs->files[index].size;
+	if (size <= 0 || size > 32L * 1024 * 1024)
+		return NULL;
+
+	cl = malloc(sizeof(int) * (size_t)(in->clusters + 2));
+	if (!cl)
+		return NULL;
+	n = chain(fs, fs->files[index].start, cl, in->clusters + 2);
+	/*
+	 * A deleted file usually has no chain left - DOS frees the FAT
+	 * entries and only the directory entry remembers where it began.
+	 * When the links are gone, read the clusters consecutively from
+	 * that start: a file written to a freshly formatted floppy is
+	 * almost always contiguous, and it is the only guess available.
+	 */
+	if (fs->files[index].deleted &&
+	    (long)n * in->spc * SECSZ < size) {
+		n = (int)((size + (long)in->spc * SECSZ - 1) /
+		          ((long)in->spc * SECSZ));
+		for (k = 0; k < n; k++)
+			cl[k] = fs->files[index].start + k;
+	}
+
+	{
+		long cluster = (long)in->spc * SECSZ;
+		long room = ((size + cluster - 1) / cluster) * cluster;
+
+		b = calloc((size_t)room + 1, 1);
+		if (!b) {
+			free(cl);
+			return NULL;
+		}
+		for (k = 0; k < n; k++) {
+			long src, want = cluster;
+			long dst = (long)k * cluster;
+
+			if (dst >= room || cl[k] < 2 ||
+			    cl[k] >= in->clusters + 2)
+				break;
+			if (dst + want > room)
+				want = room - dst;
+			src = (in->data_lba + (long)(cl[k] - 2) * in->spc) *
+			      SECSZ;
+			if (src + want <= fs->nlba * SECSZ)
+				memcpy(b + dst, fs->img + src, (size_t)want);
+		}
+	}
+	free(cl);
+	*len = size;
+	return b;
 }

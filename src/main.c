@@ -7,6 +7,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "dr_internal.h"
 
@@ -26,6 +28,8 @@ static const char *usage_text =
 "  convert  <image>              write the image out in another format\n"
 "  plot     <image>              write an interactive scatter of the flux\n"
 "                                transition widths to --out FILE.html\n"
+"  extract  <image>              write out the files the disk holds,\n"
+"                                deleted ones included\n"
 "  formats                       list libhxcfe export formats\n"
 "\n"
 "inspect options:\n"
@@ -90,6 +94,8 @@ static const char *usage_text =
 "                    are anchored on the damaged sector's known-good\n"
 "                    neighbours, and applied only if they reproduce\n"
 "                    the sector's stored CRC.\n"
+"  --deleted         extract: include files whose directory entry was\n"
+"                    erased - their data is often still there\n"
 "  --variants N      write one image per reading: FILE_a1.hfe,\n"
 "                    FILE_a2.hfe ... Open them in a disk browser and\n"
 "                    see which one's files still make sense.\n"
@@ -132,6 +138,7 @@ typedef struct {
 	int    variants;
 	int    frommirror;
 	const char *fromfile;
+	int    deleted;
 	char *const *sets;
 	int    nsets;
 	dr_options opt;
@@ -191,6 +198,7 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--auto"))     a->autoapply = 1;
 		else if (!strcmp(o, "--all"))      a->all = 1;
 		else if (!strcmp(o, "--fs"))       a->fs = 1;
+		else if (!strcmp(o, "--deleted"))  a->deleted = 1;
 		else if (!strcmp(o, "--from-mirror") ||
 		         !strcmp(o, "--from-copy")) a->frommirror = 1;
 		else if (!strcmp(o, "--variants")) a->variants = atoi(NEXT());
@@ -1651,6 +1659,68 @@ int main(int argc, char **argv)
 		       a.out, idx, pv->sect.track, pv->sect.side,
 		       pv->sect.sector_id);
 		dr_view_free(pv);
+		dr_close(c);
+		return 0;
+	}
+
+	if (!strcmp(a.cmd, "extract")) {
+		dr_fs *fs = fs_of(c);
+		dr_fs_file ff[128];
+		int nf, k, wrote = 0;
+
+		if (!a.out) {
+			fprintf(stderr, "extract needs --out DIR\n");
+			dr_close(c);
+			return 2;
+		}
+		if (!fs) {
+			fprintf(stderr, "no filesystem recognised on this "
+			                "disk\n");
+			dr_close(c);
+			return 1;
+		}
+		mkdir(a.out, 0777);
+		nf = dr_fs_files(fs, ff, 128);
+		printf("writing to %s\n\n", a.out);
+		for (k = 0; k < nf; k++) {
+			char path[2400];
+			long len = 0;
+			uint8_t *b;
+			FILE *f;
+
+			if (ff[k].deleted && !a.deleted)
+				continue;
+			b = dr_fs_read(fs, k, &len);
+			if (!b || len <= 0) {
+				free(b);
+				continue;
+			}
+			if (snprintf(path, sizeof(path), "%s/%s", a.out,
+			             ff[k].name) >= (int)sizeof(path)) {
+				fprintf(stderr, "path too long for %s\n",
+				        ff[k].name);
+				free(b);
+				continue;
+			}
+			f = fopen(path, "wb");
+			if (f) {
+				fwrite(b, 1, (size_t)len, f);
+				fclose(f);
+				wrote++;
+				printf("  %-16s %8ld byte(s)  %s%s\n",
+				       ff[k].name, len,
+				       ff[k].bad ? "CONTAINS DAMAGE - "
+				                 : "",
+				       ff[k].note[0] ? ff[k].note : "ok");
+			}
+			free(b);
+		}
+		printf("\n%d file(s) written%s\n", wrote,
+		       a.deleted ? "" :
+		       "; --deleted also writes the ones whose directory "
+		       "entry was erased");
+		if (g_fs)
+			dr_fs_free(g_fs);
 		dr_close(c);
 		return 0;
 	}

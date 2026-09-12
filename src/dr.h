@@ -503,6 +503,11 @@ typedef struct {
 
 int         dr_fs_files(dr_fs *fs, dr_fs_file *out, int max);
 
+/* Hand back a file's bytes - live or deleted - so they can be written
+ * out. `index` is its position in the dr_fs_files() listing. The caller
+ * frees. */
+uint8_t    *dr_fs_read(dr_fs *fs, int index, long *len);
+
 int         dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc,
                          uint8_t *out, int len, char *how, int howsz);
 

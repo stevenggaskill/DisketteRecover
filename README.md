@@ -555,6 +555,30 @@ It also says when two live files claim the same clusters, or when a
 file's chain gives out before its recorded length - both of which mean
 the filesystem is wrong about something quite apart from any bad sector.
 
+And `extract --deleted` writes them out. On ALXPPT that recovers three
+PalmOS databases whose directory entries had been erased. A `.prc` or
+`.pdb` describes itself - a name, a record count, and a list of offsets
+that have to rise and land inside the file - so the tool can say more
+about them than any sector checksum could:
+
+```
+  RPN.PRC        36099 byte(s)  PalmOS resource database 'RPN' (appl/Yrpn):
+                                all 12 resource offsets rise and land inside the file
+  TEALLOCK.PRC   26056 byte(s)  PalmOS resource database 'TealLock' (appl/TlLk):
+                                all 38 resource offsets rise and land inside the file
+```
+
+In all three the last record ends *exactly* on the last byte of the
+file, which is a few dozen constraints satisfied at once.
+
+Note the names. The directory could only offer `?PN.PRC` and
+`?EALLOCK.PRC`, because the byte DOS destroys when it erases an entry is
+the first letter of the name. The name *inside* each file puts it back,
+and only when the two agree on everything else - so `RPN.PRC` and
+`TEALLOCK.PRC` are restored, while a third file whose internal name is
+`Yrpn_R_WScripts` keeps its question mark rather than being given a
+letter it has not earned.
+
 **And not every floppy is a PC floppy.** A Macintosh HFS volume has no
 FAT and no 8.3 directory, so the FAT reader saw nothing and the whole
 account above the sector went quiet - on a disk that turned out to have
