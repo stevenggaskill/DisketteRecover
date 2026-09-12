@@ -249,6 +249,16 @@ typedef struct {
 
 
 
+/*
+ * What the automatic second re-binning pass uses when the first finds
+ * nothing: a prior that expects the disturbance to have drifted in and
+ * out smoothly, and a list long enough to reach the reading that did.
+ * Both are measured rather than guessed: see "A disturbance that is
+ * spread out" in README.md.
+ */
+#define DR_SMOOTH_SPREAD  16.0
+#define DR_WIDTH_SPREAD   20000
+
 typedef struct {
 	double good_threshold;  /* p_err below this = "assumed good"      */
 	double base_perr;       /* prior when there is no timing evidence */
@@ -262,6 +272,8 @@ typedef struct {
 	long    max_explore;    /* cap on re-binning assignments tested   */
 	int     max_ambiguous;  /* refuse to search past this many        */
 	int     rebin_width;    /* re-readings kept per disturbed stretch */
+	                        /* - the enumeration goes at least this   */
+	                        /* deep, so one knob sets both            */
 	int     max_outliers;   /* pattern engine: bytes off-pattern      */
 	double  dropout_bias;   /* nats favouring a lost 1 over a gained 1*/
 	int     restore_only;   /* only consider putting reversals back   */
@@ -270,6 +282,11 @@ typedef struct {
 	double  burst_len;      /* how fast that decays, in message bits  */
 	int     crc_budget;     /* stored-CRC bits a repair may correct,  */
 	                        /* when the damage reaches them (2)       */
+	double  smooth;         /* how hard to insist that whatever moved */
+	                        /* the reversals moved them gradually: a  */
+	                        /* speck, a scratch and the reader's own  */
+	                        /* PLL all act over a stretch of track,   */
+	                        /* never on one reversal. 0 turns it off. */
 } dr_options;
 
 void        dr_options_default(dr_options *o);
@@ -508,6 +525,18 @@ int         dr_fs_files(dr_fs *fs, dr_fs_file *out, int max);
  * out. `index` is its position in the dr_fs_files() listing. The caller
  * frees. */
 uint8_t    *dr_fs_read(dr_fs *fs, int index, long *len);
+
+/* One member written out of a damaged archive. */
+typedef struct {
+	char name[2400];        /* the path it was written to           */
+	long size;              /* bytes written                        */
+	long full;              /* bytes it should have had             */
+	int  whole;             /* its own CRC-32 agrees                */
+	char note[200];
+} dr_fs_member;
+
+int         dr_fs_salvage(dr_fs *fs, int index, const char *dir,
+                          dr_fs_member *out, int max);
 
 int         dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc,
                          uint8_t *out, int len, char *how, int howsz);

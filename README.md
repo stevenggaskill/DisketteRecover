@@ -104,6 +104,66 @@ The residuals of a real dump are near-Gaussian out to about 4 sigma and
 then break cleanly into a separate population of genuine mis-reads, so
 that is where the defect detector draws its line.
 
+### 3b. A disturbance that is spread out
+
+The binning above treats each reversal's displacement as its own
+accident. That is right for the defect the tool was built on - one
+transition knocked onto a cell boundary - and wrong for most of what
+actually damages a floppy. A speck of dust under the head, a scratch, a
+patch of thin oxide, the drive's own speed wander and the reader's PLL
+all act over a *stretch* of track. None of them can move one reversal
+and leave its neighbour alone: the displacement eases in, peaks, and
+eases out again. Physical things are smooth.
+
+That matters because of what it costs. The re-binning search charges a
+reading for how far it has drifted from the measured transition
+positions. A disturbance ten reversals wide needs a reading that drifts
+a whole cell away and comes back, and under a per-reversal prior every
+one of those ten steps is charged at full price. The right answer ends
+up thousands of entries down the stretch's own list of candidates, or
+off it altogether.
+
+`--smooth W` trades one prior for the other. With `w = W/(1+W)`, that
+fraction of the cost falls on the *change* in displacement between one
+reversal and the next instead of on its size - a random walk rather than
+white noise, which is the cheapest version of "smooth" the search's
+existing state can express. W = 0 is the per-reversal prior exactly; as
+W grows the question stops being "how far has this reading drifted?" and
+becomes "how abruptly did it get there?".
+
+The effect is measurable. Take a clean 720K image, add the usual 40 ns
+of per-transition jitter, and ease ten consecutive reversals a whole
+cell out of position and back with a raised cosine - which is
+`tests/tools/scp_jitter.py --bump`. One sector fails, two bytes wrong,
+and the true reading sits here in the stretch's candidate list:
+
+| `--smooth` | rank of the true reading |
+|-----------:|-------------------------:|
+| 0          | not enumerated at all    |
+| 4          | 60,164                   |
+| 16         | 13,135                   |
+| 64         | 7,834                    |
+| 256        | 6,912                    |
+
+With the list cut at the usual depth the answer is simply unreachable at
+W = 0; at W = 16 and a deep enough list the tool returns six CRC-valid
+readings that all say the same thing, `0D 0A` where the decoder read
+`10 6A`, and `--apply 0` reproduces the original image byte for byte.
+
+So `--mode auto` does it unprompted: when the ordinary re-binning pass
+comes back with nothing, it runs a second pass with the smooth prior and
+a list long enough to reach the answer. That costs seconds where the
+first pass costs milliseconds, which is why it only happens on failure.
+
+Two honest limits. The first difference is not the whole story - a PLL
+is a second-order loop, so its phase error follows a curve with
+overshoot, and charging *curvature* would need two deviations in the
+search state instead of one and would square the search. And on the six
+real sectors where the true bytes are known independently (LGTC0 9/0 and
+10/0 s12, Sand 24-26/1 s10, Zeus 9/0 s9) the true reading is absent from
+the candidate list at every W tried, because their damage is not a
+re-binnable ambiguity at all - see *The errors that actually happen*.
+
 ### 4. Four engines, ranked on one scale
 
 There are several ways to make a sector's CRC come out right, and they
@@ -654,6 +714,36 @@ Anchored on the damaged sector, not on the whole member: run the decoder
 through the corruption instead and it carries on emitting rubbish, and
 will cheerfully report more bytes "recovered" than the file ever had.
 
+`extract --salvage` writes those bytes out instead of merely counting
+them, member by member, into `<name>.d/`. Each member is judged on its
+own CRC-32, so the ones the damage misses come out whole and *proven*,
+not merely plausible - which is the point of unpacking the archive
+rather than handing back the damaged `.ZIP`.
+
+A half-decompressed file is usually not a file, though. GIF in
+particular is a chain: header, screen descriptor, palette, then blocks
+made of length-prefixed chunks, a zero byte to end each chain, and
+`0x3B` to end the file. Cut that anywhere and a viewer reads a length
+that runs off the end and gives up, often showing nothing at all. Cut it
+at the last whole chunk and write the two bytes that close it off and
+the same bytes become a real, short GIF - the rows that survived are
+drawn and the rest is left blank. On SLAT's `TRAVEL~1.ZIP`:
+
+```
+  TRAVEL~1.ZIP.d/LodgingImg.gif           2530  complete - its own CRC-32 agrees
+  TRAVEL~1.ZIP.d/CurrencyImg.gif          2331  trimmed ... 2331 of 2784 byte(s), and it opens
+  TRAVEL~1.ZIP.d/AutoRentImg.gif          1818  trimmed ... 1818 of 2444 byte(s), and it opens
+  TRAVEL~1.ZIP.d/TripsImg.gif             2074  trimmed ... 2074 of 3194 byte(s), and it opens
+  TRAVEL~1.ZIP.d/TransportImg.gif         1563  trimmed ... 1563 of 2796 byte(s), and it opens
+  TRAVEL~1.ZIP.d/TravelPalReadme.html    26881  26881 of 38958 byte(s) readable before the damage
+```
+
+Four images the survey had written off as lost now open and show 115,
+91, 74 and 45 of their 160 rows, and two thirds of the readme is
+readable text. The ones with nothing left before the damage - here a GIF
+whose own palette is longer than the bytes that survived - are reported
+as such rather than written as a file that will not open.
+
 ### 4d-bis. How much of the sector is actually settled
 
 "256 CRC-valid readings, the top one twice as likely as the next" is
@@ -1149,7 +1239,9 @@ make test        # regression suite, builds its images from the HxC samples
 ## Usage
 
 ```
-disketterecover <command> [options] <image>
+DisketteRecover - CRC-guided flux-level floppy repair (built on libhxcfe)
+
+usage: disketterecover <command> [options] <image>
 
 commands:
   scan     <image>              list every sector and flag CRC failures
@@ -1158,12 +1250,20 @@ commands:
   damage   <image>              flip data bits on purpose (test images)
   serve    <image>              browser UI for inspect + repair
   convert  <image>              write the image out in another format
+  plot     <image>              write an interactive scatter of the flux
+                                transition widths to --out FILE.html
+  extract  <image>              write out the files the disk holds,
+                                deleted ones included
   formats                       list libhxcfe export formats
+
+inspect options:
+  --bytes A:B       zoom in on message bytes A..B - shows the cells, the
+                    flux interval each reversal came from, and the bits
+                    they decode to
 
 selection:
   --sector N        sector index from `scan` (default: first bad CRC)
   --track T --side S --id R     select by physical address instead
-  --all             work through every sector with a CRC error
 
 engine options:
   --mode M          auto | pattern | revs | rebin | bits (default auto)
@@ -1175,14 +1275,29 @@ engine options:
                       bits   : search bit flips (works without flux)
                     auto runs them all and ranks on one scale
   --max-outliers N  pattern engine: bytes allowed off-pattern (24)
-  --restore-only    only consider putting dropped reversals back
-  --dropout-bias N  nats favouring a restored 1 over a removed one (1.6)
+  --dropout-bias N  nats favouring a lost 1 over a gained 1 (1.6)
   --burst-gain G    how much likelier an error is right after another
-                    one (110; 0 turns the burst prior off)
+                    one - errors clump, so a flip beside a flip is one
+                    event, not two (110; 0 turns the burst prior off)
   --burst-len B     bits over which that lift decays (60)
+  --smooth W        how smooth to expect the disturbance to be. A
+                    speck, a scratch or the reader's own PLL acts over
+                    a stretch of track, so the displacement drifts in
+                    and out rather than jumping. W trades the default
+                    prior (each reversal displaced on its own) for
+                    that one: W/(1+W) of the cost falls on the change
+                    in displacement instead of its size. 0 is the
+                    default; auto mode tries 16 on its own when the
+                    ordinary pass comes back empty
+  --restore-only    only consider putting dropped reversals back;
+                    every verified error so far has been a 1 read as 0
   --bin-budget N    nats of timing cost a re-bin may spend (12)
-  --max-ambiguous N refuse to search past this many open intervals (48)
-  --max-explore N   cap on re-binning assignments tested (500000)
+  --max-ambiguous N refuse to search past this many open intervals (40)
+  --rebin-width N   re-readings kept per disturbed stretch (24). A
+                    disturbance spread over many reversals has a long
+                    tail of near-equal re-readings, so the right one
+                    can sit some way down; raise this to go deeper
+  --max-explore N   cap on re-binning assignments tested (2000000)
 
 model options:
   --threshold P     p_err below this is 'assumed good' (default 1e-3)
@@ -1193,15 +1308,56 @@ model options:
   --max-results N   cap on returned candidates (256)
 
 repair options:
+  --all             work through every sector with a CRC error
   --apply K         apply candidate K (0 = most likely) and verify
   --auto            apply candidate 0 only when it clearly wins
   --out FILE        write the patched image
-  --format NAME     export format for --out (default: HXC_HFE)
+  --format NAME     export format for --out (default: hfe)
+
+filesystem options (scan and repair):
+  --fs              say what each bad sector actually is: free space,
+                    a FAT with a second copy on the disk, or so many
+                    bytes of a named file - and, where the file format
+                    carries a checksum of its own, put every candidate
+                    reading to it. Thirty-two bits about the data beats
+                    sixteen about the sector.
+  --from-copy       write the second copy of these bytes that is
+                    already on this disk - the other FAT, or the same
+                    archive entry stored twice - and re-stamp the CRC.
+                    Not a ranking: the archive's CRC-32 confirms it.
+                    (--from-mirror is the same switch.)
+  --from-file F     a copy of the same file from somewhere else -
+                    another disk, an archive, a download. Its bytes
+                    are anchored on the damaged sector's known-good
+                    neighbours, and applied only if they reproduce
+                    the sector's stored CRC.
+  --salvage         extract: also unpack damaged archives, member by
+                    member, into <name>.d/ - a member the damage
+                    missed comes out whole and proven by its own
+                    CRC-32, and the one it hit gives up everything
+                    readable before it (a GIF is trimmed to its last
+                    whole block and closed off, so it still opens)
+  --deleted         extract: include files whose directory entry was
+                    erased - their data is often still there
+  --variants N      write one image per reading: FILE_a1.hfe,
+                    FILE_a2.hfe ... Open them in a disk browser and
+                    see which one's files still make sense.
+
+damage options:
+  --bits a,b,c      message bit indices to flip
+  --slip B:N        shift the sector's cells by N from byte B on, the
+                    way a decoder does when it loses its place
+  --drop-only       only clear bits that read 1, so the damage is a
+                    lost reversal - what real media actually does
+  --out FILE        required
 
 other:
   --set NAME=VALUE  override a libhxcfe setting before loading, e.g.
                     --set FLUXSTREAM_PLL_MAX_ERROR_NS=900 (repeatable)
   --json            machine readable output
+  --port N          port for `serve` (default 842)
+  --bind ADDR       bind address for `serve` (default 127.0.0.1)
+  -v / -vv          libhxcfe chatter
 ```
 
 ### Repairing a whole disk

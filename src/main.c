@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <sys/types.h>
 
 #include "dr_internal.h"
@@ -56,10 +57,23 @@ static const char *usage_text =
 "                    one - errors clump, so a flip beside a flip is one\n"
 "                    event, not two (110; 0 turns the burst prior off)\n"
 "  --burst-len B     bits over which that lift decays (60)\n"
+"  --smooth W        how smooth to expect the disturbance to be. A\n"
+"                    speck, a scratch or the reader's own PLL acts over\n"
+"                    a stretch of track, so the displacement drifts in\n"
+"                    and out rather than jumping. W trades the default\n"
+"                    prior (each reversal displaced on its own) for\n"
+"                    that one: W/(1+W) of the cost falls on the change\n"
+"                    in displacement instead of its size. 0 is the\n"
+"                    default; auto mode tries 16 on its own when the\n"
+"                    ordinary pass comes back empty\n"
 "  --restore-only    only consider putting dropped reversals back;\n"
 "                    every verified error so far has been a 1 read as 0\n"
 "  --bin-budget N    nats of timing cost a re-bin may spend (12)\n"
 "  --max-ambiguous N refuse to search past this many open intervals (40)\n"
+"  --rebin-width N   re-readings kept per disturbed stretch (24). A\n"
+"                    disturbance spread over many reversals has a long\n"
+"                    tail of near-equal re-readings, so the right one\n"
+"                    can sit some way down; raise this to go deeper\n"
 "  --max-explore N   cap on re-binning assignments tested (2000000)\n"
 "\n"
 "model options:\n"
@@ -94,6 +108,12 @@ static const char *usage_text =
 "                    are anchored on the damaged sector's known-good\n"
 "                    neighbours, and applied only if they reproduce\n"
 "                    the sector's stored CRC.\n"
+"  --salvage         extract: also unpack damaged archives, member by\n"
+"                    member, into <name>.d/ - a member the damage\n"
+"                    missed comes out whole and proven by its own\n"
+"                    CRC-32, and the one it hit gives up everything\n"
+"                    readable before it (a GIF is trimmed to its last\n"
+"                    whole block and closed off, so it still opens)\n"
 "  --deleted         extract: include files whose directory entry was\n"
 "                    erased - their data is often still there\n"
 "  --variants N      write one image per reading: FILE_a1.hfe,\n"
@@ -139,6 +159,7 @@ typedef struct {
 	int    frommirror;
 	const char *fromfile;
 	int    deleted;
+	int    salvage;
 	char *const *sets;
 	int    nsets;
 	dr_options opt;
@@ -180,10 +201,12 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--bin-budget")) a->opt.bin_budget = atof(NEXT());
 		else if (!strcmp(o, "--max-explore")) a->opt.max_explore = atol(NEXT());
 		else if (!strcmp(o, "--max-ambiguous")) a->opt.max_ambiguous = atoi(NEXT());
+		else if (!strcmp(o, "--rebin-width")) a->opt.rebin_width = atoi(NEXT());
 		else if (!strcmp(o, "--max-outliers")) a->opt.max_outliers = atoi(NEXT());
 		else if (!strcmp(o, "--dropout-bias")) a->opt.dropout_bias = atof(NEXT());
 		else if (!strcmp(o, "--burst-gain")) a->opt.burst_gain = atof(NEXT());
 		else if (!strcmp(o, "--burst-len"))  a->opt.burst_len  = atof(NEXT());
+		else if (!strcmp(o, "--smooth"))     a->opt.smooth     = atof(NEXT());
 		else if (!strcmp(o, "--restore-only")) a->opt.restore_only = 1;
 		else if (!strcmp(o, "--drop-only")) a->droponly = 1;
 		else if (!strcmp(o, "--mode")) {
@@ -198,6 +221,7 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--auto"))     a->autoapply = 1;
 		else if (!strcmp(o, "--all"))      a->all = 1;
 		else if (!strcmp(o, "--fs"))       a->fs = 1;
+		else if (!strcmp(o, "--salvage")) a->salvage = 1;
 		else if (!strcmp(o, "--deleted"))  a->deleted = 1;
 		else if (!strcmp(o, "--from-mirror") ||
 		         !strcmp(o, "--from-copy")) a->frommirror = 1;
@@ -1828,6 +1852,28 @@ int main(int argc, char **argv)
 				       ff[k].bad ? "CONTAINS DAMAGE - "
 				                 : "",
 				       ff[k].note[0] ? ff[k].note : "ok");
+			}
+			/*
+			 * An archive is a second filesystem in a file, with
+			 * a CRC-32 per member. Unpacking it here means the
+			 * members the damage missed come out whole and
+			 * proven, and the one it hit still gives up
+			 * everything the decompressor reached before it.
+			 */
+			if (a.salvage && ff[k].bad) {
+				dr_fs_member mm[64];
+				char sub[2600];
+				int nm, q;
+
+				snprintf(sub, sizeof(sub), "%s.d", path);
+				mkdir(sub, 0777);
+				nm = dr_fs_salvage(fs, k, sub, mm, 64);
+				for (q = 0; q < nm; q++)
+					printf("    %-24s %8ld  %s\n",
+					       mm[q].name + strlen(a.out) + 1,
+					       mm[q].size, mm[q].note);
+				if (nm <= 0)
+					rmdir(sub);
 			}
 			free(b);
 		}

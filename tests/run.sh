@@ -245,6 +245,36 @@ if command -v python3 >/dev/null 2>&1; then
 	if cmp -s "$out/ref.img" "$out/f3.img"; then ok "flux defect recovered"
 	else bad "flux defect recovered"; fi
 
+	# A disturbance that is spread out rather than pointlike: ten
+	# consecutive reversals eased a whole cell out of place and back
+	# again, which is what a speck or a scratch actually does. The
+	# reading that fixes it has to drift and return, so under a
+	# white-noise prior it is ruinously dear and buried thousands deep
+	# in the stretch's own list; under the smooth prior it is the
+	# likeliest thing on the disk.
+	echo "== flux path: a disturbance spread over ten reversals"
+	python3 "$here/tools/scp_jitter.py" "$out/clean.scp" "$out/bump.scp" \
+	        --sigma 40 --seed 5 --bump 0:4000:10:1.0 >/dev/null
+	check "one bad sector from a smooth bump" \
+	      "$(badcount "$out/bump.scp")" "1"
+
+	n=$("$dr" repair "$out/bump.scp" --sector 0 --mode rebin --json \
+	    2>/dev/null | sed -n 's/^{"count":\([0-9]*\).*/\1/p')
+	check "the white-noise prior alone reaches nothing" "${n:-x}" "0"
+
+	n=$("$dr" repair "$out/bump.scp" --sector 0 --mode rebin \
+	    --smooth 16 --rebin-width 20000 --json 2>/dev/null |
+	    sed -n 's/^{"count":\([0-9]*\).*/\1/p')
+	if [ "${n:-0}" -gt 0 ]; then ok "the smooth prior reaches it ($n)"
+	else bad "the smooth prior reaches it (got '${n:-none}')"; fi
+
+	# and auto mode gets there on its own, without being told
+	"$dr" repair "$out/bump.scp" --sector 0 --apply 0 \
+	      --out "$out/f4.img" --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/ref.img" "$out/f4.img"; then
+		ok "spread disturbance recovered without a flag"
+	else bad "spread disturbance recovered without a flag"; fi
+
 	echo "== the timing model, fitted per region"
 	# One set of coefficients across a sector with a bad patch is wrong
 	# at both ends. The blocks have to cover the sector, hold their own
@@ -489,6 +519,81 @@ PYEOF
 	# same preview thumbnail twice: once live, once under the storage
 	# carrying the PowerPoint 95 copy. Zeus's 9/0 s9 is that case.
 	python3 "$here/tools/mkcfb.py" "$out/deck.ppt" 700
+	# An archive is a filesystem inside a file: every member carries
+	# its own CRC-32, so the damage can be cornered to the one member
+	# it lands in. The rest come out whole and proven, and the one it
+	# hits still gives up its readable prefix - trimmed, for a GIF, to
+	# the last whole block so the picture still opens.
+	echo "== salvaging an archive member by member"
+	python3 - "$out" <<'PYEOF2'
+import os, random, sys, zipfile
+out = sys.argv[1]
+random.seed(11)
+
+
+def gif(w, h, seed):
+    """A real GIF: header, palette, and one LZW image of random rows."""
+    random.seed(seed)
+    hdr = b'GIF89a' + bytes([w & 255, w >> 8, h & 255, h >> 8, 0xF7, 0, 0])
+    pal = bytes(random.randrange(256) for _ in range(3 * 256))
+    desc = b'\x2C' + bytes([0, 0, 0, 0, w & 255, w >> 8, h & 255, h >> 8, 0])
+    # 8-bit pixels, written with a clear code before each literal so no
+    # dictionary is needed: code width stays 9 bits.
+    px = [random.randrange(256) for _ in range(w * h)]
+    bits, acc, nb, body = 9, 0, 0, bytearray()
+    for v in px:
+        for code in (256, v):
+            acc |= code << nb
+            nb += bits
+            while nb >= 8:
+                body.append(acc & 255)
+                acc >>= 8
+                nb -= 8
+    acc |= 257 << nb
+    nb += bits
+    while nb > 0:
+        body.append(acc & 255)
+        acc >>= 8
+        nb -= 8
+    out_ = bytearray(hdr + pal + desc + b'\x08')
+    for i in range(0, len(body), 255):
+        chunk = body[i:i + 255]
+        out_.append(len(chunk))
+        out_ += chunk
+    out_ += b'\x00\x3B'
+    return bytes(out_)
+
+
+with zipfile.ZipFile(os.path.join(out, 'pics.zip'), 'w',
+                     zipfile.ZIP_STORED) as z:
+    z.writestr('first.gif', gif(40, 40, 1))
+    z.writestr('big.gif', gif(64, 200, 2))
+    z.writestr('last.gif', gif(40, 40, 3))
+PYEOF2
+	python3 "$here/tools/mkfat.py" "$out/pics.img" "PICS.ZIP=$out/pics.zip"
+	"$dr" convert "$out/pics.img" --out "$out/pics.hfe" >/dev/null 2>&1
+	# LBA 30 lands in the middle of the second member
+	"$dr" damage "$out/pics.hfe" --track 1 --side 1 --id 4 --drop-only \
+	      --bits 803,1701 --out "$out/pics_bad.hfe" >/dev/null 2>&1
+	check "one bad sector" "$(badcount "$out/pics_bad.hfe")" "1"
+	rm -rf "$out/salv"
+	sv=$("$dr" extract "$out/pics_bad.hfe" --out "$out/salv" --salvage \
+	     2>/dev/null)
+	nw=$(printf '%s\n' "$sv" | grep -c "own CRC-32 agrees" || true)
+	if [ "${nw:-0}" -ge 2 ]; then
+		ok "the members the damage missed come out proven ($nw)"
+	else bad "the members the damage missed come out proven (got $nw)"; fi
+	if printf '%s\n' "$sv" | grep -q "trimmed to the last whole GIF"; then
+		ok "the member it hit is trimmed to a GIF that opens"
+	else bad "the member it hit is trimmed to a GIF that opens"; fi
+	# and what came out really is a GIF, header and trailer both
+	gb="$out/salv/PICS.ZIP.d/big.gif"
+	if [ -s "$gb" ] &&
+	   [ "$(dd if="$gb" bs=1 count=6 2>/dev/null)" = "GIF89a" ] &&
+	   [ "$(tail -c 1 "$gb" | od -An -tx1 | tr -d ' \n')" = "3b" ]; then
+		ok "the trimmed GIF keeps its header and gains a trailer"
+	else bad "the trimmed GIF keeps its header and gains a trailer"; fi
+
 	python3 "$here/tools/mkfat.py" "$out/cfb.img" "DECK.PPT=$out/deck.ppt"
 	"$dr" convert "$out/cfb.img" --out "$out/cfb.hfe" >/dev/null 2>&1
 	"$dr" convert "$out/cfb.hfe" --out "$out/cfb_ref.img" \

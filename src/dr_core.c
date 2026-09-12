@@ -69,6 +69,7 @@ void dr_options_default(dr_options *o)
 	o->burst_gain     = 110.0;
 	o->burst_len      = 60.0;
 	o->crc_budget     = 2;
+	o->smooth         = 0.0;
 }
 
 /* ------------------------------------------------------------------ */

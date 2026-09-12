@@ -1324,14 +1324,22 @@ static int inflate_check(const uint8_t *src, long csz,
  * a well-compressed file that can be a great deal. Sand's Contacts.adx
  * gives up 3,699 of its 58,368 bytes this way.
  *
+ * With `keep` non-NULL the bytes themselves come back in a buffer the
+ * caller owns, so the readable part of a lost file can be written out
+ * rather than merely counted.
+ *
  * Returns the number of bytes recoverable, or -1. */
-static long inflate_prefix(const uint8_t *src, long avail)
+static long inflate_prefix_to(const uint8_t *src, long avail,
+                              uint8_t **keep)
 {
 	z_stream z;
 	uint8_t out[16384];
+	uint8_t *acc = NULL;
 	long total = 0;
 	int rc;
 
+	if (keep)
+		*keep = NULL;
 	if (avail < 2)
 		return -1;
 	memset(&z, 0, sizeof(z));
@@ -1340,17 +1348,111 @@ static long inflate_prefix(const uint8_t *src, long avail)
 	z.next_in = (Bytef *)src;
 	z.avail_in = (uInt)avail;
 	do {
+		long got;
+
 		z.next_out = out;
 		z.avail_out = sizeof(out);
 		rc = inflate(&z, Z_NO_FLUSH);
-		total += (long)(sizeof(out) - z.avail_out);
+		got = (long)(sizeof(out) - z.avail_out);
+		if (keep && got > 0) {
+			uint8_t *na = realloc(acc, (size_t)(total + got));
+			if (!na) {
+				free(acc);
+				acc = NULL;
+				keep = NULL;
+			} else {
+				acc = na;
+				memcpy(acc + total, out, (size_t)got);
+			}
+		}
+		total += got;
 		if (rc != Z_OK && rc != Z_BUF_ERROR)
 			break;
 	} while (z.avail_in || z.avail_out == 0);
 	inflateEnd(&z);
+	if (keep)
+		*keep = acc;
+	else
+		free(acc);
 	return total;
 }
+
+static long inflate_prefix(const uint8_t *src, long avail)
+{
+	return inflate_prefix_to(src, avail, NULL);
+}
 #endif
+
+/*
+ * A half-decompressed image is not a file. GIF in particular is a
+ * chain: header, screen descriptor, palette, then a run of blocks each
+ * of which is itself a chain of length-prefixed chunks, ended by a
+ * zero byte, and the file ends with 0x3B. Cut that chain anywhere and
+ * a viewer has nothing to hold on to - it reads a length byte that
+ * runs off the end and gives up, often showing nothing at all.
+ *
+ * Cutting it at the last chunk boundary and writing the two bytes that
+ * close it off turns the same bytes into a real, short GIF: the rows
+ * that survived are drawn, and the rest is left blank. SLAT's
+ * TransportImg.gif inflates to 2,292 of its 2,796 bytes and shows 48
+ * of its 160 rows this way.
+ *
+ * Returns the length to keep, having appended any terminator into
+ * `buf` (which must have room for two more bytes), or -1 to say this
+ * is not a format it knows how to close.
+ */
+static long gif_close(uint8_t *buf, long n, long full,
+                      char *how, size_t howsz)
+{
+	long p, last;
+
+	if (n < 13 || memcmp(buf, "GIF8", 4) != 0)
+		return -1;
+	p = 13;
+	if (buf[10] & 0x80)                       /* global colour table */
+		p += 3L << ((buf[10] & 7) + 1);
+	if (p >= n)
+		return -1;                        /* not even the palette */
+	last = p;
+	while (p < n) {
+		if (buf[p] == 0x3B)               /* already complete */
+			return p + 1;
+		if (buf[p] == 0x21) {             /* extension */
+			p += 2;
+		} else if (buf[p] == 0x2C) {      /* image descriptor */
+			if (p + 10 > n)
+				break;
+			if (buf[p + 9] & 0x80)    /* local colour table */
+				p += 3L << ((buf[p + 9] & 7) + 1);
+			p += 11;                  /* + LZW minimum code size */
+		} else {
+			break;                    /* not a block we know */
+		}
+		if (p > n)
+			break;
+		while (p < n && buf[p]) {         /* the sub-block chain */
+			long blk = 1 + buf[p];
+
+			if (p + blk > n)
+				break;
+			p += blk;
+			last = p;
+		}
+		if (p >= n || buf[p])
+			break;                    /* chain ran off the end */
+		p++;
+		last = p;
+	}
+	if (last <= 13 || last > n)
+		return -1;
+	buf[last] = 0x00;                         /* end of sub-blocks */
+	buf[last + 1] = 0x3B;                     /* trailer */
+	if (how)
+		snprintf(how, howsz, "trimmed to the last whole GIF block "
+		         "and closed off - %ld of %ld byte(s), and it opens",
+		         last + 2, full);
+	return last + 2;
+}
 
 /* Walk a ZIP's central directory and judge every entry the sector
  * overlaps. A 512-byte sector is bigger than a small archive member and
@@ -2846,6 +2948,205 @@ int dr_fs_files(dr_fs *fs, dr_fs_file *out, int max)
 	free(cl);
 	return n;
 }
+
+#ifndef DR_NO_ZLIB
+/*
+ * Where the first unreadable sector lands inside this file's bytes,
+ * counting only from offset `from`, or -1 if everything from there on
+ * decoded.
+ *
+ * Asking per member rather than per file matters: the damage sits in
+ * one member, and every member after it is as sound as every member
+ * before. Taking the file's first bad sector as the end of the good
+ * data throws away the whole tail of the archive for no reason.
+ */
+static long next_bad_offset(dr_fs *fs, int index, long from)
+{
+	const dr_fs_info *in = &fs->info;
+	int *cl, n, k, j;
+
+	cl = malloc(sizeof(int) * (size_t)(in->clusters + 2));
+	if (!cl)
+		return -1;
+	n = chain(fs, fs->files[index].start, cl, in->clusters + 2);
+	for (k = 0; k < n; k++)
+		for (j = 0; j < in->spc; j++) {
+			long lba, at = (long)k * in->spc * SECSZ +
+			               (long)j * SECSZ;
+
+			if (at + SECSZ <= from)
+				continue;
+			lba = in->data_lba +
+			      (long)(cl[k] - 2) * in->spc + j;
+			if (lba >= 0 && lba < fs->nlba && fs->have[lba] == 2) {
+				free(cl);
+				return at;
+			}
+		}
+	free(cl);
+	return -1;
+}
+
+/* A member name, reduced to something safe to create on disk. */
+static void member_path(char *dst, size_t dstsz, const char *dir,
+                        const uint8_t *nm, int nl)
+{
+	char leaf[256];
+	int i, j = 0;
+
+	for (i = 0; i < nl && i < 255; i++) {
+		int ch = nm[i];
+
+		if (ch == '/' || ch == '\\')
+			j = 0;                   /* keep the last component */
+		else if (ch >= 32 && ch < 127 && ch != ':' && ch != '"')
+			leaf[j++] = (char)ch;
+	}
+	leaf[j] = 0;
+	if (!j)
+		snprintf(leaf, sizeof(leaf), "member");
+	snprintf(dst, dstsz, "%s/%s", dir, leaf);
+}
+
+/*
+ * Write out what is still readable of every member of a damaged
+ * archive.
+ *
+ * A ZIP entry carries a CRC-32 of its own contents, so each member can
+ * be judged on its own: the ones the damage misses come out whole and
+ * proven, and the ones it hits still give up everything the
+ * decompressor had produced before it reached the bad byte. That
+ * prefix is often most of the file - deflate is streaming, so the
+ * damage costs the tail, not the whole thing.
+ *
+ * Returns the number of members written, or -1.
+ */
+int dr_fs_salvage(dr_fs *fs, int index, const char *dir,
+                  dr_fs_member *out, int max)
+{
+	uint8_t *b = NULL;
+	long len = 0, damaged_at, p;
+	int n = 0;
+
+	if (!fs || index < 0 || index >= fs->nfiles || !dir)
+		return -1;
+	b = dr_fs_read(fs, index, &len);
+	if (!b || len < 30) {
+		free(b);
+		return -1;
+	}
+	if (!(b[0] == 'P' && b[1] == 'K' && b[2] == 3 && b[3] == 4)) {
+		free(b);
+		return 0;                       /* not an archive */
+	}
+
+	for (p = 0; p + 30 <= len && (!out || n < max); p++) {
+		long csz, usz, body, got, keep;
+		unsigned long crc;
+		uint8_t *data = NULL;
+		int nl, el, meth, whole;
+		char path[2400], note[200];
+		FILE *f;
+
+		if (!(b[p] == 'P' && b[p+1] == 'K' &&
+		      b[p+2] == 3 && b[p+3] == 4))
+			continue;
+		meth = u16le(b + p + 8);
+		crc  = (unsigned long)b[p+14] | ((unsigned long)b[p+15] << 8) |
+		       ((unsigned long)b[p+16] << 16) |
+		       ((unsigned long)b[p+17] << 24);
+		csz  = (long)b[p+18] | ((long)b[p+19] << 8) |
+		       ((long)b[p+20] << 16) | ((long)b[p+21] << 24);
+		usz  = (long)b[p+22] | ((long)b[p+23] << 8) |
+		       ((long)b[p+24] << 16) | ((long)b[p+25] << 24);
+		nl   = u16le(b + p + 26);
+		el   = u16le(b + p + 28);
+		if ((meth != 0 && meth != 8) || nl < 1 || nl > 255 ||
+		    el > 4096 || csz < 1)
+			continue;
+		body = p + 30 + nl + el;
+		if (body + csz > len)
+			continue;
+
+		/* How much of this member's compressed bytes we trust. */
+		damaged_at = next_bad_offset(fs, index, body);
+		whole = (damaged_at < 0 || damaged_at >= body + csz);
+		if (meth == 0) {
+			long have = whole ? csz : damaged_at - body;
+
+			if (have < 0)
+				have = 0;
+			got = have;
+			data = malloc((size_t)(got + 2));
+			if (data && got)
+				memcpy(data, b + body, (size_t)got);
+		} else {
+			long feed = whole ? csz : damaged_at - body;
+
+			if (feed < 0)
+				feed = 0;
+			got = feed > 1 ? inflate_prefix_to(b + body, feed,
+			                                   &data) : 0;
+			if (got > 0 && data) {
+				uint8_t *rm = realloc(data,
+				                      (size_t)(got + 2));
+				if (rm)
+					data = rm;
+			}
+		}
+		if (got <= 0 || !data) {
+			free(data);
+			continue;
+		}
+
+		keep = got;
+		note[0] = 0;
+		if (whole && got == usz &&
+		    crc32(crc32(0L, NULL, 0), data, (uInt)got) == crc)
+			snprintf(note, sizeof(note),
+			         "complete - its own CRC-32 agrees");
+		else {
+			long cl2 = gif_close(data, got, usz, note,
+			                     sizeof(note));
+
+			if (cl2 > 0)
+				keep = cl2;
+			else
+				snprintf(note, sizeof(note),
+				         "%ld of %ld byte(s) readable before "
+				         "the damage", got, usz);
+		}
+
+		member_path(path, sizeof(path), dir, b + p + 30, nl);
+		f = fopen(path, "wb");
+		if (f) {
+			fwrite(data, 1, (size_t)keep, f);
+			fclose(f);
+			if (out) {
+				snprintf(out[n].name, sizeof(out[n].name),
+				         "%s", path);
+				out[n].size = keep;
+				out[n].full = usz;
+				out[n].whole = (note[0] == 'c');
+				snprintf(out[n].note, sizeof(out[n].note),
+				         "%s", note);
+			}
+			n++;
+		}
+		free(data);
+		p = body + csz - 1;
+	}
+	free(b);
+	return n;
+}
+#else
+int dr_fs_salvage(dr_fs *fs, int index, const char *dir,
+                  dr_fs_member *out, int max)
+{
+	(void)fs; (void)index; (void)dir; (void)out; (void)max;
+	return -1;
+}
+#endif /* DR_NO_ZLIB */
 
 uint8_t *dr_fs_read(dr_fs *fs, int index, long *len)
 {

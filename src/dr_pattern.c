@@ -843,9 +843,9 @@ int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
                    dr_repair_result *out)
 {
 	dr_options defopt;
-	dr_repair_result part[4];
-	dr_mode modes[4] = { DR_MODE_PATTERN, DR_MODE_REVS, DR_MODE_REBIN,
-	                     DR_MODE_BITS };
+	dr_repair_result part[5];
+	dr_mode modes[5] = { DR_MODE_PATTERN, DR_MODE_REVS, DR_MODE_REBIN,
+	                     DR_MODE_BITS, DR_MODE_REBIN };
 	dr_candidate *all = NULL;
 	int nall = 0, i, j, m;
 
@@ -856,8 +856,43 @@ int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
 	memset(out, 0, sizeof(*out));
 	memset(part, 0, sizeof(part));
 
-	for (m = 0; m < 4; m++) {
-		if (modes[m] == DR_MODE_PATTERN)
+	for (m = 0; m < 5; m++) {
+		if (m == 4) {
+			/*
+			 * Second re-binning pass, run only when the first
+			 * came back with nothing.
+			 *
+			 * The first pass charges each reversal's displacement
+			 * on its own, which suits a single transition knocked
+			 * off its cell. A disturbance spread over a dozen
+			 * reversals is a different shape of answer: the
+			 * reading has to drift a long way and come back, and
+			 * under a white-noise prior that is ruinously
+			 * expensive and buried thousands deep in the
+			 * stretch's own list. So if there is nothing to show
+			 * for the first pass, try again with the prior that
+			 * matches a smooth disturbance, and look far enough
+			 * down the list to reach it.
+			 *
+			 * Only on that failure: this costs seconds where the
+			 * first pass costs milliseconds, and when the first
+			 * pass has already found readings they are the ones
+			 * the evidence supports.
+			 */
+			dr_options deep;
+
+			if (part[2].count || opt->smooth > 0.0)
+				continue;
+			if (!v->flux_available ||
+			    v->encoding != DR_ENC_ISO_MFM)
+				continue;
+			deep = *opt;
+			deep.smooth = DR_SMOOTH_SPREAD;
+			if (deep.rebin_width < DR_WIDTH_SPREAD)
+				deep.rebin_width = DR_WIDTH_SPREAD;
+			dr_rebin_search(v, &deep, &part[m]);
+		}
+		else if (modes[m] == DR_MODE_PATTERN)
 			dr_pattern_search(v, opt, &part[m]);
 		else if (modes[m] == DR_MODE_REVS)
 			dr_revs_search(v, opt, &part[m]);
@@ -906,12 +941,12 @@ int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
 	if (nall) {
 		all = malloc((size_t)nall * sizeof(*all));
 		if (!all) {
-			for (m = 0; m < 4; m++)
+			for (m = 0; m < 5; m++)
 				dr_repair_free(&part[m]);
 			return -1;
 		}
 		nall = 0;
-		for (m = 0; m < 4; m++)
+		for (m = 0; m < 5; m++)
 			for (i = 0; i < part[m].count; i++) {
 				int dup = 0;
 				for (j = 0; j < nall && !dup; j++)
@@ -921,7 +956,7 @@ int dr_repair_auto(dr_ctx *c, dr_view *v, const dr_options *opt,
 					all[nall++] = part[m].list[i];
 			}
 	}
-	for (m = 0; m < 4; m++)
+	for (m = 0; m < 5; m++)
 		dr_repair_free(&part[m]);
 
 	out->list = all;

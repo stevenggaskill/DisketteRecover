@@ -14,8 +14,17 @@ plant the kind of defect that actually breaks a sector: a reversal that
 lands close to a cell boundary, so the PLL has to guess and the decoded
 bit stream comes out one bit wrong.
 
+--bump plants the other kind, and the kind real media mostly produces: a
+disturbance spread over many consecutive reversals, easing in and out
+again. A speck under the head, a scratch, a patch of thin oxide and the
+reader's own PLL all act over a stretch of track rather than on one
+transition, and they all move things *gradually*. The profile here is a
+raised cosine, which is as good a stand-in as any for something smooth
+with a beginning and an end.
+
   usage: scp_jitter.py IN.scp OUT.scp [--sigma NS] [--seed N]
                        [--shift TRACK:INDEX:CELLS]
+                       [--bump TRACK:INDEX:COUNT:CELLS]
 """
 import argparse
 import random
@@ -56,6 +65,10 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--shift", default=None, metavar="TRACK:INDEX:CELLS",
                     help="displace one transition by CELLS cell periods")
+    ap.add_argument("--bump", default=None,
+                    metavar="TRACK:INDEX:COUNT:CELLS",
+                    help="displace COUNT consecutive transitions by a "
+                         "raised-cosine profile peaking at CELLS")
     ap.add_argument("--cell-ns", type=float, default=2000.0,
                     help="cell period for --shift (default 2us, MFM DD)")
     args = ap.parse_args()
@@ -72,6 +85,18 @@ def main():
         shift_track = int(parts[0])
         shift_index = int(parts[1])
         shift_cells = float(parts[2])
+
+    bump_track = bump_index = None
+    bump_count = 0
+    bump_cells = 0.0
+    if args.bump:
+        parts = args.bump.split(":")
+        if len(parts) != 4:
+            sys.exit("--bump wants TRACK:INDEX:COUNT:CELLS")
+        bump_track = int(parts[0])
+        bump_index = int(parts[1])
+        bump_count = int(parts[2])
+        bump_cells = float(parts[3])
 
     buf = bytearray(open(src, "rb").read())
     if buf[:3] != b"SCP":
@@ -121,6 +146,28 @@ def main():
                 d = int(round(shift_cells * args.cell_ns / tick_ns))
                 vals[shift_index] = max(1, vals[shift_index] + d)
                 vals[shift_index + 1] = max(1, vals[shift_index + 1] - d)
+                shifted = True
+
+            # A smooth displacement over a run of transitions. The
+            # positions move, not the intervals: each interval takes the
+            # difference between its endpoints' displacements, so the
+            # track's total length is untouched and the disturbance ends
+            # where it began.
+            if (bump_track == tno and bump_index is not None
+                    and 0 < bump_index < len(vals) - bump_count - 2):
+                import math
+                scale = args.cell_ns / tick_ns
+                prev = 0.0
+                for i in range(bump_count + 1):
+                    frac = i / float(bump_count)
+                    disp = bump_cells * 0.5 * (1.0 - math.cos(2.0 * math.pi
+                                                              * frac))
+                    d = disp * scale
+                    j = bump_index + i
+                    vals[j] = max(1, int(round(vals[j] + d - prev)))
+                    prev = d
+                vals[bump_index + bump_count + 1] = max(
+                    1, int(round(vals[bump_index + bump_count + 1] - prev)))
                 shifted = True
 
             enc = write_flux(vals)

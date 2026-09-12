@@ -674,6 +674,8 @@ struct ctx {
 	 * the DP state alone: how far the reading has drifted from the
 	 * measurements by the time it reaches interval j having spent
 	 * `dev` extra cells. */
+	double        w_pos;      /* weight on displacement (white noise) */
+	double        w_dev;      /* weight on its change (a random walk) */
 	double       *cum_meas;   /* measured cells before interval j     */
 	double       *cum_pll;    /* cells the decoder assigned, same     */
 };
@@ -691,7 +693,58 @@ static double pos_cost(const struct ctx *X, int j, int dev)
 	double r = X->cum_meas[j] - (X->cum_pll[j] + (double)dev);
 	double z = r / X->t.sigma_pos;
 
-	return 0.5 * z * z;
+	return X->w_pos * 0.5 * z * z;
+}
+
+/*
+ * What a disturbance is allowed to look like.
+ *
+ * pos_cost() charges each reversal's displacement on its own, which is
+ * to say it models the error as white noise. Physically it is nothing
+ * of the kind. Whatever moved these reversals - a speck lifting the
+ * head, a scratch, a patch of thin oxide, the drive's own speed wander -
+ * acts over a stretch of track, so the displacement drifts in and out
+ * gradually rather than jumping about from one reversal to the next.
+ * The reader's PLL behaves the same way: it is a second-order loop, so
+ * its phase error follows a smooth curve, overshoot and all, and cannot
+ * step.
+ *
+ * So the prior is a blend of the two, set by --smooth W:
+ *
+ *     w_pos = 1/(1+W)   charges displacement       (white noise)
+ *     w_dev = W/(1+W)   charges *change* in it     (a random walk)
+ *
+ * W = 0 is the old behaviour exactly. As W grows the cost stops asking
+ * "how far has this reading drifted?" and starts asking "how abruptly
+ * did it get there?", which is the question the physics actually
+ * answers. That is not a tie-breaker bolted on top: it is what lets a
+ * reading drift a whole cell and back across a dozen reversals for
+ * roughly the price white noise charges for one, which is the only way
+ * a smooth disturbance is ever affordable. Charging both at full weight
+ * - adding the smoothness term to an unchanged displacement term - can
+ * only ever make such a reading dearer, never reachable.
+ *
+ * Both weights fall out of the same scale, so the total stays
+ * comparable across W and the two ends remain proper log-likelihoods:
+ * white noise on the displacements, or white noise on their first
+ * difference.
+ *
+ * (The full second-order story would charge curvature rather than
+ * slope, which needs two deviations in the state instead of one and
+ * squares the search. The first difference gets most of it: it is what
+ * stops a run of intervals being re-binned in alternating directions.)
+ */
+static double smooth_cost(const struct ctx *X, int j0, int dev0,
+                          int j1, int dev1)
+{
+	double r0, r1, z;
+
+	if (X->w_dev <= 0.0)
+		return 0.0;
+	r0 = X->cum_meas[j0] - (X->cum_pll[j0] + (double)dev0);
+	r1 = X->cum_meas[j1] - (X->cum_pll[j1] + (double)dev1);
+	z = (r1 - r0) / X->t.sigma_pos;
+	return X->w_dev * 0.5 * z * z;
 }
 
 /* Turn a chain of decisions into transition positions, decode the bytes
@@ -819,7 +872,7 @@ static int cmp_runcand(const void *a, const void *b)
 
 /* Enumerate the best re-readings of one disturbed stretch. */
 static int run_search(struct ctx *X, int first, int last,
-                      long budget_nodes, runset *rs)
+                      long budget_nodes, int want, runset *rs)
 {
 	int M = last - first + 1;
 	double *h = NULL;
@@ -923,7 +976,7 @@ static int run_search(struct ctx *X, int first, int last,
 
 		if (nodes++ > budget_nodes)
 			break;
-		if (rs->n >= RUN_CANDS)
+		if (rs->n >= want)
 			break;
 
 		if (s.j == M) {
@@ -980,7 +1033,9 @@ static int run_search(struct ctx *X, int first, int last,
 			if (ns < 0 || ns >= DEV_SPAN)
 				continue;
 			PUSH(0, k, 0, s.j + 1, ns,
-			     s.g + pos_cost(X, first + s.j + 1, ns - MAX_DEV));
+			     s.g + pos_cost(X, first + s.j + 1, ns - MAX_DEV)
+			     + smooth_cost(X, first + s.j, s.s - MAX_DEV,
+			                   first + s.j + 1, ns - MAX_DEV));
 		}
 		{
 			int k1, k2;
@@ -991,7 +1046,11 @@ static int run_search(struct ctx *X, int first, int last,
 					continue;
 				PUSH(1, k1, k2, s.j + 1, ns,
 				     s.g + pos_cost(X, first + s.j + 1,
-				                    ns - MAX_DEV) + X->p_drop);
+				                    ns - MAX_DEV) + X->p_drop
+				     + smooth_cost(X, first + s.j,
+				                   s.s - MAX_DEV,
+				                   first + s.j + 1,
+				                   ns - MAX_DEV));
 			}
 		}
 		if (s.j + 1 < M) {
@@ -1003,7 +1062,11 @@ static int run_search(struct ctx *X, int first, int last,
 					continue;
 				PUSH(2, k, 0, s.j + 2, ns,
 				     s.g + pos_cost(X, first + s.j + 2,
-				                    ns - MAX_DEV) + X->p_spur);
+				                    ns - MAX_DEV) + X->p_spur
+				     + smooth_cost(X, first + s.j,
+				                   s.s - MAX_DEV,
+				                   first + s.j + 2,
+				                   ns - MAX_DEV));
 			}
 		}
 		#undef PUSH
@@ -1032,6 +1095,7 @@ int dr_rebin_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 	dr_candidate *found = NULL;
 	int nfound = 0, fcap = 0;
 	int i, j, rc = 0;
+	int want_cands;
 	long explored = 0;
 	double period = 0.0;
 
@@ -1068,6 +1132,12 @@ int dr_rebin_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 		return 0;
 	}
 
+	{
+		double w = opt->smooth > 0.0 ? opt->smooth : 0.0;
+
+		X.w_pos = 1.0 / (1.0 + w);
+		X.w_dev = w / (1.0 + w);
+	}
 	X.cum_meas = malloc((size_t)(X.niv + 2) * sizeof(double));
 	X.cum_pll  = malloc((size_t)(X.niv + 2) * sizeof(double));
 	if (!X.cum_meas || !X.cum_pll) {
@@ -1176,11 +1246,21 @@ int dr_rebin_search(dr_view *v, const dr_options *opt, dr_repair_result *out)
 			out->current_cost += dr_bin_cost(&X.t, i, X.iv[i].adj,
 			                                 X.iv[i].gap);
 
+	/*
+	 * How deep to go down each stretch's own list. Working out more
+	 * re-readings than the joint merge will ever look at is wasted
+	 * effort, and stopping short of what it will look at is a search
+	 * that quietly gives up - so the two are the same number, floored
+	 * at the old fixed depth so nothing gets shallower than it was.
+	 */
+	want_cands = opt->rebin_width > RUN_CANDS ? opt->rebin_width
+	                                          : RUN_CANDS;
+
 	/* ---- enumerate re-readings of each stretch ------------------- */
 	for (i = 0; i < nruns; i++) {
 		if (run_search(&X, runs[i].first, runs[i].last,
 		               opt->max_explore / (nruns ? nruns : 1),
-		               &runs[i]) < 0) {
+		               want_cands, &runs[i]) < 0) {
 			rc = -1;
 			goto done;
 		}
