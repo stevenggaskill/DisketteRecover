@@ -640,6 +640,20 @@ between `AB CD`s are exactly 56, where the runner-up - a pair whose
 modal gap of 69 is pure coincidence, and which an earlier version of
 this happily took instead - manages 66%.
 
+**A member that cannot be repaired is not always a total loss.** A
+deflate stream cannot be decoded from the middle, so a bad sector
+normally costs an archive member from that point on - but not before it.
+Feeding the decoder only the bytes that precede the damage yields
+everything it had produced by then, and the survey says so:
+
+```
+lost: Contacts.adx (3699 of 58368 byte(s) still readable)
+```
+
+Anchored on the damaged sector, not on the whole member: run the decoder
+through the corruption instead and it carries on emitting rubbish, and
+will cheerfully report more bytes "recovered" than the file ever had.
+
 ### 4d-bis. How much of the sector is actually settled
 
 "256 CRC-valid readings, the top one twice as likely as the next" is

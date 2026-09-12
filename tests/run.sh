@@ -557,6 +557,22 @@ open(sys.argv[2],'wb').write(bytes(d))
 	     sed -n 's/.*\([0-9][0-9]*\) of \([0-9][0-9]*\) archive member.*/\1 of \2/p')
 	check "...and an undamaged one comes out whole" "$iv" "1 of 1"
 
+	echo "== what survives inside a damaged archive member"
+	# A deflate stream cannot be decoded from the middle, so a bad
+	# sector costs the member from that point on - but not before it.
+	# Two bad sectors, so that nothing can put the member back.
+	"$dr" damage "$out/fs_bad.hfe" --track 1 --side 0 --id 5 --drop-only \
+	      --bits 803,1701,2743 --out "$out/fs_bad2.hfe" >/dev/null 2>&1
+	sv=$("$dr" scan "$out/fs_bad2.hfe" --fs 2>/dev/null |
+	     sed -n 's/.*lost: [^(]*(\([0-9]*\) of \([0-9]*\) byte(s) still readable.*/\1 \2/p' |
+	     head -1)
+	set -- $sv
+	if [ "${1:-0}" -gt 0 ] && [ "${1:-0}" -lt "${2:-1}" ]; then
+		ok "the part before the damage is still readable ($1 of $2)"
+	else
+		bad "the part before the damage is still readable ($sv)"
+	fi
+
 	echo "== a second copy of the archive's own directory"
 	# An archiver that rewrites a file leaves the old central directory
 	# behind inside it. When a mark destroys a member's local header,

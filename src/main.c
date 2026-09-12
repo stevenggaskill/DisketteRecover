@@ -1117,6 +1117,8 @@ static void print_referee(dr_ctx *c, dr_view *v, dr_repair_result *r,
 		if (bestnote[0] && bestscore > 0.0)
 			printf("            The closest any of them came: "
 			       "%s\n", bestnote);
+		else if (note[0])
+			printf("            %s\n", note);
 	} else if (kept == tested)
 		printf("            all %d of them do; this check cannot "
 		       "separate them.\n", tested);

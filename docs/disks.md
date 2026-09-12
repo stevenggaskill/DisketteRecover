@@ -231,6 +231,51 @@ Twenty bytes and five bytes. In an uncompressed file that would be a
 small loss; inside a compressed stream it is the end of it from that
 point on. The backups either side of each - four of the six - are whole.
 
+## Sand's Contacts.adx, and what half a deflate stream is worth
+
+Sand's last sector is inside `Contacts.adx` in `CONTACTS.ZIP`, and the
+short answer is that the disk already holds the file: `CONTAC~1.ZIP`, the
+earlier backup, carries a complete, CRC-verified copy of it. But the
+newer one is worth an entry here for what it shows about salvage.
+
+The sector's own checksum is intact - 0.028 bits in doubt - so the true
+reading does satisfy it. So do hundreds of others: 245 from the bit
+search, **568** from a 40-million-assignment re-reading of the flux, and
+the archive's CRC-32 refutes every one. The readings agree with each
+other on 501 of the sector's 512 bytes, which sounds like the damage is
+eleven bytes wide; since none of them works, at least one of the 501
+they agree on must be wrong too. That is the limit of what agreement
+among readings can tell you.
+
+What can still be had is the part of the member *before* the damage. A
+deflate stream cannot be decoded from the middle - the Huffman tables
+and the 32 KB window are both state - but feeding the decoder only the
+275 compressed bytes that precede the bad sector yields every byte it
+had produced by then:
+
+```
+lost: Contacts.adx (3699 of 58368 byte(s) still readable)
+```
+
+Those 3,699 bytes agree with the older backup's copy on **3,695** of
+them. Four bytes differ. The two versions of this contacts database are
+the same file with a little added.
+
+Going further by hand: the newer member is two deflate blocks, and the
+second one - the last 9,724 bytes of the file - lies entirely past the
+damage. Scanning the intact tail bit by bit finds exactly one offset
+(compressed byte 4772, bit 5) that parses as a block header, decodes
+1,991 symbols with a realistic mix of 1,222 literals and 769 matches,
+ends cleanly on an end-of-block, and consumes the stream to its last
+byte. Decoding it recovers those 9,724 bytes - except where its
+back-references reach into the missing region. Tracking that byte by
+byte, 2,094 of them trace to literals inside the block and are certain,
+in runs of up to 714 bytes.
+
+That last step is done by hand here, not by the tool. What the tool does
+is the part that generalises: say how much of a lost member is still
+readable, rather than writing it off.
+
 ## Teres's Quicken files, and what the records say
 
 Teres's three remaining sectors are in `QDATA.QDB`, `QDATA.QSD` and
