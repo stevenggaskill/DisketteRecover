@@ -744,6 +744,35 @@ readable text. The ones with nothing left before the damage - here a GIF
 whose own palette is longer than the bytes that survived - are reported
 as such rather than written as a file that will not open.
 
+### 4d-i-bis. Another build of the same program, on the same disk
+
+An install disk ships the same driver several times over - one build per
+chipset, per resolution, per version - and two builds of the same
+program are usually identical for long stretches. Where a damaged sector
+falls inside such a stretch, the other file on the disk holds the bytes.
+
+The test is a *contiguous* run of agreement on each side of the damage,
+at the same offset, not a percentage, and that distinction does all the
+work. On VGAW:
+
+```
+second copy: 'WD6A.3EX' on this same disk runs identical to 'WD74.3EX' for 8704
+             byte(s) before this sector and 8705 after - a second build of the
+             same code; its bytes for this sector are offered to the stored CRC
+             and they reproduce this sector's stored CRC - proven
+```
+
+Every other pair of files on that disk manages at most 22 contiguous
+bytes - including two that match on 90% of their bytes overall. A
+percentage would have called several of them siblings; an unbroken run
+says the two files are the same code *here*, not merely similar.
+
+That is evidence, not proof, so the bytes are put to the sector's own
+CRC before anything is written. Where the damage spared those sixteen
+bits they settle it: 512 bytes carrying the right CRC by accident is a
+one-in-65536 coincidence, and these are not arbitrary bytes. Where the
+CRC is damaged too, the tool says so and writes nothing.
+
 ### 4d-ii. Sound is smooth too
 
 The smoothness argument that shapes the flux search applies a level up,

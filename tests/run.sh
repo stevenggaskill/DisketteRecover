@@ -594,6 +594,50 @@ PYEOF2
 		ok "the trimmed GIF keeps its header and gains a trailer"
 	else bad "the trimmed GIF keeps its header and gains a trailer"; fi
 
+	# Install disks ship the same driver several times over, one build
+	# per chipset or resolution, and two builds of the same program run
+	# identical for long stretches. Where the damage lands inside such
+	# a stretch the other file holds the bytes - and the sector's own
+	# CRC, where the damage spared it, turns that into proof.
+	echo "== another build of the same program, on the same disk"
+	python3 - "$out" <<'PYEOF4'
+import os, random, sys
+out = sys.argv[1]
+random.seed(23)
+a = bytearray(random.randrange(256) for _ in range(40000))
+b = bytearray(a)
+# two regions where the builds genuinely differ, far from the damage at
+# file offset 3072 - so the unbroken run either side of it is long
+for lo, n in ((100, 300), (36000, 900)):
+    for i in range(lo, lo + n):
+        b[i] = random.randrange(256)
+open(os.path.join(out, "bld_a.bin"), "wb").write(bytes(a))
+open(os.path.join(out, "bld_b.bin"), "wb").write(bytes(b))
+PYEOF4
+	python3 "$here/tools/mkfat.py" "$out/sib.img" \
+	        "DRVA.SYS=$out/bld_a.bin" "DRVB.SYS=$out/bld_b.bin"
+	"$dr" convert "$out/sib.img" --out "$out/sib.hfe" >/dev/null 2>&1
+	"$dr" convert "$out/sib.hfe" --out "$out/sib_ref.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	"$dr" damage "$out/sib.hfe" --track 1 --side 0 --id 3 --drop-only \
+	      --bits 803,1701,2743 --out "$out/sib_bad.hfe" >/dev/null 2>&1
+	check "one bad sector" "$(badcount "$out/sib_bad.hfe")" "1"
+	sb=$("$dr" repair "$out/sib_bad.hfe" --from-copy 2>&1 |
+	     grep -c "runs identical to" || true)
+	if [ "${sb:-0}" -ge 1 ]; then
+		ok "the other build on the disk is found"
+	else bad "the other build on the disk is found"; fi
+	sp=$("$dr" repair "$out/sib_bad.hfe" --from-copy 2>&1 |
+	     grep -c "reproduce this sector.s stored CRC - proven" || true)
+	if [ "${sp:-0}" -ge 1 ]; then
+		ok "and its bytes are proven by the sector's own CRC"
+	else bad "and its bytes are proven by the sector's own CRC"; fi
+	"$dr" repair "$out/sib_bad.hfe" --from-copy --out "$out/sib_fix.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/sib_ref.img" "$out/sib_fix.img"; then
+		ok "the recovered bytes match the original exactly"
+	else bad "the recovered bytes match the original exactly"; fi
+
 	# A boot sector too damaged to parse costs the whole disk: it holds
 	# the map. The layout is rebuilt from the geometry the dump reports
 	# and checked against where it says the root directory is.

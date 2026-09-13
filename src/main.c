@@ -1319,6 +1319,32 @@ static void print_consensus(dr_view *v, dr_repair_result *r)
 
 /* Run the engine cascade for one sector and report in one line.
  * Returns 1 if the sector was repaired and verified. */
+/*
+ * Does this candidate payload reproduce the sector's own stored CRC?
+ *
+ * A second copy found by inference - another build of the same program,
+ * say - is evidence and not proof. The sector's sixteen bits, where the
+ * damage spared them, turn it into proof: 512 bytes that happen to
+ * carry the right CRC by chance is a one-in-65536 accident, and these
+ * are not 512 arbitrary bytes but a specific file's.
+ */
+static int payload_matches_crc(dr_view *v, const uint8_t *data)
+{
+	uint8_t *msg;
+	uint16_t k;
+
+	if (!v || !v->msg || v->msg_len < 2 || v->crc_suspect)
+		return 0;
+	msg = malloc((size_t)v->msg_len);
+	if (!msg)
+		return 0;
+	memcpy(msg, v->msg, (size_t)v->msg_len);
+	memcpy(msg + v->data_offset, data, (size_t)v->data_len);
+	k = dr_crc16(msg, v->msg_len - 2);
+	free(msg);
+	return k == v->stored_crc;
+}
+
 /* Does the file above this sector say the reading cannot be right? */
 static int refuted_by_file(dr_ctx *c, dr_view *v, const dr_candidate *cand,
                            int idx)
@@ -1499,11 +1525,23 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply,
 		else if (!proven && m)
 			proven = 3;
 		if (!m && fs && dr_fs_locate(fs, c, idx, &loc) == 0 &&
-		    v->data_len == (int)sizeof(sis) &&
-		    dr_fs_sister(fs, &loc, sis, v->data_len, how,
-		                 (int)sizeof(how)) == 1) {
-			m = sis;
-			proven = 2;
+		    v->data_len == (int)sizeof(sis)) {
+			int sr = dr_fs_sister(fs, &loc, sis, v->data_len, how,
+			                      (int)sizeof(how));
+
+			/*
+			 * 1 is a copy that proved itself - an archive
+			 * member's own CRC-32, a compound document's twin
+			 * stream. 2 is a copy found by inference, another
+			 * build of the same program on the same disk, and
+			 * that one has to satisfy the sector's own CRC
+			 * before it is written.
+			 */
+			if (sr == 1 || (sr == 2 &&
+			                payload_matches_crc(v, sis))) {
+				m = sis;
+				proven = 2;
+			}
 		}
 		if (m && dr_set_data(c, v, m, v->data_len) == 0) {
 			char *semi = strchr(how, ';');
@@ -2430,6 +2468,20 @@ int main(int argc, char **argv)
 						if (sr == 1) {
 							m = sis;
 							proven = 1;
+						} else if (sr == 2 &&
+						           payload_matches_crc(v, sis)) {
+							printf("             and "
+							       "they reproduce this "
+							       "sector's stored CRC "
+							       "- proven\n");
+							m = sis;
+							proven = 1;
+						} else if (sr == 2) {
+							printf("             but "
+							       "they do not reproduce "
+							       "this sector's stored "
+							       "CRC, so the two builds "
+							       "differ here too\n");
 						}
 					}
 				}

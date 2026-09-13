@@ -2167,6 +2167,90 @@ static uint8_t *assemble_file(dr_fs *fs, int f, long *out_len)
 
 #define MAXENT 512
 
+/* A sibling has to agree for this long on each side to be believed. */
+#define SIB_NEED 2048
+
+/*
+ * Another file on the same disk that is very nearly this one.
+ *
+ * Install disks ship the same driver several times over - one build per
+ * resolution, per chipset, per version - and two builds of the same
+ * program are usually identical for long stretches. Where a damaged
+ * sector falls inside such a stretch, the other file holds the bytes.
+ *
+ * The test is a *contiguous* run of agreement on each side of the
+ * damage, at the same offset, not a percentage. That distinction does
+ * all the work. On VGAW, WD74.3EX and WD6A.3EX run identical for 8,704
+ * bytes before the damaged sector and 8,705 after; every other pair of
+ * files on that disk - including two that match on 90% of their bytes -
+ * manages at most 22. A percentage would have called several of them
+ * siblings. An unbroken run says the two files are the same code here,
+ * not merely similar overall.
+ *
+ * This is evidence, not proof, so it returns 2: "here are the bytes,
+ * now put them to the sector's own CRC". On VGAW that CRC agreed, and
+ * the sector was recovered exactly.
+ */
+static int sibling_file(dr_fs *fs, int self, const dr_fs_loc *loc,
+                        const uint8_t *mine, long mlen,
+                        uint8_t *out, int len, char *how, size_t howsz)
+{
+	long at = loc->file_offset;
+	long best = -1, best_back = 0, best_fwd = 0;
+	int j, bestj = -1;
+	uint8_t *theirs = NULL, *keep = NULL;
+	long tlen = 0, keeplen = 0;
+
+	if (at < SIB_NEED || at + len > mlen)
+		return -1;
+
+	for (j = 0; j < fs->nfiles; j++) {
+		long back = 0, fwd = 0, lim;
+
+		if (j == self || fs->files[j].deleted)
+			continue;
+		free(theirs);
+		theirs = assemble_file(fs, j, &tlen);
+		if (!theirs || tlen < at + len)
+			continue;
+
+		while (back < 65536 && at - 1 - back >= 0 &&
+		       mine[at - 1 - back] == theirs[at - 1 - back])
+			back++;
+		lim = mlen < tlen ? mlen : tlen;
+		while (fwd < 65536 && at + len + fwd < lim &&
+		       mine[at + len + fwd] == theirs[at + len + fwd])
+			fwd++;
+		if (back < SIB_NEED || fwd < SIB_NEED)
+			continue;
+		if (back + fwd > best) {
+			best = back + fwd;
+			best_back = back;
+			best_fwd = fwd;
+			bestj = j;
+			free(keep);
+			keep = theirs;
+			keeplen = tlen;
+			theirs = NULL;
+		}
+	}
+	free(theirs);
+	if (bestj < 0) {
+		free(keep);
+		return -1;
+	}
+	(void)keeplen;
+	memcpy(out, keep + at, (size_t)len);
+	snprintf(how, howsz,
+	         "'%s' on this same disk runs identical to '%s' for %ld "
+	         "byte(s) before this sector and %ld after - a second build "
+	         "of the same code; its bytes for this sector are offered "
+	         "to the stored CRC",
+	         fs->files[bestj].name, loc->file, best_back, best_fwd);
+	free(keep);
+	return 2;
+}
+
 int dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc, uint8_t *out, int len,
                  char *how, int howsz)
 {
@@ -2196,9 +2280,13 @@ int dr_fs_sister(dr_fs *fs, const dr_fs_loc *loc, uint8_t *out, int len,
 	na = zip_entries(mine, mlen, a, MAXENT);
 	if (!na) {
 		/* Not an archive - but a compound document keeps its own
-		 * second copy, and it is the same idea. */
+		 * second copy, and it is the same idea. Failing that, the
+		 * disk may carry another build of the same program. */
 		rc = cfb_twin(mine, mlen, loc->file_offset, len, out,
 		              how, (size_t)howsz);
+		if (rc < 0)
+			rc = sibling_file(fs, self, loc, mine, mlen, out,
+			                  len, how, (size_t)howsz);
 		goto out;
 	}
 

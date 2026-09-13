@@ -30,17 +30,19 @@ failure was misleading.
 | nVid32b  | 2898 |  8 | **0** | - | an nVidia IDE/RAID driver disk. All 8 are **sector 6** on tracks 69-77, both sides - one radial mark - and all in **free space**. Nothing lost |
 | SB16_InD2| 2882 |  6 | 6 | **1** | Sound Blaster 16 install disk 2. All 6 are **sector 15** on tracks 67-79: four in `_INST32I.EX_`, two in `S_16_44.WAV`. The WAV is uncompressed PCM, so the waveform is its own referee - and it refutes every CRC-valid reading of both, the closest being 13x and 176x rougher than the audio either side |
 | SB32_ID  | 2882 |  1 | **0** | - | an AWE32 install disk. One bad sector, in **free space**, repaired. Nothing lost |
-| **total** | **47820** | **102** | **36** | **11** | |
+| VGAW     | 2874 | 24 | 21 | **11** | a video-card driver disk, and the most radially scarred yet: sector 10 across tracks 11-16 and 34-36, sector 18 across 43-45 and 51-54, sector 1 across 51-58, sector 8 on tracks 0-1. Ten sectors repaired outright; an eleventh came from **another build of the same driver on the same disk** - `WD6A.3EX` runs identical to `WD74.3EX` for 8,704 bytes before the damaged sector and 8,705 after, and its bytes reproduce the sector's own CRC. Both copies of one FAT sector are damaged, in the same place |
+| 2CIV     | 2881 |  1 | **0** | - | a Civilization installer disk, 64 files. The one bad sector is on track 80, past the last formatted track - **not a damaged disk at all**. Nothing lost |
+| **total** | **53575** | **127** | **57** | **22** | |
 
-Ten of the eighteen disks - Disk 1, GasAcc, Scott, Ron, SLAW, DisComp,
-3COME, UUDVD, nVid32b and SB32_ID - lost nothing at all, and LGTC0
-joins them once the outside copy of its driver is applied. That is not
+Eleven of the twenty disks - Disk 1, GasAcc, Scott, Ron, SLAW, DisComp,
+3COME, UUDVD, nVid32b, SB32_ID and 2CIV - lost nothing at all, and
+LGTC0 joins them once the outside copy of its driver is applied. That is not
 visible from the CRC; it is visible from the filesystem.
 
-The five driver and install disks also show what damage to a floppy
-actually looks like. On nVid32b every bad sector is sector 6, on tracks
-69 to 77, on both sides; on SB16 every one is sector 15, on tracks 67 to
-79. That is not eight independent failures and six more: it is one mark
+The driver and install disks also show what damage to a floppy actually
+looks like. On nVid32b every bad sector is sector 6, on tracks 69 to 77,
+on both sides; on SB16 every one is sector 15, on tracks 67 to 79; VGAW
+carries four such marks at once. That is not eight independent failures and six more: it is one mark
 at one angular position, crossing every track it passes under. The
 damage is radial, which is the same observation that the flux search's
 smoothness prior rests on, a millimetre further out.
@@ -72,6 +74,7 @@ the outside of the disk has already eaten.
 | LGTC0 | `9/0 s12`, `10/0 s12` | the same build of the file, from outside the disk | anchored on the sector's clean neighbours: 65,536 bytes of agreement before and 17,958 / 61,494 after, and the repaired file then matches the known-good copy byte for byte |
 | Zeus | `9/0 s9` | the same stream, stored twice inside the same `.ppt` | the twin matches for 8581 bytes either side of the damage, and with its 512 in place the preview metafile's 727 records tile exactly |
 | UUDVD | *the whole disk* | the layout rebuilt from the dump's own geometry, then the file read straight on from its start - both FATs are blank | the archive's central directory agrees with all six of its local headers, and all six members pass their CRC-32 |
+| VGAW | `52/1 s18` | `WD6A.3EX`, another build of the same driver, on the same disk | identical for 8,704 bytes before the sector and 8,705 after, and its bytes reproduce the sector's stored CRC |
 | SLAT | `RotatingGlobeAnimation.gif` | the archive stored the same animation twice, under two names | the stale copy of the archive's own central directory is the only thing that knows the second name; its packed bytes inflate to CRC-32 `E16CA998` |
 | Disk 2, LGTC0, Scott | 4 sectors | the search, applied on a clear margin | libhxcfe re-decode reads them clean |
 
