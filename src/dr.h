@@ -292,6 +292,23 @@ typedef struct {
 	                        /* never on one reversal. 0 turns it off. */
 } dr_options;
 
+/*
+ * Does this image carry the CRCs the drive actually read, or were they
+ * made up when it loaded?
+ *
+ * A sector image - .img, .ima, a raw dump - records the bytes a dumper
+ * managed to read and throws away which of them it was sure about. The
+ * MFM and its CRCs are then synthesised from those bytes at load time,
+ * so every sector reads clean by construction and "0 sector(s) with a
+ * CRC error" means nothing at all. A bitcell or flux image (HFE, SCP,
+ * KryoFlux streams) carries the original encoding, CRCs included.
+ *
+ * Returns 1 when the CRCs are the disk's own, 0 when they were
+ * manufactured on load, -1 if it cannot tell.
+ */
+int         dr_crcs_are_real(dr_ctx *c);
+const char *dr_loader_name(dr_ctx *c);
+
 void        dr_options_default(dr_options *o);
 
 /* ------------------------------------------------------------------ */
@@ -549,6 +566,12 @@ typedef struct {
 	int  whole;             /* its own CRC-32 agrees                */
 	char note[200];
 } dr_fs_member;
+
+/* Is this file internally consistent, by whatever check its own format
+ * carries? 1 = the format vouches for it, 0 = the format says it is
+ * damaged, -1 = the format carries nothing to ask. Independent of the
+ * sector CRC, so it is the only thing a sector image can be held to. */
+int         dr_fs_verify(dr_fs *fs, int index, char *how, size_t howsz);
 
 int         dr_fs_salvage(dr_fs *fs, int index, const char *dir,
                           dr_fs_member *out, int max);

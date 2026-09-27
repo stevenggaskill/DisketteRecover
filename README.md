@@ -856,6 +856,62 @@ three bad sectors on that disk are in block 15 of 99: blocks 0-14 decode
 and the remaining 84 cannot be picked up again. The referee that
 identifies the block is what makes that difference visible at all.
 
+### 4d-i-quinquies. What a sector image can still be held to
+
+Not every dump carries flux. An `.img` or `.ima` is a sector image: it
+records the bytes a dumper managed to read and throws away which of them
+it was sure about. The MFM and its CRCs are then *manufactured* from
+those bytes when the image loads, so every sector reads clean by
+construction. "0 sector(s) with a CRC error" on such a file is the
+absence of evidence, and reporting it as a clean disk is a lie the tool
+used to tell:
+
+```
+note      : this is a sector image (RAW_IMG), not a flux or bitcell dump. Its
+            CRCs were computed from its own bytes when it loaded, so they
+            cannot disagree with them - the count above is not a verdict on
+            the disk. Which sectors actually read is not in the file.
+            What can still be checked is inside the data: try --verify.
+```
+
+The loaders are listed the way round that fails safe: only the ones
+known to carry the disk's own encoding (KryoFlux streams, SCP, IPF, the
+HFE family, MFI, DMK, STX/STW) are trusted, and anything else is assumed
+to be a sector image. An unrecognised loader then gets the warning
+rather than a false clean bill.
+
+And `--verify` is what is left. Every check that lives *inside* the data
+survives the trip through any dumper - an archive member's CRC-32, a
+cabinet block's 32-bit checksum, a compound document's twin streams, a
+record list that has to be ordered and in range - and on install media
+those are stronger than the sixteen bits the image threw away. On two
+1990s installer disks supplied as plain images:
+
+```
+  GWARC1           459437 byte(s)  no bad sector - intact
+             VERIFIED: installer archive (first member 'COMMDLG.DLL'): its chain
+             of 17 member(s) tiles the file exactly - structure sound, though
+             this says nothing about the compressed bytes inside
+
+verified by the files' own formats: 4 pass, 0 fail, 3 carry nothing to check
+```
+
+That last clause is the honest part of a structural referee. A chain of
+declared lengths that tiles a file exactly is a few dozen constraints
+for nothing, and it will catch a mangled header or a truncated member -
+but it cannot see a flipped bit in the middle of a compressed block,
+which is most of the file. A checksum can; a skeleton cannot.
+
+Calibrating one of these is also where it is easiest to fool yourself.
+Three successive attempts at that chain check "found damage" on all
+seven archives across both disks, and each time the damage was mine: the
+end-of-chain marker is a zero rather than a pointer past the file, and
+the last member runs one byte past its declared length because the
+writer recorded the length before flushing the trailing one-bits of its
+bit-packed stream. A referee has to be calibrated against files known to
+be good before it is allowed to accuse anything - the same lesson the
+cabinet checksum taught with its byte order.
+
 ### 4d-ii. Sound is smooth too
 
 The smoothness argument that shapes the flux search applies a level up,
@@ -1545,6 +1601,13 @@ filesystem options (scan and repair):
                     file under DIR (one level of subdirectories too)
                     is tried; the match is on the bytes, not the name.
                     (--from-set is the same switch.)
+  --verify          put every file to the check its own format
+                    carries - an archive member's CRC-32, a cabinet
+                    block's 32-bit checksum, a record list that has
+                    to be ordered and in range. Independent of the
+                    sector CRC, so it is the only thing a sector
+                    image (.img/.ima) can be held to at all. Implies
+                    --fs.
   --salvage         extract: also unpack damaged archives, member by
                     member, into <name>.d/ - a member the damage
                     missed comes out whole and proven by its own

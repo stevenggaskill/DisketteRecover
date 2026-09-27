@@ -50,6 +50,41 @@ static void dr_err(dr_ctx *c, const char *fmt, ...)
 const char *dr_last_error(dr_ctx *c) { return c ? c->error : "no context"; }
 const char *dr_path(dr_ctx *c)       { return c ? c->path : ""; }
 
+int dr_crcs_are_real(dr_ctx *c)
+{
+	/*
+	 * Judged by which loader accepted the file, and listed the way
+	 * round that fails safe: only these carry the disk's own encoding,
+	 * and anything else is assumed to be a sector image. An unknown
+	 * loader then gets the warning rather than a false clean bill,
+	 * which is the error worth preferring.
+	 *
+	 * (The alternative - looking for a bad CRC and concluding the
+	 * image must be real if it finds one - gets a genuinely clean disk
+	 * exactly backwards.)
+	 */
+	static const char *bitcell_images[] = {
+		"KRYOFLUXSTREAM", "SCP_FLUX_STREAM", "SPS_IPF",
+		"ATARIST_STX", "ATARIST_STW", "HXCMFM_IMG",
+		"HXC_HFE", "HXC_HFEV3", "HXC_EXTHFE", "HXC_HDDD_A2_HFE",
+		"HXC_STREAMHFE", "MAME_MFI", "TRS80_DMK", "FDX68_FDX",
+		"HXC_AFI", "BMP_STREAM_IMAGE", "PNG_STREAM_IMAGE", NULL
+	};
+	int i;
+
+	if (!c || !c->loader_name[0])
+		return -1;
+	for (i = 0; bitcell_images[i]; i++)
+		if (!strcasecmp(c->loader_name, bitcell_images[i]))
+			return 1;
+	return 0;
+}
+
+const char *dr_loader_name(dr_ctx *c)
+{
+	return (c && c->loader_name[0]) ? c->loader_name : "?";
+}
+
 void dr_options_default(dr_options *o)
 {
 	o->good_threshold = 1e-3;
@@ -145,6 +180,13 @@ dr_ctx *dr_open_ex(const char *path, int verbose,
 		return c;
 	}
 
+	{
+		const char *nm = hxcfe_imgGetLoaderName(c->loader,
+		                                        c->loader_id);
+
+		snprintf(c->loader_name, sizeof(c->loader_name), "%s",
+		         nm ? nm : "?");
+	}
 	c->floppy = hxcfe_imgLoad(c->loader, (char *)path, c->loader_id, &err);
 	if (!c->floppy) {
 		dr_err(c, "load failed (hxcfe error %d)", (int)err);

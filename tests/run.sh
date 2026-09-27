@@ -708,6 +708,44 @@ PYEOF4
 		ok "the recovered bytes match the original exactly"
 	else bad "the recovered bytes match the original exactly"; fi
 
+	# A sector image carries no CRCs of its own: they are made up from
+	# its bytes when it loads, so "0 with a CRC error" is the absence of
+	# evidence and must not be reported as a clean disk.
+	echo "== a sector image has no CRCs to report"
+	si=$("$dr" scan "$out/cab.img" 2>/dev/null |
+	     grep -c "this is a sector image" || true)
+	if [ "${si:-0}" -ge 1 ]; then
+		ok "a sector image says its CRC count is not a verdict"
+	else bad "a sector image says its CRC count is not a verdict"; fi
+	sh_=$("$dr" scan "$out/cab.hfe" 2>/dev/null |
+	      grep -c "this is a sector image" || true)
+	if [ "${sh_:-0}" -eq 0 ]; then
+		ok "a bitcell image does not say that"
+	else bad "a bitcell image does not say that"; fi
+
+	# --verify puts each file to its own format's check, independent of
+	# the sector CRC - the only thing a sector image can be held to.
+	echo "== verifying files against their own formats"
+	vg=$("$dr" scan "$out/cab.img" --verify 2>/dev/null |
+	     grep -c "VERIFIED" || true)
+	if [ "${vg:-0}" -ge 1 ]; then
+		ok "an intact cabinet verifies from a sector image alone"
+	else bad "an intact cabinet verifies from a sector image alone"; fi
+	# now break a data block inside the cabinet, in the image itself
+	python3 - "$out" <<'PYEOF6'
+import os, sys
+out = sys.argv[1]
+b = bytearray(open(os.path.join(out, "cab.img"), "rb").read())
+i = b.find(b"MSCF")
+b[i + 400] ^= 0x40                       # one bit, well inside block 0
+open(os.path.join(out, "cab_rot.img"), "wb").write(bytes(b))
+PYEOF6
+	vb=$("$dr" scan "$out/cab_rot.img" --verify 2>/dev/null |
+	     grep -c "FAILS" || true)
+	if [ "${vb:-0}" -ge 1 ]; then
+		ok "one flipped bit in a cabinet block is caught"
+	else bad "one flipped bit in a cabinet block is caught"; fi
+
 	# Software did not arrive on one floppy: --from-dir looks for the
 	# same file on the other disks of the set, matching on bytes rather
 	# than on the name.

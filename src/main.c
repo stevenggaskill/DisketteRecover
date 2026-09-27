@@ -116,6 +116,13 @@ static const char *usage_text =
 "                    file under DIR (one level of subdirectories too)\n"
 "                    is tried; the match is on the bytes, not the name.\n"
 "                    (--from-set is the same switch.)\n"
+"  --verify          put every file to the check its own format\n"
+"                    carries - an archive member's CRC-32, a cabinet\n"
+"                    block's 32-bit checksum, a record list that has\n"
+"                    to be ordered and in range. Independent of the\n"
+"                    sector CRC, so it is the only thing a sector\n"
+"                    image (.img/.ima) can be held to at all. Implies\n"
+"                    --fs.\n"
 "  --salvage         extract: also unpack damaged archives, member by\n"
 "                    member, into <name>.d/ - a member the damage\n"
 "                    missed comes out whole and proven by its own\n"
@@ -177,6 +184,7 @@ typedef struct {
 	const char *fromdir;
 	int    deleted;
 	int    salvage;
+	int    verify;
 	char *const *sets;
 	int    nsets;
 	dr_options opt;
@@ -239,6 +247,7 @@ static int parse_args(int argc, char **argv, args *a)
 		else if (!strcmp(o, "--all"))      a->all = 1;
 		else if (!strcmp(o, "--fs"))       a->fs = 1;
 		else if (!strcmp(o, "--salvage")) a->salvage = 1;
+		else if (!strcmp(o, "--verify")) { a->verify = 1; a->fs = 1; }
 		else if (!strcmp(o, "--deleted"))  a->deleted = 1;
 		else if (!strcmp(o, "--from-mirror") ||
 		         !strcmp(o, "--from-copy")) a->frommirror = 1;
@@ -405,6 +414,25 @@ static void print_scan(dr_ctx *c)
 		printf("; first is index %d (track %d side %d sector %d)",
 		       i, s[i].track, s[i].side, s[i].sector_id);
 	printf("\n");
+	/*
+	 * Do not let a sector image pass for a clean disk. Its CRCs were
+	 * manufactured when it loaded, from the bytes a dumper had already
+	 * decided to keep, so they cannot disagree with anything. Saying
+	 * "0 sector(s) with a CRC error" and stopping there reports the
+	 * absence of evidence as evidence.
+	 */
+	if (dr_crcs_are_real(c) == 0)
+		printf("\nnote      : this is a sector image (%s), not a flux "
+		       "or bitcell dump. Its\n"
+		       "            CRCs were computed from its own bytes when "
+		       "it loaded, so they\n"
+		       "            cannot disagree with them - the count above "
+		       "is not a verdict on\n"
+		       "            the disk. Which sectors actually read is "
+		       "not in the file.\n"
+		       "            What can still be checked is inside the "
+		       "data: try --verify.\n",
+		       dr_loader_name(c));
 	print_radial(c);
 }
 
@@ -2084,11 +2112,12 @@ int main(int argc, char **argv)
 				{
 					dr_fs_file ff[64];
 					int nf = dr_fs_files(fs, ff, 64), k;
+					int vok = 0, vbad = 0, vnone = 0;
 
 					if (nf)
 						printf("\nthe files on this "
 						       "disk\n");
-					for (k = 0; k < nf; k++)
+					for (k = 0; k < nf; k++) {
 						printf("  %-14s %8ld byte(s)"
 						       "  %s%s%s\n",
 						       ff[k].name, ff[k].size,
@@ -2097,6 +2126,34 @@ int main(int argc, char **argv)
 						         : "no bad sector",
 						       ff[k].note[0] ? " - " : "",
 						       ff[k].note);
+						if (!a.verify)
+							continue;
+						{
+							char vh[256];
+							int vr = dr_fs_verify(
+							        fs, k, vh,
+							        sizeof(vh));
+
+							if (vr == 1) vok++;
+							else if (vr == 0) vbad++;
+							else vnone++;
+							if (vh[0])
+								printf("  %-14s "
+								       "%8s   %s "
+								       "%s\n", "",
+								       "",
+								       vr == 1 ? "VERIFIED:"
+								       : vr == 0 ? "FAILS:  "
+								       : "        ",
+								       vh);
+						}
+					}
+					if (a.verify && nf)
+						printf("\nverified by the "
+						       "files' own formats: %d "
+						       "pass, %d fail, %d carry "
+						       "nothing to check\n",
+						       vok, vbad, vnone);
 				}
 				if (shown) {
 					/* The number that matters is not how

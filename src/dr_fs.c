@@ -1606,6 +1606,140 @@ static long gif_close(uint8_t *buf, long n, long full,
 }
 
 /*
+ * A length-chained installer archive.
+ *
+ * Early-90s Windows install media is full of these: signature
+ * 65 5D 13 8C, then one entry per member, each declaring its own
+ * compressed length *and* where the next entry begins. Grammatik 5 and
+ * On Time both ship their payload this way, and so do their
+ * INSTALL.EX$ wrappers.
+ *
+ *   +0   flags
+ *   +1   0x12, on every entry of every one of these seen so far
+ *   +2   uint32  compressed length of this member
+ *   +6   uint32  where the next entry starts, counted from one
+ *   +10  uint16  DOS date
+ *   +12  uint32  time, and something else
+ *   +16  byte    length of the name
+ *   +17  the name, then that many bytes of compressed data
+ *
+ * The check is that the chain has to tile the file exactly: every
+ * member's declared length must put the next entry where the previous
+ * entry said it would be, and the last one must land on the end of the
+ * file and not a byte over. That is a few dozen constraints for free,
+ * and it is worth having for a reason beyond this format - a sector
+ * image carries no CRCs of its own, so a structure inside the data is
+ * the only thing such an image can be held to at all.
+ *
+ * What it cannot do is notice damage inside a member's compressed
+ * bytes, which is most of the file. It checks the skeleton, not the
+ * flesh, and says so.
+ *
+ * Returns 1 when the chain tiles the file, 0 when it does not, -1 when
+ * this is not one.
+ */
+static int instarc_check(const uint8_t *b, long len, char *how, size_t howsz)
+{
+	long o = 0x0C, ent = 0;
+	char first[16];
+
+	if (len < 0x20 || b[0] != 0x65 || b[1] != 0x5D ||
+	    b[2] != 0x13 || b[3] != 0x8C)
+		return -1;
+	first[0] = 0;
+	while (o + 17 <= len && ent < 4096) {
+		long csz, nxt, data;
+		int nl, i;
+
+		if (b[o + 1] != 0x12) {
+			snprintf(how, howsz,
+			         "installer archive: entry %ld has no 0x12 "
+			         "marker, so the chain is broken after %ld "
+			         "member(s)", ent, ent);
+			return 0;
+		}
+		csz = (long)b[o+2] | ((long)b[o+3] << 8) |
+		      ((long)b[o+4] << 16) | ((long)b[o+5] << 24);
+		nxt = (long)b[o+6] | ((long)b[o+7] << 8) |
+		      ((long)b[o+8] << 16) | ((long)b[o+9] << 24);
+		nl = b[o + 16];
+		data = o + 17 + nl;
+		if (nl < 1 || nl > 13 || data + csz > len || csz < 0) {
+			snprintf(how, howsz,
+			         "installer archive: entry %ld declares a %d-"
+			         "character name and %ld byte(s) of data, "
+			         "which does not fit", ent, nl, csz);
+			return 0;
+		}
+		for (i = 0; i < nl; i++)
+			if (b[data - nl + i] < 0x20 || b[data - nl + i] > 0x7E) {
+				snprintf(how, howsz,
+				         "installer archive: entry %ld's name "
+				         "is not printable, so the chain is "
+				         "broken", ent);
+				return 0;
+			}
+		if (!first[0]) {
+			int k = nl < 13 ? nl : 13;
+			memcpy(first, b + data - nl, (size_t)k);
+			first[k] = 0;
+		}
+		/*
+		 * The next-entry pointer is counted from one, and the last
+		 * entry marks the end with a zero instead - so the final
+		 * member's length is what has to land on the end of the
+		 * file. That is the constraint worth the most: it ties every
+		 * declared length in the chain to the one number a dumper
+		 * could not have got wrong.
+		 */
+		ent++;
+		if (!nxt) {
+			/*
+			 * The last member runs to the end of the file, give
+			 * or take one byte. Every one of these seen - seven
+			 * archives across two unrelated products - ends one
+			 * byte past its declared length, and that byte is
+			 * always 0x03, 0x07, 0x1F or 0x3F: the trailing
+			 * one-bits that pad the final byte of a bit-packed
+			 * stream. The writer recorded the length before
+			 * flushing them. So a byte of slack here is the
+			 * format, not damage.
+			 */
+			o = data + csz;
+			if (o != len && o + 1 != len) {
+				snprintf(how, howsz,
+				         "installer archive: the last of its %ld "
+				         "member(s) ends at %ld, but the file is "
+				         "%ld byte(s)", ent, o, len);
+				return 0;
+			}
+			o = len;
+			break;
+		}
+		if (nxt != data + csz + 1) {
+			snprintf(how, howsz,
+			         "installer archive: entry %ld says the next "
+			         "one starts at %ld but its own length puts it "
+			         "at %ld", ent - 1, nxt - 1, data + csz);
+			return 0;
+		}
+		o = data + csz;
+	}
+	if (o != len) {
+		snprintf(how, howsz,
+		         "installer archive: the chain of %ld member(s) ends at "
+		         "%ld, not at the file's %ld byte(s)", ent, o, len);
+		return 0;
+	}
+	snprintf(how, howsz,
+	         "installer archive (first member '%s'): its chain of %ld "
+	         "member(s) tiles the file exactly - structure sound, though "
+	         "this says nothing about the compressed bytes inside",
+	         first, ent);
+	return 1;
+}
+
+/*
  * Sound is smooth too.
  *
  * The same argument that shapes the flux search applies a level up, to
@@ -1779,6 +1913,13 @@ static unsigned long cab_csum(const uint8_t *d, long n, unsigned long acc)
 	return (acc ^ t) & 0xFFFFFFFFUL;
 }
 
+/*
+ * The same walk, but asked about the whole cabinet rather than one
+ * sector: pass at = -1 and every block is counted. This is what a
+ * sector image can still be checked with, since it carries no CRCs of
+ * its own - the cabinet's checksums are inside the data and survive the
+ * trip through any dumper.
+ */
 static int cab_check(const uint8_t *b, long len, long at, long span,
                      char *how, size_t howsz)
 {
@@ -1853,7 +1994,8 @@ static int cab_check(const uint8_t *b, long len, long at, long span,
 					ok++;
 				else
 					bad++;
-				if (at < blk + dsz && at + span > blk) {
+				if (at < 0 ||
+				    (at < blk + dsz && at + span > blk)) {
 					touched++;
 					if (got != stored)
 						touched_bad++;
@@ -1864,6 +2006,17 @@ static int cab_check(const uint8_t *b, long len, long at, long span,
 	}
 	if (!nblocks || !touched)
 		return -1;
+	if (at < 0) {
+		if (bad)
+			snprintf(how, howsz,
+			         "a cabinet, and %d of its %d block(s) fail "
+			         "their own 32-bit checksum", bad, ok + bad);
+		else
+			snprintf(how, howsz,
+			         "a cabinet, and all %d of its block(s) pass "
+			         "their own 32-bit checksum", ok);
+		return bad ? 0 : 1;
+	}
 	if (touched_bad) {
 		snprintf(how, howsz,
 		         "cabinet block checksum: this reading fails the "
@@ -2177,6 +2330,9 @@ int dr_fs_score(dr_fs *fs, const dr_fs_loc *loc, const uint8_t *payload,
 				v = framing_check(buf, flen, loc->file_offset,
 				                  len, out->how,
 				                  sizeof(out->how), &part);
+			if (v < 0)
+				v = instarc_check(buf, flen, out->how,
+				                  sizeof(out->how));
 			if (v < 0)
 				v = cab_check(buf, flen, loc->file_offset,
 				              len, out->how,
@@ -2997,22 +3153,39 @@ static int palm_ok(const uint8_t *b, long len, char *name, size_t namesz,
 
 	if (len < 78)
 		return -1;
+	/*
+	 * Identify before judging. This used to accept anything whose
+	 * first byte was printable, which is most files, and then refute
+	 * them - a verdict of "damaged" on a file it had no business
+	 * reading. A PalmOS header is a name of at least two printable
+	 * characters and a four-character type and creator, both of which
+	 * are conventionally printable; ask for all of that first.
+	 */
 	for (i = 0; i < 31 && b[i]; i++)
 		if (b[i] < 0x20 || b[i] > 0x7E)
 			return -1;       /* not a name, so not one of these */
-	if (!b[0])
+	if (i < 2)
 		return -1;
+	for (i = 60; i < 68; i++)
+		if (b[i] < 0x20 || b[i] > 0x7E)
+			return -1;       /* no type/creator, so not one */
 	attr = (b[32] << 8) | b[33];
 	nrec = (b[76] << 8) | b[77];
 	res  = attr & 0x0001;
 	step = res ? 10 : 8;
 	if (nrec < 1 || nrec > 4096)
 		return -1;
-	need = 78 + (long)nrec * step;
-	if (need > len)
-		return 0;
 	memcpy(type, b + 60, 4);    type[4] = 0;
 	memcpy(creator, b + 64, 4); creator[4] = 0;
+	need = 78 + (long)nrec * step;
+	if (need > len) {
+		snprintf(how, howsz,
+		         "PalmOS %s '%.31s' (%s/%s): its %d-entry %s list does "
+		         "not fit in the file", res ? "resource database"
+		                                    : "database", b, type,
+		         creator, nrec, res ? "resource" : "record");
+		return 0;
+	}
 
 	for (i = 0; i < nrec; i++) {
 		const uint8_t *e = b + 78 + (long)i * step;
@@ -3020,8 +3193,15 @@ static int palm_ok(const uint8_t *b, long len, char *name, size_t namesz,
 		long off = ((long)o[0] << 24) | ((long)o[1] << 16) |
 		           ((long)o[2] << 8) | o[3];
 
-		if (off < need || off > len || off < prev)
+		if (off < need || off > len || off < prev) {
+			snprintf(how, howsz,
+			         "PalmOS %s '%.31s' (%s/%s): %s %d declares its "
+			         "data at offset %ld, which is out of order or "
+			         "outside the file", res ? "resource database"
+			                                 : "database", b, type,
+			         creator, res ? "resource" : "record", i, off);
 			return 0;
+		}
 		prev = off;
 	}
 	if (name && namesz) {
@@ -3965,6 +4145,108 @@ int dr_fs_salvage(dr_fs *fs, int index, const char *dir,
 	return -1;
 }
 #endif /* DR_NO_ZLIB */
+
+/*
+ * Is this file, as it sits on the disk, internally consistent?
+ *
+ * The sector CRC is not the only check a disk carries, and on a sector
+ * image it is not a check at all: an .img or .ima records the bytes a
+ * dumper managed to read and throws away which of them it was sure
+ * about. What survives that trip is every check that lives *inside* the
+ * data - an archive member's CRC-32, a cabinet block's 32-bit checksum,
+ * a compound document's twin streams, a record list that has to be
+ * ordered and in range. Those are what a sector image can still be held
+ * to, and on install media they are stronger than the sixteen bits the
+ * image lost anyway.
+ *
+ * Returns 1 when the file's own format vouches for it, 0 when the
+ * format says it is damaged, -1 when the format carries nothing to ask.
+ */
+int dr_fs_verify(dr_fs *fs, int index, char *how, size_t howsz)
+{
+	uint8_t *b = NULL;
+	long len = 0;
+	int rc = -1;
+
+	if (how && howsz)
+		how[0] = 0;
+	if (!fs || index < 0 || index >= fs->nfiles)
+		return -1;
+	b = dr_fs_read(fs, index, &len);
+	if (!b || len < 16) {
+		free(b);
+		return -1;
+	}
+#ifndef DR_NO_ZLIB
+	/* A cabinet: every block carries a checksum of its own bytes. */
+	rc = cab_check(b, len, -1, 0, how, howsz);
+	if (rc >= 0)
+		goto done;
+
+	/* An archive: every member carries a CRC-32 of its contents. */
+	if (len > 30 && b[0] == 'P' && b[1] == 'K' && b[2] == 3 && b[3] == 4) {
+		int parts = 0, ok = 0, found = 0, lay;
+		char lost[160];
+
+		zip_survey(b, len, fs->img, fs->nlba * SECSZ, -1,
+		           &parts, &ok, &found, lost, sizeof(lost));
+		lay = zip_layout_ok(b, len);
+		if (parts) {
+			if (ok == parts)
+				snprintf(how, howsz,
+				         "an archive, and all %d member(s) "
+				         "pass their own CRC-32", parts);
+			else
+				snprintf(how, howsz,
+				         "an archive, and %d of its %d "
+				         "member(s) fail their own CRC-32%s%s",
+				         parts - ok, parts,
+				         lost[0] ? ": " : "", lost);
+			rc = (ok == parts) ? 1 : 0;
+			goto done;
+		}
+		if (lay > 0) {
+			snprintf(how, howsz,
+			         "an archive whose directory agrees with all "
+			         "%d of its local headers, though nothing "
+			         "here can decompress its members", lay);
+			rc = 1;
+			goto done;
+		}
+	}
+
+	/* A compound document keeps the same stream twice over. */
+	{
+		char msg[240];
+
+		if (cfb_describe(b, len, msg, sizeof(msg)) == 1) {
+			snprintf(how, howsz, "%s", msg);
+			rc = -1;                 /* described, not judged */
+			goto done;
+		}
+	}
+
+	/* A PalmOS database declares where each of its records starts. */
+	{
+		char msg[240];
+		int r = palm_ok(b, len, NULL, 0, msg, sizeof(msg));
+
+		if (r >= 0) {
+			snprintf(how, howsz, "%s", msg);
+			rc = r;
+			goto done;
+		}
+	}
+
+	/* An installer archive's members have to tile the file. */
+	rc = instarc_check(b, len, how, howsz);
+	if (rc >= 0)
+		goto done;
+#endif
+done:
+	free(b);
+	return rc;
+}
 
 uint8_t *dr_fs_read(dr_fs *fs, int index, long *len)
 {

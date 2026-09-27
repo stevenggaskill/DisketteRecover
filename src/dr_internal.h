@@ -28,6 +28,7 @@ struct dr_ctx {
 	char   error[512];
 
 	int    loader_id;
+	char   loader_name[64];
 	int    verbose;
 	int    dirty;            /* track cells were patched              */
 
