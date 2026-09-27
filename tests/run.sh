@@ -594,6 +594,76 @@ PYEOF2
 		ok "the trimmed GIF keeps its header and gains a trailer"
 	else bad "the trimmed GIF keeps its header and gains a trailer"; fi
 
+	# A cabinet checks its own blocks: every CFDATA block carries a
+	# 32-bit checksum of its compressed bytes, which is four times the
+	# sector CRC and says exactly which block the damage is in.
+	echo "== a cabinet's own block checksums"
+	python3 - "$out" <<'PYEOF5'
+import os, random, struct, sys, zlib
+out = sys.argv[1]
+random.seed(31)
+
+
+def csum(d, acc=0):
+    n, i = len(d), 0
+    while i + 4 <= n:
+        acc ^= struct.unpack_from("<I", d, i)[0]
+        i += 4
+    r, t = n - i, 0
+    if r == 3:
+        t = (d[i] << 16) | (d[i + 1] << 8) | d[i + 2]
+    elif r == 2:
+        t = (d[i] << 8) | d[i + 1]
+    elif r == 1:
+        t = d[i]
+    return acc ^ t
+
+
+# Four MSZIP blocks of compressible data, the shape a real cabinet has.
+words = [bytes(random.choice(b"abcdefghijklmnop") for _ in range(6))
+         for _ in range(400)]
+blocks = []
+for _ in range(4):
+    raw = b" ".join(random.choice(words) for _ in range(5000))[:32768]
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)
+    cd = b"CK" + co.compress(raw) + co.flush()
+    blocks.append((cd, len(raw)))
+
+name = b"BIG.TXT\0"
+nfiles, nfold = 1, 1
+cbCFFOLDER, cbCFFILE = 8, 16
+coffFiles = 36 + nfold * cbCFFOLDER
+coffData = coffFiles + cbCFFILE + len(name)
+total = sum(len(u) for u, _ in blocks)
+usize = sum(n for _, n in blocks)
+csize = coffData + 8 * len(blocks) + total
+h = struct.pack("<4sIIIIIBBHHHHH", b"MSCF", 0, csize, 0, coffFiles, 0,
+                3, 1, nfold, nfiles, 0, 0, 0)
+h += struct.pack("<IHH", coffData, len(blocks), 1)      # one folder, MSZIP
+h += struct.pack("<IIHHHH", usize, 0, 0, 0x2A21, 0x5FA0, 0x20) + name
+for cd, n in blocks:
+    hdr = struct.pack("<HH", len(cd), n)
+    h += struct.pack("<I", csum(hdr, csum(cd))) + hdr + cd
+open(os.path.join(out, "test.cab"), "wb").write(h)
+PYEOF5
+	python3 "$here/tools/mkfat.py" "$out/cab.img" "TEST.CAB=$out/test.cab"
+	"$dr" convert "$out/cab.img" --out "$out/cab.hfe" >/dev/null 2>&1
+	"$dr" damage "$out/cab.hfe" --track 1 --side 0 --id 4 --drop-only \
+	      --bits 803,1701 --out "$out/cab_bad.hfe" >/dev/null 2>&1
+	check "one bad sector" "$(badcount "$out/cab_bad.hfe")" "1"
+	cb=$("$dr" repair "$out/cab_bad.hfe" --fs 2>/dev/null |
+	     grep -c "cabinet block checksum" || true)
+	if [ "${cb:-0}" -ge 1 ]; then ok "the cabinet is used as a referee"
+	else bad "the cabinet is used as a referee"; fi
+	# and the true reading is the one it accepts
+	"$dr" repair "$out/cab_bad.hfe" --all --auto --fs \
+	      --out "$out/cab_fix.img" --format RAW_LOADER >/dev/null 2>&1
+	"$dr" convert "$out/cab.hfe" --out "$out/cab_ref.img" \
+	      --format RAW_LOADER >/dev/null 2>&1
+	if [ ! -f "$out/cab_fix.img" ] || cmp -s "$out/cab_ref.img" "$out/cab_fix.img"; then
+		ok "no reading the cabinet rejects is applied"
+	else bad "no reading the cabinet rejects is applied"; fi
+
 	# Install disks ship the same driver several times over, one build
 	# per chipset or resolution, and two builds of the same program run
 	# identical for long stretches. Where the damage lands inside such
@@ -637,6 +707,33 @@ PYEOF4
 	if cmp -s "$out/sib_ref.img" "$out/sib_fix.img"; then
 		ok "the recovered bytes match the original exactly"
 	else bad "the recovered bytes match the original exactly"; fi
+
+	# Software did not arrive on one floppy: --from-dir looks for the
+	# same file on the other disks of the set, matching on bytes rather
+	# than on the name.
+	echo "== the same file on another disk of the set"
+	mkdir -p "$out/set"
+	cp "$out/bld_a.bin" "$out/set/RENAMED.BIN"
+	fd=$("$dr" repair "$out/sib_bad.hfe" --from-dir "$out/set" 2>&1 |
+	     grep -c "RENAMED.BIN" || true)
+	if [ "${fd:-0}" -ge 1 ]; then
+		ok "a renamed copy on another disk is still found"
+	else bad "a renamed copy on another disk is still found"; fi
+	"$dr" repair "$out/sib_bad.hfe" --from-dir "$out/set" \
+	      --out "$out/set_fix.img" --format RAW_LOADER >/dev/null 2>&1
+	if cmp -s "$out/sib_ref.img" "$out/set_fix.img"; then
+		ok "and it recovers the sector exactly"
+	else bad "and it recovers the sector exactly"; fi
+	# the disk's own copy must never be handed back as a repair
+	mkdir -p "$out/setself"
+	cp "$out/bld_b.bin" "$out/setself/DRVA.SYS"
+	ss=$("$dr" repair "$out/sib_bad.hfe" --from-dir "$out/setself" 2>&1 |
+	     grep -c "hand back the damage" || true)
+	sv=$("$dr" repair "$out/sib_bad.hfe" --from-dir "$out/setself" 2>&1 |
+	     grep -c "RENAMED" || true)
+	if [ "${sv:-0}" -eq 0 ]; then
+		ok "a candidate offering the damage back is rejected"
+	else bad "a candidate offering the damage back is rejected"; fi
 
 	# A boot sector too damaged to parse costs the whole disk: it holds
 	# the map. The layout is rebuilt from the geometry the dump reports

@@ -501,6 +501,16 @@ int         dr_fs_detail(dr_fs *fs, const dr_fs_loc *loc,
  * guess even if the sector's own checksum disagrees; 0 when it lines up
  * well enough to be worth checking against that checksum; -1 when it
  * does not line up at all. */
+/* The same file on one of the other disks in the set: every file under
+ * `dir` (one level of subdirectories included) is offered to
+ * dr_fs_from_file, and the best match wins. Matching is on the bytes
+ * either side of the damage, not on the name. `found` receives the path
+ * that won. Returns as dr_fs_from_file does. */
+int         dr_fs_from_dir(dr_fs *fs, const dr_fs_loc *loc,
+                           const char *dir, uint8_t *out, int len,
+                           char *how, int howsz,
+                           char *found, size_t foundsz);
+
 int         dr_fs_from_file(dr_fs *fs, const dr_fs_loc *loc,
                             const char *path, uint8_t *out, int len,
                             char *how, int howsz);

@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include "dr_internal.h"
 
@@ -1727,6 +1729,156 @@ static int wav_check(const uint8_t *b, long len, long at, long span,
 }
 
 /*
+ * A cabinet checks its own blocks.
+ *
+ * Microsoft's CAB holds its data in blocks of up to 32 KB, and every
+ * block carries a 32-bit checksum of its own compressed bytes. That is
+ * a far better referee than the sector's sixteen: it says which block
+ * the damage is in, it says so exactly, and a repair either satisfies
+ * it or does not.
+ *
+ * Word 6.0 shipped as WORD1.CAB..WORDn.CAB across a box of disks, one
+ * cabinet per floppy, each one a 1.7 MB file with a hundred blocks in
+ * it. On disk 2 of that set, 95 of the 99 blocks verify and three do
+ * not - and those three are exactly where the three bad sectors fall.
+ *
+ * The header has to be walked carefully: the reserve fields and the
+ * previous/next cabinet names all shift where the folder table starts,
+ * and getting that wrong silently reads the block list out of the
+ * middle of the data.
+ *
+ * Returns 1 when every block the sector touches checks out, 0 when one
+ * of them does not, -1 for no opinion.
+ */
+static unsigned long cab_csum(const uint8_t *d, long n, unsigned long acc)
+{
+	long i = 0;
+	unsigned long t = 0;
+
+	for (; i + 4 <= n; i += 4)
+		acc ^= (unsigned long)d[i] | ((unsigned long)d[i+1] << 8) |
+		       ((unsigned long)d[i+2] << 16) |
+		       ((unsigned long)d[i+3] << 24);
+	/*
+	 * The tail bytes are folded in the other byte order from the whole
+	 * words - that is what the spec says, and it is the one detail
+	 * that makes this checksum look broken when it is not: get it
+	 * wrong and every block whose length is not a multiple of four
+	 * fails, which on a real cabinet is about half of them.
+	 */
+	switch (n - i) {
+	case 3: t = ((unsigned long)d[i] << 16) |
+	            ((unsigned long)d[i + 1] << 8) | (unsigned long)d[i + 2];
+	        break;
+	case 2: t = ((unsigned long)d[i] << 8) | (unsigned long)d[i + 1];
+	        break;
+	case 1: t = (unsigned long)d[i];
+	        break;
+	default: break;
+	}
+	return (acc ^ t) & 0xFFFFFFFFUL;
+}
+
+static int cab_check(const uint8_t *b, long len, long at, long span,
+                     char *how, size_t howsz)
+{
+	long o, coff, blk;
+	int nfold, nfiles, flags, i, cbHdr = 0, cbFold = 0, cbData = 0;
+	int ok = 0, bad = 0, touched = 0, touched_bad = 0, nblocks = 0;
+
+	if (len < 64 || memcmp(b, "MSCF", 4))
+		return -1;
+	coff = (long)b[16] | ((long)b[17] << 8) | ((long)b[18] << 16) |
+	       ((long)b[19] << 24);
+	nfold  = u16le(b + 26);
+	nfiles = u16le(b + 28);
+	flags  = u16le(b + 30);
+	if (nfold < 1 || nfold > 256 || nfiles < 1)
+		return -1;
+	o = 36;
+	if (flags & 4) {                          /* reserve fields */
+		cbHdr  = u16le(b + o);
+		cbFold = b[o + 2];
+		cbData = b[o + 3];
+		o += 4 + cbHdr;
+	}
+	if (flags & 1) {                          /* previous cabinet */
+		for (i = 0; i < 2; i++) {
+			while (o < len && b[o]) o++;
+			o++;
+		}
+	}
+	if (flags & 2) {                          /* next cabinet */
+		for (i = 0; i < 2; i++) {
+			while (o < len && b[o]) o++;
+			o++;
+		}
+	}
+	if (o + 8 > len || coff < o || coff > len)
+		return -1;
+
+	for (i = 0; i < nfold; i++) {
+		long start, n, p;
+		int j;
+
+		if (o + 8 > len)
+			return -1;
+		start = (long)b[o] | ((long)b[o+1] << 8) |
+		        ((long)b[o+2] << 16) | ((long)b[o+3] << 24);
+		n = u16le(b + o + 4);
+		o += 8 + cbFold;
+		if (start < 0 || start >= len || n < 1 || n > 65535)
+			continue;
+		p = start;
+		for (j = 0; j < n && p + 8 + cbData <= len; j++) {
+			long dsz = u16le(b + p + 4);
+			unsigned long stored, got;
+			uint8_t hdr[4];
+
+			if (p + 8 + cbData + dsz > len)
+				break;
+			stored = (unsigned long)b[p] |
+			         ((unsigned long)b[p+1] << 8) |
+			         ((unsigned long)b[p+2] << 16) |
+			         ((unsigned long)b[p+3] << 24);
+			blk = p + 8 + cbData;
+			nblocks++;
+			/* A zero checksum means the writer stored none. */
+			if (stored) {
+				hdr[0] = b[p + 4]; hdr[1] = b[p + 5];
+				hdr[2] = b[p + 6]; hdr[3] = b[p + 7];
+				got = cab_csum(b + blk, dsz, 0UL);
+				got = cab_csum(hdr, 4, got);
+				if (got == stored)
+					ok++;
+				else
+					bad++;
+				if (at < blk + dsz && at + span > blk) {
+					touched++;
+					if (got != stored)
+						touched_bad++;
+				}
+			}
+			p = blk + dsz;
+		}
+	}
+	if (!nblocks || !touched)
+		return -1;
+	if (touched_bad) {
+		snprintf(how, howsz,
+		         "cabinet block checksum: this reading fails the "
+		         "block's own 32-bit checksum (%d of %d block(s) in "
+		         "the cabinet check out)", ok, ok + bad);
+		return 0;
+	}
+	snprintf(how, howsz,
+	         "cabinet block checksum: the %d block(s) this sector touches "
+	         "check out, and so do %d of %d in the cabinet", touched, ok,
+	         ok + bad);
+	return 1;
+}
+
+/*
  * Does this archive hang together as a whole?
  *
  * A ZIP ends with a directory of everything in it, and every entry in
@@ -2025,6 +2177,10 @@ int dr_fs_score(dr_fs *fs, const dr_fs_loc *loc, const uint8_t *payload,
 				v = framing_check(buf, flen, loc->file_offset,
 				                  len, out->how,
 				                  sizeof(out->how), &part);
+			if (v < 0)
+				v = cab_check(buf, flen, loc->file_offset,
+				              len, out->how,
+				              sizeof(out->how));
 			if (v < 0)
 				v = wav_check(buf, flen, loc->file_offset,
 				              len, out->how,
@@ -2518,6 +2674,185 @@ static const uint8_t *find_bytes(const uint8_t *hay, long hlen,
 #define ANCHOR 48
 #define NEED   256
 
+/*
+ * The same file, on one of the other disks in the set.
+ *
+ * Software did not arrive on one floppy. An install set shipped the
+ * same runtime on several of its disks, and two editions of the same
+ * product shipped much of the same code - so a file this disk has lost
+ * is often sitting intact on the disk next to it in the box. Nothing
+ * about that is visible from inside one dump, which is why the tool
+ * could not see it before.
+ *
+ * So point it at a directory of the others: --from-dir. Every file
+ * under it is offered to dr_fs_from_file() in turn, and the one that
+ * lines up wins. The name is not trusted - the match is made on the
+ * bytes, by finding the damaged sector's known-good neighbours inside
+ * the candidate - so a renamed copy is found and a same-named file from
+ * a different build is rejected. Nine disks' worth of files is a
+ * second's work to sift.
+ *
+ * Whatever it finds still has to satisfy the sector's own CRC, or a run
+ * of agreement long enough to outweigh sixteen bits that did not
+ * survive. This only widens where the tool looks; it does not lower the
+ * bar for what it believes.
+ */
+int dr_fs_from_dir(dr_fs *fs, const dr_fs_loc *loc, const char *dir,
+                   uint8_t *out, int len, char *how, int howsz,
+                   char *found, size_t foundsz)
+{
+	char (*names)[1024] = NULL;
+	int nn = 0, cap = 0, i, rc = -1, best = -1, selfsame = 0;
+	long best_score = -1;
+	char bestpath[1024], besthow[512];
+	uint8_t *now = NULL;
+	DIR *d;
+	struct dirent *e;
+
+	if (!fs || !loc || !dir || !out)
+		return -1;
+	if (found && foundsz)
+		found[0] = 0;
+	bestpath[0] = 0;
+	besthow[0] = 0;
+
+	/* One level of subdirectories, so a folder per disk works. */
+	d = opendir(dir);
+	if (!d) {
+		snprintf(how, (size_t)howsz, "cannot read %s", dir);
+		return -1;
+	}
+	while ((e = readdir(d)) != NULL) {
+		char sub[1024];
+		struct stat st;
+
+		if (e->d_name[0] == '.')
+			continue;
+		if (snprintf(sub, sizeof(sub), "%s/%s", dir, e->d_name) >=
+		    (int)sizeof(sub))
+			continue;
+		if (stat(sub, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode)) {
+			DIR *d2 = opendir(sub);
+			struct dirent *e2;
+
+			if (!d2)
+				continue;
+			while ((e2 = readdir(d2)) != NULL) {
+				char f2[1024];
+
+				if (e2->d_name[0] == '.')
+					continue;
+				if (snprintf(f2, sizeof(f2), "%s/%s", sub,
+				             e2->d_name) >= (int)sizeof(f2))
+					continue;
+				if (stat(f2, &st) != 0 || !S_ISREG(st.st_mode))
+					continue;
+				if (nn == cap) {
+					void *nv;
+					cap = cap ? cap * 2 : 256;
+					nv = realloc(names,
+					     (size_t)cap * sizeof(*names));
+					if (!nv) break;
+					names = nv;
+				}
+				snprintf(names[nn++], sizeof(names[0]), "%s",
+				         f2);
+			}
+			closedir(d2);
+			continue;
+		}
+		if (!S_ISREG(st.st_mode))
+			continue;
+		if (nn == cap) {
+			void *nv;
+			cap = cap ? cap * 2 : 256;
+			nv = realloc(names, (size_t)cap * sizeof(*names));
+			if (!nv) break;
+			names = nv;
+		}
+		snprintf(names[nn++], sizeof(names[0]), "%s", sub);
+	}
+	closedir(d);
+
+	/*
+	 * What this disk already reads there. A candidate that proposes
+	 * exactly those bytes is not a repair - and the disk's own copy of
+	 * the file, sitting in the same library as its neighbours', is
+	 * precisely such a candidate: it agrees with itself for the whole
+	 * length of the file either side of the damage, which looks like
+	 * the strongest match there could be. Without this the search
+	 * would confidently hand the damage back.
+	 */
+	{
+		long mlen = 0;
+		uint8_t *mine = assemble(fs, loc, NULL, 0, &mlen);
+
+		if (mine && loc->file_offset >= 0 &&
+		    loc->file_offset + len <= mlen) {
+			now = malloc((size_t)len);
+			if (now)
+				memcpy(now, mine + loc->file_offset,
+				       (size_t)len);
+		}
+		free(mine);
+	}
+
+	for (i = 0; i < nn; i++) {
+		uint8_t *try = malloc((size_t)len);
+		char h[512];
+		int r;
+
+		if (!try)
+			break;
+		h[0] = 0;
+		r = dr_fs_from_file(fs, loc, names[i], try, len, h,
+		                    (int)sizeof(h));
+		if (r >= 0 && now && memcmp(try, now, (size_t)len) == 0) {
+			free(try);
+			selfsame++;
+			continue;
+		}
+		if (r >= 0) {
+			/*
+			 * 1 beats 0: a candidate whose agreement either side
+			 * is long enough to stand on its own outranks one
+			 * that merely lined up. Among equals, the first
+			 * found - the listing order is the caller's.
+			 */
+			long score = (r == 1) ? 2 : 1;
+
+			if (score > best_score) {
+				best_score = score;
+				best = i;
+				memcpy(out, try, (size_t)len);
+				snprintf(bestpath, sizeof(bestpath), "%s",
+				         names[i]);
+				snprintf(besthow, sizeof(besthow), "%s", h);
+				rc = r;
+			}
+		}
+		free(try);
+		if (best_score >= 2)
+			break;
+	}
+
+	if (best < 0)
+		snprintf(how, (size_t)howsz,
+		         "none of the %d file(s) under %s offers anything "
+		         "this sector does not already have (%d of them just "
+		         "hand back the damage)", nn, dir, selfsame);
+	else {
+		snprintf(how, (size_t)howsz, "%s", besthow);
+		if (found && foundsz)
+			snprintf(found, foundsz, "%s", bestpath);
+	}
+	free(now);
+	free(names);
+	return rc;
+}
+
 int dr_fs_from_file(dr_fs *fs, const dr_fs_loc *loc, const char *path,
                     uint8_t *out, int len, char *how, int howsz)
 {
@@ -2607,11 +2942,30 @@ int dr_fs_from_file(dr_fs *fs, const dr_fs_loc *loc, const char *path,
 	 * build, byte for byte, and then the 512 in the middle are not a
 	 * guess even when the sector's own checksum disagrees - because
 	 * on these disks the checksum is the thing that usually died.
+	 *
+	 * "Thousands either side" is the wrong test near the ends of a
+	 * file, though: damage 1,024 bytes in cannot have 4,096 bytes of
+	 * agreement before it however perfect the copy is. What matters is
+	 * that the two agree everywhere there was anything to check, so a
+	 * side also counts as satisfied when the run reaches the file's own
+	 * edge - which is what WINHELP.HL_ on XTree4WinX's disk 2 needed:
+	 * 1,024 bytes before, all there are, and 19,455 after.
 	 */
-	rc = (best_back >= 4096 && best_fwd >= 4096) ? 1 : 0;
-	snprintf(how, (size_t)howsz,
-	         "%s lines up at offset %ld and agrees for %ld byte(s) before "
-	         "the damage and %ld after", path, best_at, best_back, best_fwd);
+	{
+		int back_done = (best_at - best_back <= 0) ||
+		                (at - best_back <= 0);
+		int fwd_done = (best_at + len + best_fwd >= clen) ||
+		               (at + len + best_fwd >= mlen);
+
+		rc = ((best_back >= 4096 || back_done) &&
+		      (best_fwd >= 4096 || fwd_done) &&
+		      best_back + best_fwd >= 4096) ? 1 : 0;
+		snprintf(how, (size_t)howsz,
+		         "%s lines up at offset %ld and agrees for %ld byte(s) "
+		         "before the damage%s and %ld after%s", path, best_at,
+		         best_back, back_done ? " (all there are)" : "",
+		         best_fwd, fwd_done ? " (all there are)" : "");
+	}
 out:
 	free(mine);
 	free(cand);

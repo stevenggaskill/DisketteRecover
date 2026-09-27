@@ -773,6 +773,80 @@ bits they settle it: 512 bytes carrying the right CRC by accident is a
 one-in-65536 coincidence, and these are not arbitrary bytes. Where the
 CRC is damaged too, the tool says so and writes nothing.
 
+### 4d-i-ter. The same file on another disk of the set
+
+Software did not arrive on one floppy. An install set shipped the same
+runtime on several of its disks, and two editions of the same product
+shipped much of the same code, so a file one disk has lost is often
+sitting intact on the disk beside it in the box. Nothing about that is
+visible from inside a single dump.
+
+`--from-dir` points the search at the rest of the set. Every file under
+the directory is put to the same anchoring test `--from-file` uses, so
+the match is made on bytes rather than names - a renamed copy is found,
+a same-named file from a different build is rejected. On XTree for
+Windows' second disk, with the other eight disks of its set extracted
+into a library of 337 files:
+
+```
+  7/0 s1    from set  the same bytes from WINHELP.EX_  -> APPLIED, proven not ranked
+  8/0 s1    from set  the same bytes from WINHELP.EX_  -> APPLIED, proven not ranked
+  9/0 s1    from set  the same bytes from WINHELP.HL_  -> APPLIED, proven not ranked
+ 22/0 s5    from set  the same bytes from XTW519F.DL_  -> APPLIED, proven not ranked
+```
+
+`WINHELP.EX_` and `WINHELP.HL_` came off a **ClarisWorks** disk - a
+different product entirely, shipping the same Windows 3.1 help viewer.
+All three files came out byte-identical to those copies across their
+whole length.
+
+Two guards make it safe. A candidate must not merely hand the damage
+back - and the disk's own copy of the file, sitting in the same library
+as its neighbours', is exactly such a candidate: it agrees with itself
+for the file's whole length either side of the damage, which looks like
+the strongest match there could be. So each candidate's proposal is
+compared with what the disk already reads there, and skipped if they
+agree.
+
+And the agreement has to reach as far as there is anything to check,
+which is not the same as a fixed number of bytes. Damage 1,024 bytes
+into a file cannot have 4,096 bytes of agreement before it however
+perfect the copy is, so a side also counts as satisfied when the run
+reaches the file's own edge. `WINHELP.HL_` needed precisely that: 1,024
+bytes before, all there are, and 19,455 after.
+
+### 4d-i-quater. A cabinet checks its own blocks
+
+Microsoft's CAB holds its data in blocks of up to 32 KB, and every block
+carries a **32-bit checksum of its own compressed bytes**. That is four
+times the sector CRC, and it says exactly which block the damage is in.
+Word 6.0 shipped as `WORD1.CAB`..`WORDn.CAB`, one cabinet per floppy; on
+disk 2 of that set 95 of the cabinet's 99 blocks check out, and the
+three that fail are precisely where the disk's three bad sectors land.
+
+The first thing that referee did was overrule the tool:
+
+```
+ 12/1 s18   bits   256 reading(s), top 251 x next  -> not applied (the file above it refutes this reading)
+```
+
+Before the cabinet was understood, that sector was repaired and reported
+clean. A reading 251 times likelier than its nearest rival, matching the
+sector's stored sixteen bits, re-decoding without error - and wrong. The
+disk's tally went from "1 of 3 repaired" to "0 of 3", which is the
+honest number.
+
+Sixteen bits cannot arbitrate 512 bytes: that has been the premise from
+the start. This is the first case in this project where a stronger check
+was available, disagreed, and turned out to be right - and it disagreed
+with a repair that looked as safe as they come.
+
+(One detail of the algorithm is worth writing down because getting it
+wrong makes the checksum look broken rather than absent: the whole
+32-bit words are folded little-endian, but a trailing one, two or three
+bytes are folded the other way round. Miss that and about half the
+blocks of any real cabinet appear to fail.)
+
 ### 4d-ii. Sound is smooth too
 
 The smoothness argument that shapes the flux search applies a level up,
@@ -1122,7 +1196,9 @@ and settled a sector the search had already "repaired" at a margin of
 [the repair that was wrong](docs/disks.md#the-repair-that-was-wrong-and-how-we-know).
 
 The running tally, and what each disk turned out to be suffering from,
-is in [docs/disks.md](docs/disks.md).
+is in [docs/disks.md](docs/disks.md) for the first twenty disks and
+[docs/windows3-office-set.md](docs/windows3-office-set.md) for the
+Windows 3 application media that followed them.
 
 That number went *down* as the tool got better, and the reason is the
 whole point of the section below. Five of the readings it used to apply
@@ -1452,6 +1528,14 @@ filesystem options (scan and repair):
                     are anchored on the damaged sector's known-good
                     neighbours, and applied only if they reproduce
                     the sector's stored CRC.
+  --from-dir DIR    the rest of the set. Software did not arrive on
+                    one floppy: an install set shipped the same
+                    runtime on several of its disks, and two editions
+                    shipped much of the same code, so a file this disk
+                    lost is often intact on the disk beside it. Every
+                    file under DIR (one level of subdirectories too)
+                    is tried; the match is on the bytes, not the name.
+                    (--from-set is the same switch.)
   --salvage         extract: also unpack damaged archives, member by
                     member, into <name>.d/ - a member the damage
                     missed comes out whole and proven by its own

@@ -108,6 +108,14 @@ static const char *usage_text =
 "                    are anchored on the damaged sector's known-good\n"
 "                    neighbours, and applied only if they reproduce\n"
 "                    the sector's stored CRC.\n"
+"  --from-dir DIR    the rest of the set. Software did not arrive on\n"
+"                    one floppy: an install set shipped the same\n"
+"                    runtime on several of its disks, and two editions\n"
+"                    shipped much of the same code, so a file this disk\n"
+"                    lost is often intact on the disk beside it. Every\n"
+"                    file under DIR (one level of subdirectories too)\n"
+"                    is tried; the match is on the bytes, not the name.\n"
+"                    (--from-set is the same switch.)\n"
 "  --salvage         extract: also unpack damaged archives, member by\n"
 "                    member, into <name>.d/ - a member the damage\n"
 "                    missed comes out whole and proven by its own\n"
@@ -166,6 +174,7 @@ typedef struct {
 	int    variants;
 	int    frommirror;
 	const char *fromfile;
+	const char *fromdir;
 	int    deleted;
 	int    salvage;
 	char *const *sets;
@@ -235,6 +244,9 @@ static int parse_args(int argc, char **argv, args *a)
 		         !strcmp(o, "--from-copy")) a->frommirror = 1;
 		else if (!strcmp(o, "--variants")) a->variants = atoi(NEXT());
 		else if (!strcmp(o, "--from-file")) { a->fromfile = NEXT();
+		                                     a->frommirror = 1; }
+		else if (!strcmp(o, "--from-dir") ||
+		         !strcmp(o, "--from-set")) { a->fromdir = NEXT();
 		                                     a->frommirror = 1; }
 		else if (!strcmp(o, "--out"))      a->out = NEXT();
 		else if (!strcmp(o, "--format"))   a->format = NEXT();
@@ -1524,6 +1536,31 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply,
 			m = NULL;
 		else if (!proven && m)
 			proven = 3;
+		/*
+		 * The rest of the set, when the user has pointed us at it.
+		 * Software did not arrive on one floppy, so the file this
+		 * sector lost is often intact on the disk beside it.
+		 */
+		if (!m && a->fromdir && fs &&
+		    dr_fs_locate(fs, c, idx, &loc) == 0 &&
+		    v->data_len == (int)sizeof(sis)) {
+			char found[1024];
+			int fr = dr_fs_from_dir(fs, &loc, a->fromdir, sis,
+			                        v->data_len, how,
+			                        (int)sizeof(how), found,
+			                        sizeof(found));
+
+			if (fr == 1 || (fr == 0 &&
+			                payload_matches_crc(v, sis))) {
+				const char *leaf = strrchr(found, '/');
+
+				m = sis;
+				proven = 4;
+				snprintf(how, sizeof(how),
+				         "the same bytes from %.180s",
+				         leaf ? leaf + 1 : found);
+			}
+		}
 		if (!m && fs && dr_fs_locate(fs, c, idx, &loc) == 0 &&
 		    v->data_len == (int)sizeof(sis)) {
 			int sr = dr_fs_sister(fs, &loc, sis, v->data_len, how,
@@ -1550,9 +1587,9 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply,
 				*semi = 0;
 			printf(" %3d/%d s%-3d  %-8s  ",
 			       sl[idx].track, sl[idx].side, sl[idx].sector_id,
-			       "2nd copy");
+			       proven == 4 ? "from set" : "2nd copy");
 			printf("%s  -> APPLIED, %s\n",
-			       proven == 2 ? how
+			       (proven == 2 || proven == 4) ? how
 			                   : "the other copy of this FAT",
 			       proven == 3
 			         ? "the stored CRC here is itself damaged"
@@ -2396,19 +2433,33 @@ int main(int argc, char **argv)
 				const uint8_t *m;
 				uint8_t sis[512];
 				char how[256];
+				char fromwhich[1024];
 				int proven = 0, ndiff = 0, ff = -1;
 
+				fromwhich[0] = 0;
+
 				m = mirror_for(c, v, idx, &loc, &proven, &ndiff);
-				if (!m && a.fromfile && fs_of(c) &&
+				if (!m && (a.fromfile || a.fromdir) &&
+				    fs_of(c) &&
 				    dr_fs_locate(fs_of(c), c, idx, &loc) == 0 &&
 				    v->data_len == (int)sizeof(sis) &&
-				    (ff = dr_fs_from_file(fs_of(c), &loc,
-				                          a.fromfile, sis,
-				                          v->data_len, how,
-				                          (int)sizeof(how))) >= 0) {
+				    (ff = a.fromdir
+				          ? dr_fs_from_dir(fs_of(c), &loc,
+				                           a.fromdir, sis,
+				                           v->data_len, how,
+				                           (int)sizeof(how),
+				                           fromwhich,
+				                           sizeof(fromwhich))
+				          : dr_fs_from_file(fs_of(c), &loc,
+				                            a.fromfile, sis,
+				                            v->data_len, how,
+				                            (int)sizeof(how))) >= 0) {
 					uint8_t *msg = malloc((size_t)v->msg_len);
 					int crcok = 0;
 
+					if (fromwhich[0])
+						printf("\nfrom set   : %s\n",
+						       fromwhich);
 					printf("\nfrom file  : %s\n", how);
 					if (msg) {
 						uint16_t k;
@@ -2453,7 +2504,7 @@ int main(int argc, char **argv)
 						       "too short to override "
 						       "it\n");
 					}
-				} else if (!m && a.fromfile) {
+				} else if (!m && (a.fromfile || a.fromdir)) {
 					printf("\nfrom file  : %s\n", how);
 				}
 				if (!m && fs_of(c) &&
