@@ -847,6 +847,15 @@ wrong makes the checksum look broken rather than absent: the whole
 bytes are folded the other way round. Miss that and about half the
 blocks of any real cabinet appear to fail.)
 
+Knowing *which* block is hit also says how much was lost, and for a CAB
+that is not the obvious number. MSZIP resets at every block - each one
+starts with a literal `CK` - so a lost block costs one block. Quantum
+and LZX carry their coder state across the whole folder, so a lost block
+costs every block after it. Word 6.0's cabinets are Quantum, and the
+three bad sectors on that disk are in block 15 of 99: blocks 0-14 decode
+and the remaining 84 cannot be picked up again. The referee that
+identifies the block is what makes that difference visible at all.
+
 ### 4d-ii. Sound is smooth too
 
 The smoothness argument that shapes the flux search applies a level up,

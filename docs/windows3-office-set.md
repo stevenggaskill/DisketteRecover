@@ -112,16 +112,43 @@ as safe as they come.
 The other two sectors are beyond reach: the checksum deltas have
 popcounts of 18, 10 and 19, so the damage is many bits and not a flip
 or two, and every one of the 245 and 256 CRC-valid readings is refuted.
-Word 6.0's cabinets use Quantum compression, so there is no
-decompressor here to salvage a prefix with either. `WORD2.CAB` is
-short three blocks of `WINWORD.EXE`, and this tool cannot supply them -
-`WORD2.CAB` from another copy of the same release could.
+
+And the loss is worse than three blocks in ninety-nine. The folder is
+Quantum-compressed (`typeCompress` 0x1372: method 2, window 19), and
+Quantum keeps its coder state *across* the blocks of a folder rather
+than resetting at each one - there is no per-block marker the way MSZIP
+has its `CK`. So a lost block does not cost one block; it costs every
+block after it. Blocks 0-14 decode, which is the first 491,520 bytes of
+this cabinet's share of `WINWORD.EXE`, and from block 15 on the stream
+cannot be picked up again. `WINWORD.EXE` also continues into
+`WORD3.CAB` with the same state, so that continuation goes with it.
+
+Two things would be needed to put that right, and only the first is
+about damage:
+
+* `WORD2.CAB` from the same pressing. Its fingerprints are `setID`
+  48632, cabinet index 1, and `WINWORD.EXE` declared as 3,490,816 bytes
+  stamped 1994-08-10 02:04:56. Given those bytes, the cabinet's own
+  block checksums would prove them outright.
+* `WORD1.CAB` and `WORD3.CAB` of the same set. `WINWORD.EXE` is marked
+  continued-from-previous-and-to-next (`iFolder` 0xFFFE), so one
+  cabinet out of three cannot yield it however healthy it is.
+
+A 1.44 MB retail Word 6.0 (1993-10-27) was tried against it and is a
+different animal: that release ships `WINWORD.E1_/E2_/E3_` as
+KWAJ-MSZIP files across disks 2-4, which decompress cleanly here to
+3,483,136 bytes - 7,680 bytes short of the 3,490,816 this cabinet
+declares, and stamped ten months earlier. Even a byte-perfect
+`WINWORD.EXE` of the right build would not help, though: the damage is
+inside a Quantum-compressed stream, and there is no way back from the
+plaintext to one particular arithmetic-coded encoding of it. Only the
+same cabinet will do.
 
 ## What is still missing
 
 | file | disk | what is left |
 |---|---|---|
-| `WORD2.CAB` | MSWord6p0 Disk2 | 3 blocks of 99, inside `WINWORD.EXE` |
+| `WORD2.CAB` | MSWord6p0 Disk2 | blocks 15-99 of 99, inside `WINWORD.EXE` - Quantum's state does not survive a lost block |
 | `XTW601F.DL_` | XTree4WinX Disk2 | 1 sector; the disk-3 copy is a different build |
 | `XTW605F.DL_` | XTree4WinX Disk2 | 1 sector; same |
 | `XTWGCFS.DL_` | XTree4WinX Disk2 | 2 sectors; no copy anywhere in the set |
