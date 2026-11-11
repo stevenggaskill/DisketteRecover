@@ -1031,16 +1031,27 @@ it prefers is guess number one and a reading it refutes is last. The
 images stop being written as soon as they stop differing.
 
 The counts can go in the name, too: with `--all`, `--out` may carry
-`{fixed}` and `{bad}`, so
+`{fixed}`, `{bad}` and `{lost}`, so
 
 ```sh
-disketterecover repair "Disk Sand/track00.0.raw" --all --auto --variants 5 \
-    --out "Disk_Sand_{fixed}of{bad}.hfe"
+disketterecover repair "Disk Sand/track00.0.raw" --all --auto --fs --variants 5 \
+    --out "Disk_Sand_{fixed}of{bad}_{lost}lost.hfe"
 ```
 
-writes `Disk_Sand_3of4.hfe` and its guesses beside it. A directory of
-repaired images then says how much of each one came back without being
-opened.
+writes `Disk_Sand_3of4_1lost.hfe` and its guesses beside it. A directory
+of repaired images then says how much of each one came back without
+being opened.
+
+`{lost}` is the number that decides whether anything is gone, and it is
+deliberately **not** `{bad}` minus `{fixed}`: it counts only the sectors
+that held a file's data and were not recovered. On most real disks those
+are different numbers by a long way - `Disk_Ron_0of22_0lost` had
+twenty-two unrepaired sectors and lost nothing, because every one of
+them was unformatted noise past the last track.
+
+The image is written whether or not anything was repaired, and even when
+there was nothing to repair. `0of4_4lost` and `0of0_0lost` are both
+results worth having on disk; a missing file is not.
 
 ### 5. Cycle through the most likely corrections
 
@@ -1623,10 +1634,14 @@ filesystem options (scan and repair):
                     the k-th reading of every sector that would not
                     settle, so each one is a coherent account of the
                     disk rather than a mixture of ranks
-  --out with --all  may carry {fixed} and {bad}, e.g.
-                    --out "Disk_Sand_{fixed}of{bad}.hfe" writes
-                    Disk_Sand_3of4.hfe - so a directory of repaired
-                    images says how much of each one came back
+  --out with --all  may carry {fixed}, {bad} and {lost}, e.g.
+                    --out "Disk_Sand_{fixed}of{bad}_{lost}lost.hfe"
+                    writes Disk_Sand_3of4_1lost.hfe - so a directory
+                    of repaired images says how much of each one came
+                    back without being opened. {lost} is the count
+                    that matters: sectors that held a file's data and
+                    could not be recovered. It is not {bad}-{fixed},
+                    because most bad sectors hold no file data at all
 
 damage options:
   --bits a,b,c      message bit indices to flip

@@ -655,12 +655,13 @@ PYEOF5
 	     grep -c "cabinet block checksum" || true)
 	if [ "${cb:-0}" -ge 1 ]; then ok "the cabinet is used as a referee"
 	else bad "the cabinet is used as a referee"; fi
-	# and the true reading is the one it accepts
+	# and no reading it rejects is applied: the written image has to
+	# come out byte-identical to the damaged one, not merely absent
 	"$dr" repair "$out/cab_bad.hfe" --all --auto --fs \
 	      --out "$out/cab_fix.img" --format RAW_LOADER >/dev/null 2>&1
-	"$dr" convert "$out/cab.hfe" --out "$out/cab_ref.img" \
+	"$dr" convert "$out/cab_bad.hfe" --out "$out/cab_asread.img" \
 	      --format RAW_LOADER >/dev/null 2>&1
-	if [ ! -f "$out/cab_fix.img" ] || cmp -s "$out/cab_ref.img" "$out/cab_fix.img"; then
+	if cmp -s "$out/cab_asread.img" "$out/cab_fix.img"; then
 		ok "no reading the cabinet rejects is applied"
 	else bad "no reading the cabinet rejects is applied"; fi
 
@@ -837,6 +838,39 @@ PYEOF3
 
 	# The counts belong in the name, and the guesses beside it.
 	echo "== whole-disk guesses, and the counts in the filename"
+	# {lost} is the count that decides whether anything is gone, and it
+	# is not {bad}-{fixed}: most bad sectors hold no file data at all.
+	# Four cases, because each gets the arithmetic wrong differently.
+	echo "== the counts in the filename"
+	# wav_slip.hfe's one bad sector is inside TONE.WAV and never
+	# settles - sib_bad.hfe will not do, because the bit search repairs
+	# it and the answer would be 1of1_0lost.
+	"$dr" repair "$out/wav_slip.hfe" --all --auto --fs \
+	      --out "$out/n1_{fixed}of{bad}_{lost}lost.hfe" >/dev/null 2>&1
+	if [ -f "$out/n1_0of1_1lost.hfe" ]; then
+		ok "a file sector left unrepaired counts as lost"
+	else bad "a file sector left unrepaired counts as lost ($(cd "$out" && ls n1_* 2>/dev/null))"; fi
+	"$dr" repair "$out/sib_bad.hfe" --all --auto --fs --from-copy \
+	      --out "$out/n2_{fixed}of{bad}_{lost}lost.hfe" >/dev/null 2>&1
+	if [ -f "$out/n2_1of1_0lost.hfe" ]; then
+		ok "a file sector recovered counts as nothing lost"
+	else bad "a file sector recovered counts as nothing lost ($(cd "$out" && ls n2_* 2>/dev/null))"; fi
+	"$dr" damage "$out/sib.hfe" --track 60 --side 1 --id 5 \
+	      --bits 803,1701 --out "$out/freebad.hfe" >/dev/null 2>&1
+	"$dr" repair "$out/freebad.hfe" --all --auto --fs \
+	      --out "$out/n3_{fixed}of{bad}_{lost}lost.hfe" >/dev/null 2>&1
+	if ls "$out"/n3_*of1_0lost.hfe >/dev/null 2>&1; then
+		ok "damage in free space is never counted as lost"
+	else bad "damage in free space is never counted as lost ($(cd "$out" && ls n3_* 2>/dev/null))"; fi
+	# an image is written even when nothing was repaired, and even when
+	# there was nothing to repair - a name saying 0of0_0lost beats a
+	# missing file
+	"$dr" repair "$out/sib.hfe" --all --auto --fs \
+	      --out "$out/n4_{fixed}of{bad}_{lost}lost.hfe" >/dev/null 2>&1
+	if [ -f "$out/n4_0of0_0lost.hfe" ]; then
+		ok "a disk with nothing wrong is still written out"
+	else bad "a disk with nothing wrong is still written out"; fi
+
 	# wav_slip.hfe is the right shape for this: plenty of readings
 	# satisfy the sector's CRC and none of them settles it, which is
 	# exactly when a person needs images to look at.

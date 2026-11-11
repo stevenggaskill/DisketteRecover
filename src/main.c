@@ -138,10 +138,14 @@ static const char *usage_text =
 "                    the k-th reading of every sector that would not\n"
 "                    settle, so each one is a coherent account of the\n"
 "                    disk rather than a mixture of ranks\n"
-"  --out with --all  may carry {fixed} and {bad}, e.g.\n"
-"                    --out \"Disk_Sand_{fixed}of{bad}.hfe\" writes\n"
-"                    Disk_Sand_3of4.hfe - so a directory of repaired\n"
-"                    images says how much of each one came back\n"
+"  --out with --all  may carry {fixed}, {bad} and {lost}, e.g.\n"
+"                    --out \"Disk_Sand_{fixed}of{bad}_{lost}lost.hfe\"\n"
+"                    writes Disk_Sand_3of4_1lost.hfe - so a directory\n"
+"                    of repaired images says how much of each one came\n"
+"                    back without being opened. {lost} is the count\n"
+"                    that matters: sectors that held a file's data and\n"
+"                    could not be recovered. It is not {bad}-{fixed},\n"
+"                    because most bad sectors hold no file data at all\n"
 "\n"
 "damage options:\n"
 "  --bits a,b,c      message bit indices to flip\n"
@@ -1737,7 +1741,7 @@ static int repair_one(dr_ctx *c, int idx, args *a, int apply,
  * tool that silently renames its output is a tool you cannot script.
  */
 static void name_with_counts(char *dst, size_t dstsz, const char *pat,
-                             int fixed, int bad)
+                             int fixed, int bad, int lost)
 {
 	size_t o = 0;
 	const char *p;
@@ -1749,6 +1753,9 @@ static void name_with_counts(char *dst, size_t dstsz, const char *pat,
 		} else if (!strncmp(p, "{bad}", 5)) {
 			o += (size_t)snprintf(dst + o, dstsz - o, "%d", bad);
 			p += 4;
+		} else if (!strncmp(p, "{lost}", 6)) {
+			o += (size_t)snprintf(dst + o, dstsz - o, "%d", lost);
+			p += 5;
 		} else {
 			dst[o++] = *p;
 		}
@@ -1859,6 +1866,7 @@ static int cmd_repair_all(dr_ctx *c, args *a)
 	struct { int track, side, id; } *todo = NULL;
 	openspot *spots = NULL;
 	int n, i, ntodo = 0, fixed = 0, apply, nspots = 0;
+	int infile = 0, infixed = 0, here_in_file = 0;
 	const dr_sector *sl = dr_sectors(c, &n);
 
 	apply = (a->apply >= 0 || a->autoapply);
@@ -1877,6 +1885,21 @@ static int cmd_repair_all(dr_ctx *c, args *a)
 
 	if (!ntodo) {
 		printf("no CRC errors on this disk.\n");
+		/*
+		 * Still write the image when asked. A disk with nothing
+		 * wrong is a result, and a directory of repaired disks
+		 * wants it there with the others, named 0of0_0lost rather
+		 * than silently absent.
+		 */
+		if (a->out) {
+			char path[1200];
+
+			name_with_counts(path, sizeof(path), a->out, 0, 0, 0);
+			if (dr_export(c, path, a->format) < 0)
+				fprintf(stderr, "%s\n", dr_last_error(c));
+			else
+				printf("wrote %s (%s)\n", path, a->format);
+		}
 		free(todo);
 		return 0;
 	}
@@ -1902,6 +1925,25 @@ static int cmd_repair_all(dr_ctx *c, args *a)
 		if (idx < 0)
 			continue;
 
+		/*
+		 * Was this sector carrying a file's data? That is the count
+		 * that decides whether anything is actually gone, and it is
+		 * not the count of CRC errors - most bad sectors on real
+		 * media are free space or unformatted track. Asked before
+		 * the repair, because a repair rewrites the sector and the
+		 * filesystem would then report it clean.
+		 */
+		{
+			dr_fs *fs = fs_of(c);
+			dr_fs_loc loc;
+
+			here_in_file = (fs &&
+			                dr_fs_locate(fs, c, idx, &loc) == 0 &&
+			                loc.area == DR_AREA_FILE);
+			if (here_in_file)
+				infile++;
+		}
+
 		if (a->variants > 0 && !spots) {
 			spots = calloc((size_t)ntodo, sizeof(*spots));
 			if (!spots) {
@@ -1909,8 +1951,14 @@ static int cmd_repair_all(dr_ctx *c, args *a)
 				return 1;
 			}
 		}
-		fixed += repair_one(c, idx, a, apply,
-		                    spots ? &spots[nspots] : NULL);
+		{
+			int got = repair_one(c, idx, a, apply,
+			                     spots ? &spots[nspots] : NULL);
+
+			fixed += got;
+			if (got && here_in_file)
+				infixed++;
+		}
 		if (spots && spots[nspots].nguess)
 			nspots++;
 		fflush(stdout);
@@ -1924,10 +1972,17 @@ static int cmd_repair_all(dr_ctx *c, args *a)
 		g_fs_tried = 0;
 	}
 
-	if (a->out && (fixed || nspots)) {
+	/*
+	 * Write it whether or not anything was repaired. The image is
+	 * still the best reading of the disk that exists, and a name
+	 * carrying 0of4_4lost says exactly that - which is more use than
+	 * no file at all.
+	 */
+	if (a->out) {
 		char path[1200];
 
-		name_with_counts(path, sizeof(path), a->out, fixed, ntodo);
+		name_with_counts(path, sizeof(path), a->out, fixed, ntodo,
+		                 infile - infixed);
 		if (dr_export(c, path, a->format) < 0) {
 			fprintf(stderr, "%s\n", dr_last_error(c));
 			free_spots(spots, nspots);
